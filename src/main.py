@@ -127,30 +127,27 @@ class App:
             logger.error("lark-oapi 未安装：{}", e)
             return
 
+        # 打印 SDK 版本，排障有用
+        try:
+            from lark_oapi.core.const import VERSION as _lark_version
+            logger.info("📦 lark-oapi 版本: {}", _lark_version)
+        except ImportError:
+            logger.warning("无法确定 lark-oapi 版本（可能过老，建议升级到 >=1.4）")
+
         builder = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._on_message)
         )
 
-        # 卡片回调：不同 SDK 版本方法名不同，枚举尝试
-        registered = False
-        for name in (
-            "register_p2_card_action_trigger",
-            "register_p2_card_action_trigger_v1",
-            "register_card_action_trigger",
-            "register_card_action_handler",
-        ):
-            if hasattr(builder, name):
-                try:
-                    builder = getattr(builder, name)(self._on_card_action)
-                    logger.info("🖱️  卡片回调已注册（方法: {}）", name)
-                    registered = True
-                    break
-                except Exception as e:
-                    logger.debug("注册 {} 失败: {}", name, e)
-
-        if not registered:
-            logger.warning("⚠️ 未找到卡片回调注册方法，按钮可能无响应。请升级 lark-oapi")
+        # 卡片回调注册（lark-oapi >= 1.4 标准方法）
+        try:
+            builder = builder.register_p2_card_action_trigger(self._on_card_action)
+            logger.info("🖱️  卡片按钮回调已注册")
+        except AttributeError:
+            logger.error(
+                "⚠️ lark-oapi 缺少 register_p2_card_action_trigger。"
+                "请升级：pip install -U lark-oapi>=1.4"
+            )
 
         self._ws_client = lark.ws.Client(
             self.cfg.feishu.app_id,
@@ -192,7 +189,7 @@ class App:
         try:
             event = getattr(data, "event", None)
             if event is None:
-                return self._empty_card_response()
+                return self._card_response()
 
             operator = getattr(event, "operator", None)
             user_id = getattr(operator, "open_id", "") if operator else ""
@@ -213,7 +210,7 @@ class App:
                 or self.cfg.feishu.target_chat_id
         except Exception as e:
             logger.exception("解析卡片回调异常: {}", e)
-            return self._empty_card_response()
+            return self._card_response()
 
         def worker():
             try:
@@ -224,7 +221,8 @@ class App:
                 logger.exception("卡片回调异步异常: {}", e)
 
         threading.Thread(target=worker, daemon=True).start()
-        return self._empty_card_response()
+        # 立刻给飞书一个 toast 作为"已收到"确认，主响应由后台异步推送
+        return self._card_response(toast="info", content="处理中…")
 
     # ============================================================
     # 发送响应
@@ -264,18 +262,30 @@ class App:
     # SDK 辅助
     # ============================================================
     @staticmethod
-    def _empty_card_response() -> Any:
-        """返回 SDK 期望的 P2CardActionTriggerResponse 空对象（兼容多版本）。"""
+    def _card_response(toast: str = "", content: str = "") -> Any:
+        """
+        返回 SDK 期望的 P2CardActionTriggerResponse。
+        可选 toast 参数会让用户在点按钮后立即看到一个气泡提示，体验更好。
+
+        lark-oapi v1.4+ 的正确路径（从 SDK 源码验证）：
+        lark_oapi.event.callback.model.p2_card_action_trigger
+        """
+        payload: dict[str, Any] = {}
+        if toast:
+            payload["toast"] = {"type": toast, "content": content or "已收到"}
+        try:
+            from lark_oapi.event.callback.model.p2_card_action_trigger import (
+                P2CardActionTriggerResponse,
+            )
+            return P2CardActionTriggerResponse(payload)
+        except ImportError:
+            pass
+        # 极老版本兼容
         try:
             from lark_oapi.card.model.p2_card_action_trigger import (
                 P2CardActionTriggerResponse,
             )
-            return P2CardActionTriggerResponse({})
-        except ImportError:
-            pass
-        try:
-            from lark_oapi.api.cardkit.v1 import P2CardActionTriggerResponse
-            return P2CardActionTriggerResponse({})
+            return P2CardActionTriggerResponse(payload)
         except ImportError:
             pass
         return None
