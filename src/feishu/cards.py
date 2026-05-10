@@ -82,13 +82,19 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _task_buttons(task_id: int, enabled: bool, url: str | None = None) -> list[dict]:
-    """任务通用的按钮行（复用）。"""
+def _task_buttons(task_id: int, enabled: bool, url: str | None = None,
+                  has_snapshot: bool = False) -> list[dict]:
+    """任务通用的按钮行（复用）。
+
+    has_snapshot=True 时额外展示「📥 下载快照」按钮，避免用户点了无快照的按钮徒劳。
+    """
     btns: list[dict] = []
     if url:
         btns.append(_btn("🔗 打开页面", "open_url", task_id, url=url))
     btns.append(_btn("⚡ 立即检查", "check", task_id))
     btns.append(_btn("📜 历史", "history", task_id))
+    if has_snapshot:
+        btns.append(_btn("📥 下载快照", "snapshot", task_id))
     if enabled:
         btns.append(_btn("⏸️ 暂停", "pause", task_id))
     else:
@@ -131,6 +137,7 @@ def help_card() -> dict:
          "`/pause <id>` / `/resume <id>` / `/remove <id>` — 管理任务\n"
          "`/check <id>` — 立即检查\n"
          "`/history <id>` — 查看变更历史\n"
+         "`/snapshot <id>` — 下载该任务最新快照文件\n"
          "`/interval <id> <秒>` — 修改间隔\n"
          "`/reset <id> [--strategy jina]` — 重置基准（策略调优用）"),
         ("🎯  精细化配置",
@@ -247,7 +254,15 @@ def task_list_card(tasks: list[dict]) -> dict:
             f"🔔 变更 `{t.get('total_changes', 0)}` · "
             f"🕐 `{last}`"
         ))
-        elements.append(_action(_task_buttons(t["id"], t["enabled"])))
+        # 关键字（仅当配置了才展示）
+        keywords = t.get("keywords") or []
+        if keywords:
+            elements.append(_div(
+                f"🎯 **关键字**：{', '.join(f'`{k}`' for k in keywords)}"
+            ))
+        elements.append(_action(_task_buttons(
+            t["id"], t["enabled"], has_snapshot=t.get("has_snapshot", False),
+        )))
         elements.append(_hr())
 
     elements.append(_note("💡 点按钮操作，或 `/add <url>` 添加新任务"))
@@ -281,7 +296,10 @@ def task_detail_card(t: dict) -> dict:
             _div(f"🕐 **上次检查**：{t.get('last_checked_at') or '从未'}"),
             _div(f"🔔 **上次变更**：{t.get('last_changed_at') or '从未'}"),
             _hr(),
-            _action(_task_buttons(t["id"], t["enabled"], url=t["url"])),
+            _action(_task_buttons(
+                t["id"], t["enabled"], url=t["url"],
+                has_snapshot=t.get("has_snapshot", False),
+            )),
         ],
         subtitle=f"#{t['id']} · {t['name']}",
     )

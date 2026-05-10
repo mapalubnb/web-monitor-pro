@@ -77,6 +77,7 @@ class CommandDispatcher:
             "delete": self._cmd_remove,
             "check": self._cmd_check,
             "history": self._cmd_history,
+            "snapshot": self._cmd_snapshot,
             "keyword": self._cmd_keyword,
             "config": self._cmd_config,
             "log": self._cmd_log,
@@ -97,6 +98,7 @@ class CommandDispatcher:
             "remove": lambda v: self._cmd_remove([str(v["task_id"])]),
             "check": lambda v: self._cmd_check([str(v["task_id"])]),
             "history": lambda v: self._cmd_history([str(v["task_id"])]),
+            "snapshot": lambda v: self._cmd_snapshot([str(v["task_id"])]),
             "task_detail": self._action_task_detail,
             "open_url": lambda _: None,  # 浏览器自己处理
         }
@@ -331,6 +333,40 @@ class CommandDispatcher:
             } for c in rows]
             name = t.name
         return CommandResponse(card=cards.history_card(name, task_id, items))
+
+    # ============================================================
+    # /snapshot —— 下载最新快照
+    # ============================================================
+    def _cmd_snapshot(self, args: list[str]) -> CommandResponse:
+        task_id = _first_int(args)
+        t, err = self._get_task(task_id, "用法：`/snapshot <ID>`")
+        if err is not None:
+            return err
+
+        snap_path_str = t.last_snapshot_path
+        if not snap_path_str or not Path(snap_path_str).exists():
+            return CommandResponse.err(
+                f"任务 #{task_id} 暂无快照",
+                f"用 `/check {task_id}` 立即抓取一次以建立基准快照",
+            )
+
+        snap_path = Path(snap_path_str)
+        content_len = snap_path.stat().st_size
+        last_checked = (
+            t.last_checked_at.strftime("%Y-%m-%d %H:%M:%S")
+            if t.last_checked_at else "从未"
+        )
+        return CommandResponse(
+            card=cards.success_card(
+                "📥 快照已发送",
+                f"**#{task_id} · {t.name}**\n"
+                f"🔗 {t.url}\n"
+                f"🕐 抓取时间：`{last_checked}`\n"
+                f"📝 文件大小：`{_humanize_size(content_len)}`",
+            ),
+            file_path=snap_path,
+            file_display_name=f"[{t.name}] 最新快照.txt",
+        )
 
     # ============================================================
     # /keyword
@@ -710,6 +746,9 @@ def _task_to_dict(t: Task) -> dict[str, Any]:
         "last_changed_at": (
             t.last_changed_at.strftime("%Y-%m-%d %H:%M:%S")
             if t.last_changed_at else None
+        ),
+        "has_snapshot": bool(
+            t.last_snapshot_path and Path(t.last_snapshot_path).exists()
         ),
     }
 
