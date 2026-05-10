@@ -136,30 +136,46 @@ class App:
             logger.error("lark-oapi 未安装，无法启动 WebSocket：{}", e)
             return
 
-        # --- 消息接收 handler ---
+        # --- 消息接收 handler（飞书 IM 消息事件）---
         def on_message_receive(data: P2ImMessageReceiveV1) -> None:
             self._handle_message_event(data)
 
-        # --- 卡片按钮回调 handler ---
-        def on_card_action(data) -> Any:
+        # --- 卡片按钮回调 handler（需要返回 P2CardActionTriggerResponse）---
+        def on_card_action(data):
             return self._handle_card_action(data)
 
-        # 构造事件分发器（WebSocket 专用）
-        try:
-            dispatcher = (
-                lark.EventDispatcherHandler.builder("", "")
-                .register_p2_im_message_receive_v1(on_message_receive)
-                .register_p2_card_action_trigger(on_card_action)
-                .build()
+        # 构造事件分发器基础（WebSocket 专用）
+        builder = lark.EventDispatcherHandler.builder("", "") \
+            .register_p2_im_message_receive_v1(on_message_receive)
+
+        # 卡片回调注册：尝试多种 SDK 方法名（不同 lark-oapi 版本用的名字不同）
+        # 参考：lark-oapi v1.2+ 叫 register_p2_card_action_trigger_v1
+        #       lark-oapi v1.4+ 叫 register_p2_card_action_trigger
+        #       旧版 叫 register_card_action_callback
+        registered = False
+        candidate_methods = [
+            "register_p2_card_action_trigger",
+            "register_p2_card_action_trigger_v1",
+            "register_card_action_trigger",
+            "register_card_action_handler",
+        ]
+        for name in candidate_methods:
+            if hasattr(builder, name):
+                try:
+                    builder = getattr(builder, name)(on_card_action)
+                    logger.info("🖱️  卡片按钮回调已注册（方法：{}）", name)
+                    registered = True
+                    break
+                except Exception as e:
+                    logger.debug("注册 {} 失败：{}", name, e)
+
+        if not registered:
+            logger.warning(
+                "⚠️ lark SDK 未找到可用的卡片回调注册方法，按钮点击可能无响应。"
+                "请确认 lark-oapi 版本 >= 1.4.0"
             )
-        except AttributeError:
-            # 某些版本的 SDK 方法名不同，退化到手动字典注册
-            dispatcher = (
-                lark.EventDispatcherHandler.builder("", "")
-                .register_p2_im_message_receive_v1(on_message_receive)
-                .build()
-            )
-            logger.warning("lark SDK 未提供 register_p2_card_action_trigger，卡片按钮回调可能不生效")
+
+        dispatcher = builder.build()
 
         self._ws_client = lark.ws.Client(
             self.cfg.feishu.app_id,
@@ -214,12 +230,13 @@ class App:
         """
         卡片按钮回调。
         **关键**：飞书要求 3 秒内响应，否则报 200340（"No card.action callback"）。
-        所以我们必须立即返回，把实际业务处理放到后台线程。
+        所以我们必须立即返回一个 P2CardActionTriggerResponse（如果 SDK 支持），
+        并把实际业务处理放到后台线程异步执行。
         """
         try:
             event = getattr(data, "event", None)
             if event is None:
-                return None
+                return self._empty_card_response()
             operator = getattr(event, "operator", None)
             user_id = getattr(operator, "open_id", "") if operator else ""
             action_obj = getattr(event, "action", None)
@@ -245,9 +262,9 @@ class App:
                          user_id[:10] + "...", value)
         except Exception as e:
             logger.exception("解析飞书卡片回调异常：{}", e)
-            return None
+            return self._empty_card_response()
 
-        # 异步处理：立即返回让飞书满意，业务在后台做
+        # 异步处理：立即返回让飞书满意（3 秒内），业务在后台做
         def _worker():
             try:
                 response = self.dispatcher.dispatch_action(value, user_id)
@@ -259,6 +276,30 @@ class App:
         threading.Thread(
             target=_worker, name=f"card-{int(time.time()*1000)}", daemon=True
         ).start()
+        return self._empty_card_response()
+
+    @staticmethod
+    def _empty_card_response() -> Any:
+        """
+        构造一个空的 P2CardActionTriggerResponse。
+        飞书卡片回调必须返回该类型的对象（即便是空的）。
+        不同版本 lark-oapi 的类路径不同，这里尽可能兼容。
+        """
+        try:
+            # lark-oapi v1.4+
+            from lark_oapi.card.model.p2_card_action_trigger import (
+                P2CardActionTriggerResponse,
+            )
+            return P2CardActionTriggerResponse({})
+        except ImportError:
+            pass
+        try:
+            # 旧版可能叫这个
+            from lark_oapi.api.cardkit.v1 import P2CardActionTriggerResponse
+            return P2CardActionTriggerResponse({})
+        except ImportError:
+            pass
+        # 兜底：返回 None（老版本 SDK 接受）
         return None
 
     # --------------------------------------------------------
