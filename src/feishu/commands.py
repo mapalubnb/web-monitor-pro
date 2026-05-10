@@ -92,6 +92,7 @@ class CommandDispatcher:
             "sniff": self._cmd_sniff,
             "debug": self._cmd_debug,
             "interval": self._cmd_interval,
+            "reset": self._cmd_reset,
         }
 
         # 卡片按钮 action → handler 方法
@@ -588,6 +589,64 @@ class CommandDispatcher:
             f"任务 #{task_id} · {name}\n新间隔：**{seconds} 秒**",
         )
         resp.sync_scheduler_task_ids = [task_id]
+        return resp
+
+    # ---- /reset ----
+    def _cmd_reset(self, args: list[str]) -> CommandResponse:
+        """
+        重置任务的基准快照。下次抓取时视作"首次"，重新建立 baseline。
+        当抓取策略或页面结构变化后很实用，不用删掉重建。
+        用法：/reset <id> [--strategy xxx]
+        """
+        parser = _make_parser("reset")
+        parser.add_argument("task_id", type=int)
+        parser.add_argument("--strategy", default=None,
+                            choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"],
+                            help="顺便切换抓取策略")
+        parser.add_argument("--impersonate", default=None, help="顺便切换 curl_cffi 指纹")
+        parser.add_argument("--selector", default=None, help="顺便设置 CSS 选择器")
+        parser.add_argument("--extract-next-data", dest="extract_next_data",
+                            action="store_true", default=None,
+                            help="打开 SPA 数据嵌入提取")
+        try:
+            ns = parser.parse_args(args)
+        except SystemExit:
+            return CommandResponse.err("用法：`/reset <任务ID> [--strategy jina]`")
+
+        with session_scope() as s:
+            t = s.get(Task, ns.task_id)
+            if t is None:
+                return CommandResponse.err(f"未找到任务 #{ns.task_id}")
+            # 清除基准
+            t.last_content_hash = None
+            t.last_snapshot_path = None
+            t.consecutive_failures = 0
+            # 顺便改策略
+            changes = []
+            if ns.strategy:
+                t.strategy = ns.strategy
+                changes.append(f"策略→`{ns.strategy}`")
+            if ns.impersonate:
+                t.impersonate = ns.impersonate
+                changes.append(f"指纹→`{ns.impersonate}`")
+            if ns.selector is not None:
+                t.selector = ns.selector
+                changes.append(f"选择器→`{ns.selector}`")
+            if ns.extract_next_data:
+                t.extract_next_data = True
+                changes.append("启用 SPA 数据提取")
+            name = t.name
+
+        logger.info("🔄 任务 #{} [{}] 已重置基准快照，{}",
+                    ns.task_id, name,
+                    "; ".join(changes) if changes else "策略不变")
+        detail = f"任务 #{ns.task_id} · {name}\n已清空基准快照，下次抓取会作为新的首次建立。"
+        if changes:
+            detail += "\n\n📝 同时调整：" + "、".join(changes)
+        resp = CommandResponse(
+            card=cards.success_card("🔄 已重置", detail),
+            trigger_check_task_id=ns.task_id,
+        )
         return resp
 
     # ========================================================

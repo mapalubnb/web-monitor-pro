@@ -436,12 +436,22 @@ def _has_any_embedded_data(html: str) -> bool:
 
 _QUICK_STRIP_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
 _QUICK_STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+_QUICK_HEAD_RE = re.compile(r"<head[^>]*>.*?</head>", re.DOTALL | re.IGNORECASE)
+_QUICK_NAV_RE = re.compile(r"<(?:nav|footer|header)[^>]*>.*?</(?:nav|footer|header)>",
+                            re.DOTALL | re.IGNORECASE)
 _QUICK_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def _quick_visible_text(html: str) -> str:
-    """粗略估算可见文本量（不依赖 selectolax，避免循环导入）。"""
-    text = _QUICK_STRIP_RE.sub("", html)
-    text = _QUICK_STYLE_RE.sub("", text)
-    text = _QUICK_TAG_RE.sub(" ", text)
+    """
+    粗略估算 body 内的实质可见文本量（排除 head/script/style/nav/footer）。
+
+    关键：**不要把 meta 标签里的 description 等文本计入**，否则 SPA 空壳
+    （body 内几乎没东西，head 里一堆 meta）会被误判为"内容足够"。
+    """
+    text = _QUICK_HEAD_RE.sub("", html)   # 先去掉整个 <head>（含 meta）
+    text = _QUICK_STRIP_RE.sub("", text)  # 去脚本
+    text = _QUICK_STYLE_RE.sub("", text)  # 去样式
+    text = _QUICK_NAV_RE.sub("", text)    # 去导航/页脚/页眉（通常是模板固定文字）
+    text = _QUICK_TAG_RE.sub(" ", text)   # 剥所有标签
     return " ".join(text.split())

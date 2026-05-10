@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Any
@@ -174,7 +175,11 @@ class App:
     # 消息事件
     # --------------------------------------------------------
     def _handle_message_event(self, data: Any) -> None:
-        """接收到群/私聊消息。"""
+        """
+        接收到群/私聊消息。
+        立即返回，把实际处理异步化，避免飞书长连接超时（3 秒限制）。
+        """
+        # 先从事件里提取必要信息（快），再异步做业务处理
         try:
             event = data.event
             message = event.message
@@ -182,26 +187,35 @@ class App:
 
             user_id = self._extract_sender_id(sender)
             chat_id = message.chat_id
-            message_id = message.message_id
-
-            # 只处理文本和富文本消息
             text = self._extract_text_from_message(message)
             if not text:
                 return
 
             logger.debug("📨 收到消息 user={} chat={} text={!r}",
                          (user_id or "")[:10] + "...", chat_id[:10] + "...", text[:60])
-
-            response = self.dispatcher.dispatch_text(text, user_id or "", chat_id)
-            if response is None:
-                return
-
-            self._send_response(response, chat_id)
         except Exception as e:
-            logger.exception("处理飞书消息事件异常：{}", e)
+            logger.exception("解析飞书消息事件异常：{}", e)
+            return
+
+        # 异步处理：避免阻塞长连接
+        def _worker():
+            try:
+                response = self.dispatcher.dispatch_text(text, user_id or "", chat_id)
+                if response is not None:
+                    self._send_response(response, chat_id)
+            except Exception as exc:
+                logger.exception("处理飞书消息（异步）异常：{}", exc)
+
+        threading.Thread(
+            target=_worker, name=f"msg-{int(time.time()*1000)}", daemon=True
+        ).start()
 
     def _handle_card_action(self, data: Any) -> Any:
-        """卡片按钮回调。返回值会作为回调响应发给飞书客户端（触发卡片刷新等）。"""
+        """
+        卡片按钮回调。
+        **关键**：飞书要求 3 秒内响应，否则报 200340（"No card.action callback"）。
+        所以我们必须立即返回，把实际业务处理放到后台线程。
+        """
         try:
             event = getattr(data, "event", None)
             if event is None:
@@ -221,7 +235,6 @@ class App:
                         value = {"raw": raw_value}
 
             chat_id = ""
-            # action 回调也可能带 chat_id（不同 SDK 版本字段不同，多处兜底）
             ctx = getattr(event, "context", None)
             if ctx is not None:
                 chat_id = getattr(ctx, "open_chat_id", "") or ""
@@ -230,15 +243,23 @@ class App:
 
             logger.debug("🖱️  卡片按钮回调 user={} value={}",
                          user_id[:10] + "...", value)
-            response = self.dispatcher.dispatch_action(value, user_id)
-            if response is None:
-                return None
-
-            self._send_response(response, chat_id)
-            return None
         except Exception as e:
-            logger.exception("处理卡片回调异常：{}", e)
+            logger.exception("解析飞书卡片回调异常：{}", e)
             return None
+
+        # 异步处理：立即返回让飞书满意，业务在后台做
+        def _worker():
+            try:
+                response = self.dispatcher.dispatch_action(value, user_id)
+                if response is not None:
+                    self._send_response(response, chat_id)
+            except Exception as exc:
+                logger.exception("处理卡片回调（异步）异常：{}", exc)
+
+        threading.Thread(
+            target=_worker, name=f"card-{int(time.time()*1000)}", daemon=True
+        ).start()
+        return None
 
     # --------------------------------------------------------
     # 发送响应

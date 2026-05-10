@@ -155,7 +155,8 @@ def help_card() -> dict[str, Any]:
          "`/pause <id>` / `/resume <id>` / `/remove <id>` — 暂停/恢复/删除\n"
          "`/check <id>` — 立即触发一次检查\n"
          "`/history <id>` — 查看任务历史变更\n"
-         "`/interval <id> <秒>` — 修改检查间隔"),
+         "`/interval <id> <秒>` — 修改检查间隔\n"
+         "`/reset <id> [--strategy xx]` — 重置基准快照（抓取策略变更后用）"),
         ("🎯  精细化配置",
          "`/keyword <id> add <关键字>` — 添加关键字过滤\n"
          "`/keyword <id> remove <关键字>` — 移除关键字\n"
