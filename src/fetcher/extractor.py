@@ -361,15 +361,22 @@ def _eval_path(obj: Any, path: str) -> Any:
 # ============================================================
 # Jina Reader 元信息过滤
 # ============================================================
-_JINA_WARNING_RE = re.compile(
-    r"^(?:Warning|Note):.*(?:cached|snapshot|retry|opt-out).*$",
+# Jina Reader 会在正文前插入一些元信息行，常见形式：
+#   "Warning: This is a cached snapshot of the original page, consider retry with caching opt-out."
+#   "Warning: This page maybe not yet fully loaded, consider explicitly specify a timeout."
+#   "Warning: This page contains shadow DOM that are currently hidden..."
+#   "Note: ..."
+# 它们不是页面真实内容，但频繁变化（具体文案随 Jina 内部状态切换），
+# 会造成 diff 噪音，在比对前统一过滤掉。
+_JINA_META_RE = re.compile(
+    r"^(?:Warning|Note)\s*:.*$",
     re.MULTILINE | re.IGNORECASE,
 )
 
 
 def _strip_jina_warnings(text: str) -> str:
-    """移除 Jina Reader 返回的 Warning/Note 行（不属于页面正文内容）。"""
-    return _JINA_WARNING_RE.sub("", text)
+    """移除 Jina Reader 返回的 Warning/Note 元信息行（不属于页面正文内容）。"""
+    return _JINA_META_RE.sub("", text)
 
 
 # ============================================================
