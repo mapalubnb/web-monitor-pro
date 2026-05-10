@@ -55,7 +55,7 @@ def extract(task: Task, result: FetchResult) -> str:
 
     # Markdown（Jina / Firecrawl）
     if "markdown" in content_type or result.strategy_used in ("jina", "firecrawl"):
-        return _normalize(content)
+        return _normalize(_strip_jina_warnings(content))
 
     # HTML
     return _extract_html(content, task)
@@ -356,6 +356,20 @@ def _eval_path(obj: Any, path: str) -> Any:
         return None
 
     return walk(obj, tokens)
+
+
+# ============================================================
+# Jina Reader 元信息过滤
+# ============================================================
+_JINA_WARNING_RE = re.compile(
+    r"^(?:Warning|Note):.*(?:cached|snapshot|retry|opt-out).*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _strip_jina_warnings(text: str) -> str:
+    """移除 Jina Reader 返回的 Warning/Note 行（不属于页面正文内容）。"""
+    return _JINA_WARNING_RE.sub("", text)
 
 
 # ============================================================

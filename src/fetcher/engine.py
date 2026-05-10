@@ -338,6 +338,7 @@ class FetchEngine:
         jh = {
             "Accept": "text/plain",
             "User-Agent": headers.get("User-Agent", "web-monitor-pro/0.1"),
+            "x-no-cache": "true",  # 禁用 Jina 缓存，确保每次拿到最新页面
         }
         if self.cfg.jina_reader_api_key:
             jh["Authorization"] = f"Bearer {self.cfg.jina_reader_api_key}"
