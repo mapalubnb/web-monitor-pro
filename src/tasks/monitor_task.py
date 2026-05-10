@@ -148,6 +148,15 @@ class MonitorRunner:
     # ============================================================
     def _handle_no_change(self, task: Task) -> None:
         logger.debug("✅ #{} 无变化", task.id)
+        # 如果之前有 pending（上次检测到变化但还没确认），现在内容恢复了
+        # → 说明是闪烁，清除 pending
+        pending_path = self._pending_path(task.id)
+        if pending_path.exists():
+            self._clear_pending(pending_path)
+            logger.info(
+                "🔄 #{} [{}] 内容恢复到基准（闪烁），已清除 pending",
+                task.id, task.name,
+            )
         with session_scope() as s:
             t = s.get(Task, task.id)
             if t is None:
@@ -157,11 +166,86 @@ class MonitorRunner:
             t.consecutive_failures = 0
 
     # ============================================================
-    # 情况 3：变化
+    # 情况 3：变化（含二次确认，防止页面闪烁/抖动）
     # ============================================================
     def _handle_change(self, task: Task, result: FetchResult,
                        extracted: str, new_hash: str) -> None:
-        # 读取上次快照
+        """
+        变化处理流程（二次确认机制）：
+
+        为了防止页面内容闪烁（如 SPA 渲染不稳定、CDN 缓存切换）导致
+        "一行被删了又马上加回来"的假阳性推送，采用二次确认：
+
+        1. 首次发现变化 → 写 pending 标记（不推送、不更新基准）
+        2. 下次检查时：
+           - 若内容 hash 仍与 pending 一致 → 确认为真变化 → 推送
+           - 若内容恢复为基准 hash → 闪烁 → 清除 pending、不推送
+           - 若内容变成第三种 hash → 更新 pending、等待再次确认
+        """
+        keywords = list(task.keywords or [])
+        has_keywords = any(kw and kw.strip() for kw in keywords)
+
+        pending_path = self._pending_path(task.id)
+        pending_hash = self._read_pending(pending_path)
+
+        if pending_hash is None:
+            # === 首次发现变化：标记 pending，不推送 ===
+            self._write_pending(pending_path, new_hash)
+            logger.info(
+                "⏳ #{} [{}] 发现变化，等待下次确认（防闪烁）",
+                task.id, task.name,
+            )
+            # 只更新检查时间，不动基准
+            with session_scope() as s:
+                t = s.get(Task, task.id)
+                if t is None:
+                    return
+                t.last_checked_at = datetime.utcnow()
+                t.total_checks += 1
+                t.consecutive_failures = 0
+            return
+
+        # === 有 pending 标记 ===
+        if new_hash == task.last_content_hash:
+            # 恢复到基准 → 页面闪烁，清除 pending
+            self._clear_pending(pending_path)
+            logger.info(
+                "🔄 #{} [{}] 内容恢复原样（页面闪烁），已清除 pending",
+                task.id, task.name,
+            )
+            with session_scope() as s:
+                t = s.get(Task, task.id)
+                if t is None:
+                    return
+                t.last_checked_at = datetime.utcnow()
+                t.total_checks += 1
+                t.consecutive_failures = 0
+            return
+
+        if new_hash != pending_hash:
+            # 变成了第三种内容 → 更新 pending，继续等
+            self._write_pending(pending_path, new_hash)
+            logger.info(
+                "⏳ #{} [{}] 内容再次变化（不同于上次 pending），重新等待确认",
+                task.id, task.name,
+            )
+            with session_scope() as s:
+                t = s.get(Task, task.id)
+                if t is None:
+                    return
+                t.last_checked_at = datetime.utcnow()
+                t.total_checks += 1
+                t.consecutive_failures = 0
+            return
+
+        # === new_hash == pending_hash：二次确认通过 → 确认变化 ===
+        self._clear_pending(pending_path)
+        logger.info(
+            "✅ #{} [{}] 二次确认通过，确认为真实变化",
+            task.id, task.name,
+        )
+
+        # 读取基准快照做 diff
         before = ""
         if task.last_snapshot_path and Path(task.last_snapshot_path).exists():
             try:
@@ -172,14 +256,9 @@ class MonitorRunner:
                 logger.warning("读取上次快照失败: {}", e)
 
         full_diff = compute_diff(before, extracted, is_json=(task.type == "json"))
-
-        # 如果配置了关键词：只保留命中关键词的行，作为"用户真正关心的变化"
-        keywords = list(task.keywords or [])
-        has_keywords = any(kw and kw.strip() for kw in keywords)
         diff = filter_by_keywords(full_diff, keywords) if has_keywords else full_diff
 
-        # 关键词模式下，如果过滤后没行 → 页面变化与关键词无关
-        # 静默推进基准：更新 hash/快照/检查时间，但不推送、不计入 total_changes
+        # 关键词模式下，过滤后没行 → 静默推进基准
         if has_keywords and not diff.changed:
             logger.info(
                 "🔇 #{} [{}] 页面有变化但未触及关键字 {} → 静默更新基准",
@@ -197,7 +276,7 @@ class MonitorRunner:
                 t.consecutive_failures = 0
             return
 
-        # 持久化（diff 文件写的是"过滤后"的 diff，用户下载看到的就是关心的部分）
+        # 持久化
         snap_path = self._save_snapshot(task.id, extracted)
         diff_path = self._save_diff(task.id, diff.unified_diff)
 
@@ -227,7 +306,7 @@ class MonitorRunner:
             task_name = t.name
             task_url = t.url
 
-        # 风控过滤（is_muted / cooldown / 非关键词模式的占比阈值）
+        # 风控过滤
         should_push, reason = self.risk.should_push_change(
             task.id, diff, keywords
         )
@@ -312,6 +391,38 @@ class MonitorRunner:
         path = SNAPSHOT_DIR / f"task_{task_id}_latest.diff"
         path.write_text(unified or "", encoding="utf-8")
         return path
+
+    # ============================================================
+    # Pending（二次确认）文件操作
+    # ============================================================
+    @staticmethod
+    def _pending_path(task_id: int) -> Path:
+        """pending 标记文件路径。"""
+        return SNAPSHOT_DIR / f"task_{task_id}_pending.hash"
+
+    @staticmethod
+    def _read_pending(path: Path) -> str | None:
+        """读取 pending hash；不存在返回 None。"""
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8").strip()
+                return content if content else None
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _write_pending(path: Path, hash_val: str) -> None:
+        """写入 pending hash。"""
+        path.write_text(hash_val, encoding="utf-8")
+
+    @staticmethod
+    def _clear_pending(path: Path) -> None:
+        """清除 pending 标记。"""
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 __all__ = ["MonitorRunner"]

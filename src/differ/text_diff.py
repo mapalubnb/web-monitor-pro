@@ -80,6 +80,10 @@ def _compute_text_diff(before: str, after: str, max_lines_in_summary: int) -> Di
     added = [line for line in added if line.strip()]
     removed = [line for line in removed if line.strip()]
 
+    # 消除"位置移动"：内容相同的行同时出现在 added 和 removed 里，
+    # 说明只是顺序变了而非真正的增删。逐一抵消（保持计数匹配）。
+    added, removed = _cancel_moved_lines(added, removed)
+
     total_lines = max(len(before_lines), len(after_lines), 1)
     change_ratio = (len(added) + len(removed)) / total_lines
 
@@ -127,6 +131,48 @@ def _build_text_summary(added: list[str], removed: list[str], max_lines: int) ->
         if len(removed) > max_lines:
             parts.append(f"  ...（省略 {len(removed) - max_lines} 行）")
     return "\n".join(parts)
+
+
+def _cancel_moved_lines(added: list[str], removed: list[str]) -> tuple[list[str], list[str]]:
+    """
+    消除"位置移动"产生的假 diff。
+
+    如果同一行内容同时出现在 added 和 removed 中，说明它只是换了位置，
+    不是真正的增删。按计数逐一抵消。
+
+    例如：
+      removed = ["A", "B", "A"]
+      added   = ["A", "C"]
+    → removed 里有 2 个 "A"，added 里有 1 个 "A"，抵消 1 对：
+      removed = ["B", "A"]   （仍有 1 个多余的 "A" 真被删了）
+      added   = ["C"]
+    """
+    from collections import Counter
+    add_counts = Counter(added)
+    rem_counts = Counter(removed)
+    # 找出双方都有的行，抵消 min(出现次数) 对
+    cancel: dict[str, int] = {}
+    for line in add_counts:
+        if line in rem_counts:
+            cancel[line] = min(add_counts[line], rem_counts[line])
+    if not cancel:
+        return added, removed
+    # 从两侧各去掉相应数量
+    new_added: list[str] = []
+    cancel_add = dict(cancel)
+    for ln in added:
+        if cancel_add.get(ln, 0) > 0:
+            cancel_add[ln] -= 1
+        else:
+            new_added.append(ln)
+    new_removed: list[str] = []
+    cancel_rem = dict(cancel)
+    for ln in removed:
+        if cancel_rem.get(ln, 0) > 0:
+            cancel_rem[ln] -= 1
+        else:
+            new_removed.append(ln)
+    return new_added, new_removed
 
 
 def _truncate(s: str, n: int) -> str:
@@ -290,6 +336,9 @@ def filter_by_keywords(
 
     added = [ln for ln in diff.added_lines if _hit(ln)]
     removed = [ln for ln in diff.removed_lines if _hit(ln)]
+
+    # 消除"位置移动"：内容相同的行同时在 added 和 removed 中出现
+    added, removed = _cancel_moved_lines(added, removed)
 
     if not added and not removed:
         # 变化与关键词无关：视为"对关键词来说没变化"
