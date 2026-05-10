@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import random
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from ..config import AppConfig
@@ -192,8 +192,7 @@ class FetchEngine:
              "https": cfg.https_proxy or cfg.http_proxy}
             if proxy else None
         )
-        self._httpx_client: Any = None  # 懒加载
-        self._httpx_client_lock = False  # 简化：同步创建，单次
+        self._httpx_client: Any = None  # 懒加载，首次使用时创建
 
     # ----- 对外入口 -----
     def fetch(self, task: Task) -> FetchResult:
@@ -408,7 +407,3 @@ class FetchEngine:
             except Exception:
                 pass
             self._httpx_client = None
-
-
-# 兼容导出
-_has_any_embedded_data = lambda html: any(m in html for m in _EMBEDDED_DATA_MARKERS)

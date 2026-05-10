@@ -1,8 +1,34 @@
 #!/usr/bin/env bash
-# 卸载 Web Monitor Pro 的 systemd 服务（保留代码和数据）
+# ============================================================
+# Web Monitor Pro 卸载脚本
+# 默认：仅卸载 systemd 服务，保留代码和数据
+# --purge：同时删除 venv、data（数据库/快照/日志）、.env、config.yaml
+# ============================================================
+
 set -euo pipefail
 
 SERVICE_NAME="web-monitor-pro"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PURGE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --purge) PURGE=1; shift ;;
+        -h|--help)
+            cat <<EOF
+用法: sudo bash uninstall.sh [选项]
+
+选项:
+  --purge     同时删除 venv/data/.env/config.yaml（彻底清理）
+  -h, --help  显示帮助
+
+默认:           仅卸载 systemd 服务，代码和数据保留
+sudo bash uninstall.sh --purge   彻底清理（除源码外）
+EOF
+            exit 0 ;;
+        *) echo "未知参数：$1" >&2; exit 1 ;;
+    esac
+done
 
 if [[ ${EUID} -ne 0 ]]; then
     echo "请用 sudo 运行" >&2
@@ -17,5 +43,14 @@ echo "🗑️  移除 systemd 文件..."
 rm -f "/etc/systemd/system/${SERVICE_NAME}.service"
 systemctl daemon-reload
 
-echo "✅ 已卸载 systemd 服务（代码和数据保留在项目目录）"
-echo "💡 如需彻底清理，手动 rm -rf 项目目录即可"
+if [[ ${PURGE} -eq 1 ]]; then
+    echo "🧹 彻底清理 venv / data / .env / config.yaml ..."
+    rm -rf "${SCRIPT_DIR}/venv"
+    rm -rf "${SCRIPT_DIR}/data"
+    rm -f  "${SCRIPT_DIR}/.env"
+    rm -f  "${SCRIPT_DIR}/config.yaml"
+    echo "✅ 已彻底清理（仅保留源码）"
+else
+    echo "✅ 已卸载 systemd 服务（代码和数据保留在项目目录）"
+    echo "💡 如需彻底清理：sudo bash uninstall.sh --purge"
+fi
