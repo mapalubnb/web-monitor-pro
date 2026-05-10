@@ -1,0 +1,31 @@
+[Unit]
+# 模板：install.sh 会根据实际安装路径生成 /etc/systemd/system/web-monitor-pro.service
+# 如需手动使用本文件，请替换 {{PROJECT_DIR}} 和 {{RUN_USER}} 占位符
+Description=Web Monitor Pro - 网页变化监控 + 飞书交互机器人
+Documentation=https://github.com/mapalubnb/web-monitor-pro
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{RUN_USER}}
+WorkingDirectory={{PROJECT_DIR}}
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH={{PROJECT_DIR}}"
+ExecStart={{PROJECT_DIR}}/venv/bin/python -m src.main
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=5
+
+LimitNOFILE=65535
+StandardOutput=append:{{PROJECT_DIR}}/data/logs/systemd-stdout.log
+StandardError=append:{{PROJECT_DIR}}/data/logs/systemd-stderr.log
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

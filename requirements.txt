@@ -1,0 +1,31 @@
+# ============ HTTP 抓取 ============
+# 主力：伪造 Chrome TLS/JA3/HTTP2 指纹，过 Cloudflare 等 TLS 指纹防护
+curl_cffi>=0.7.4
+# 轻量备选：L1/L2 静态页面可直接用
+httpx[http2]>=0.27.0
+
+# ============ HTML/正文提取 ============
+selectolax>=0.3.21        # 超快 HTML 解析器（比 BeautifulSoup 快 ~30x）
+trafilatura>=1.12.0       # 一流的正文提取
+readability-lxml>=0.8.1   # 正文提取备选
+lxml>=5.2.0
+
+# ============ Diff ============
+deepdiff>=7.0.0           # JSON 结构化 diff
+
+# ============ 飞书 ============
+lark-oapi>=1.4.0          # 飞书官方 SDK（含 WebSocket 长连接）
+
+# ============ 调度 / 存储 / 配置 ============
+APScheduler>=3.10.4
+SQLAlchemy>=2.0.30
+aiosqlite>=0.20.0
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+
+# ============ 日志 ============
+loguru>=0.7.2
+
+# ============ 其他 ============
+tenacity>=8.2.3           # 重试
+pydantic>=2.7.0           # 配置校验
