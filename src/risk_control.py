@@ -141,16 +141,22 @@ class RiskController:
                 f"{self.cfg.min_change_ratio:.3%}",
             )
         if keywords:
-            text = "\n".join(diff.added_lines + diff.removed_lines).lower()
-            if not any(kw.lower() in text for kw in keywords):
-                return False, f"未命中关键字 {keywords}"
+            # 只保留非空关键字，空字符串 "" 会导致 `"" in text` 永真，制造假阳性
+            kws = [kw for kw in keywords if kw and kw.strip()]
+            if kws:
+                text = "\n".join(diff.added_lines + diff.removed_lines).lower()
+                if not any(kw.lower() in text for kw in kws):
+                    return False, f"未命中关键字 {kws}"
         return True, ""
 
     def matched_keywords(self, diff: DiffResult, keywords: list[str]) -> list[str]:
         if not keywords:
             return []
+        kws = [kw for kw in keywords if kw and kw.strip()]
+        if not kws:
+            return []
         text = "\n".join(diff.added_lines + diff.removed_lines).lower()
-        return [kw for kw in keywords if kw.lower() in text]
+        return [kw for kw in kws if kw.lower() in text]
 
     def should_alert_failure(self, consecutive_failures: int) -> bool:
         return consecutive_failures >= self.cfg.alert_after_consecutive_failures

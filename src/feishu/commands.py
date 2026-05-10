@@ -206,6 +206,7 @@ class CommandDispatcher:
         parser.add_argument("--json-path", dest="json_path", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
                             action="store_true")
+        # --keyword 可重复；每个 --keyword 的值再支持逗号/中文逗号分隔。
         parser.add_argument("--keyword", action="append", default=[])
         ns = parser.parse_args(args)
 
@@ -214,6 +215,10 @@ class CommandDispatcher:
             return CommandResponse.err("URL 必须以 http:// 或 https:// 开头")
 
         name = ns.name or _url_to_name(url)
+
+        # 解析关键字：支持 --keyword a --keyword b,c --keyword "d e"
+        # 英文/中文逗号、中文顿号都算分隔符
+        keywords = _parse_keywords(ns.keyword)
 
         with session_scope() as s:
             exists = s.execute(
@@ -228,19 +233,27 @@ class CommandDispatcher:
                 name=name, url=url, type=ns.type, strategy=ns.strategy,
                 impersonate=ns.impersonate, selector=ns.selector,
                 json_path=ns.json_path, extract_next_data=ns.extract_next_data,
-                interval=ns.interval, keywords=ns.keyword or [], enabled=True,
+                interval=ns.interval, keywords=keywords, enabled=True,
             )
             s.add(t)
             s.flush()
             task_id = t.id
 
-        logger.info("➕ 新增任务 #{} [{}] url={}", task_id, name, url)
+        logger.info(
+            "➕ 新增任务 #{} [{}] url={} 关键字={}",
+            task_id, name, url, keywords,
+        )
+        kw_line = (
+            f"\n🎯 关键字：{', '.join(f'`{k}`' for k in keywords)}"
+            if keywords else ""
+        )
         return CommandResponse(
             card=cards.success_card(
                 "任务已添加",
                 f"**#{task_id} · {name}**\n"
                 f"🔗 {url}\n"
-                f"⏱️ 间隔 {ns.interval}s · 🎯 策略 {ns.strategy}\n\n"
+                f"⏱️ 间隔 {ns.interval}s · 🎯 策略 {ns.strategy}"
+                f"{kw_line}\n\n"
                 f"首次抓取后会建立基准快照并推送卡片。",
             ),
             trigger_check_task_id=task_id,
@@ -372,42 +385,114 @@ class CommandDispatcher:
     # /keyword
     # ============================================================
     def _cmd_keyword(self, args: list[str]) -> CommandResponse:
-        if len(args) < 3:
+        """
+        /keyword <ID> add <关键字>[, <关键字2>, ...]
+        /keyword <ID> remove <关键字>[, <关键字2>, ...]
+        /keyword <ID> list              查看当前关键字
+        /keyword <ID> clear             清空所有关键字
+        """
+        if len(args) < 2:
             return CommandResponse.err(
-                "用法：`/keyword <ID> add <关键字>` 或 `/keyword <ID> remove <关键字>`"
+                "用法：\n"
+                "• `/keyword <ID> add <关键字1> [关键字2] ...`\n"
+                "• `/keyword <ID> remove <关键字1> [关键字2] ...`\n"
+                "• `/keyword <ID> list` / `clear`"
             )
         try:
             task_id = int(args[0])
         except ValueError:
             return CommandResponse.err("任务 ID 必须为整数")
         op = args[1].lower()
-        keyword = " ".join(args[2:]).strip()
-        if op not in ("add", "remove"):
-            return CommandResponse.err("操作必须为 add 或 remove")
 
         with session_scope() as s:
             t = s.get(Task, task_id)
             if t is None:
                 return CommandResponse.err(f"未找到任务 #{task_id}")
-            keywords = list(t.keywords or [])
-            if op == "add":
-                if keyword in keywords:
-                    return CommandResponse.err(f"关键字已存在：`{keyword}`")
-                keywords.append(keyword)
-                verb = "➕ 已添加"
-            else:
-                if keyword not in keywords:
-                    return CommandResponse.err(f"关键字不存在：`{keyword}`")
-                keywords.remove(keyword)
-                verb = "➖ 已移除"
-            t.keywords = keywords
             name = t.name
+            current = list(t.keywords or [])
 
-        logger.info("🎯 任务 #{} [{}] {} 关键字 {}", task_id, name, verb, keyword)
-        return CommandResponse.ok(
-            f"{verb}关键字",
-            f"任务 #{task_id} · {name}\n关键字：`{keyword}`",
-        )
+            if op == "list":
+                text = (
+                    "\n".join(f"• `{k}`" for k in current)
+                    if current else "（未配置关键字）"
+                )
+                return CommandResponse(card=cards.success_card(
+                    f"🎯 任务 #{task_id} · {name} 的关键字",
+                    text + f"\n\n共 {len(current)} 个。",
+                ))
+
+            if op == "clear":
+                if not current:
+                    return CommandResponse.err("当前就没有关键字")
+                t.keywords = []
+                logger.info("🎯 任务 #{} [{}] 清空了 {} 个关键字",
+                            task_id, name, len(current))
+                return CommandResponse.ok(
+                    "🧹 已清空关键字",
+                    f"任务 #{task_id} · {name}\n清除了 {len(current)} 个关键字",
+                )
+
+            if op not in ("add", "remove"):
+                return CommandResponse.err(
+                    "操作必须是 add / remove / list / clear"
+                )
+
+            if len(args) < 3:
+                return CommandResponse.err(f"用法：`/keyword {task_id} {op} <关键字>`")
+
+            # 解析关键字（支持空格分隔 + 逗号/顿号分隔混合）
+            raw_inputs = args[2:]
+            new_kws = _parse_keywords(raw_inputs)
+            if not new_kws:
+                return CommandResponse.err("未解析到有效关键字（不能为空或纯空白）")
+
+            if op == "add":
+                added, skipped = [], []
+                for kw in new_kws:
+                    if kw in current:
+                        skipped.append(kw)
+                    else:
+                        current.append(kw)
+                        added.append(kw)
+                if not added:
+                    return CommandResponse.err(
+                        f"关键字都已存在：{', '.join(f'`{k}`' for k in skipped)}"
+                    )
+                t.keywords = current
+                detail = (
+                    f"任务 #{task_id} · {name}\n"
+                    f"➕ 新增：{', '.join(f'`{k}`' for k in added)}"
+                )
+                if skipped:
+                    detail += f"\n⏭️ 已存在跳过：{', '.join(f'`{k}`' for k in skipped)}"
+                detail += f"\n\n当前共 {len(current)} 个关键字。"
+                logger.info("🎯 任务 #{} [{}] ➕ 关键字 {}",
+                            task_id, name, added)
+                return CommandResponse.ok("🎯 已更新关键字", detail)
+
+            # op == "remove"
+            removed, missing = [], []
+            for kw in new_kws:
+                if kw in current:
+                    current.remove(kw)
+                    removed.append(kw)
+                else:
+                    missing.append(kw)
+            if not removed:
+                return CommandResponse.err(
+                    f"以下关键字都不存在：{', '.join(f'`{k}`' for k in missing)}"
+                )
+            t.keywords = current
+            detail = (
+                f"任务 #{task_id} · {name}\n"
+                f"➖ 移除：{', '.join(f'`{k}`' for k in removed)}"
+            )
+            if missing:
+                detail += f"\n⏭️ 未找到跳过：{', '.join(f'`{k}`' for k in missing)}"
+            detail += f"\n\n当前共 {len(current)} 个关键字。"
+            logger.info("🎯 任务 #{} [{}] ➖ 关键字 {}",
+                        task_id, name, removed)
+            return CommandResponse.ok("🎯 已更新关键字", detail)
 
     # ============================================================
     # /config
@@ -682,6 +767,36 @@ def _first_int(args: list[str]) -> int | None:
         return int(args[0])
     except ValueError:
         return None
+
+
+# 关键字分隔符：英文逗号、中文逗号、中文顿号、分号（中英）
+_KW_SEP_RE = re.compile(r"[,，、;；]+")
+
+
+def _parse_keywords(raw_inputs: list[str]) -> list[str]:
+    """
+    解析多种形式的关键字输入，返回清理后的关键字列表（去空、去重、保持顺序）。
+
+    支持：
+    - ["招聘", "金融"]                   → ["招聘", "金融"]
+    - ["招聘,金融,Python"]               → ["招聘", "金融", "Python"]
+    - ["招聘、金融"]                     → ["招聘", "金融"]
+    - ["招聘 金融"]  （已被 shlex 拆开）→ ["招聘", "金融"]（外层传进来多个元素）
+    - ["  ", ""]                        → [] （全空字符串被过滤）
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_inputs:
+        if not raw:
+            continue
+        for part in _KW_SEP_RE.split(raw):
+            kw = part.strip()
+            if not kw:
+                continue
+            if kw not in seen:
+                seen.add(kw)
+                result.append(kw)
+    return result
 
 
 def _make_parser(prog: str) -> argparse.ArgumentParser:

@@ -141,8 +141,9 @@ def help_card() -> dict:
          "`/interval <id> <秒>` — 修改间隔\n"
          "`/reset <id> [--strategy jina]` — 重置基准（策略调优用）"),
         ("🎯  精细化配置",
-         "`/keyword <id> add <关键字>` — 添加关键字过滤\n"
-         "`/keyword <id> remove <关键字>` — 移除关键字\n"
+         "`/keyword <id> add <关键字>[, 关键字2, ...]` — 添加关键字（支持批量）\n"
+         "`/keyword <id> remove <关键字>[, ...]` — 移除关键字（支持批量）\n"
+         "`/keyword <id> list` / `clear` — 查看 / 清空关键字\n"
          "`/sniff <url>` — 抓包助手（引导找 API）\n"
          "`/debug <id>` — 诊断页面（框架/数据点/建议）"),
         ("📊  服务管理",
@@ -160,7 +161,10 @@ def help_card() -> dict:
         elements.append(_div(f"**{title}**\n{content}"))
         elements.append(_hr())
     elements.append(_note(
-        "💡 `/add https://example.com --name 官网 --interval 60 --keyword 招聘`"
+        "💡 示例：\n"
+        "• `/add https://example.com --name 官网 --interval 60 --keyword 招聘,金融`\n"
+        "• `/keyword 3 add Python, 高级工程师, 远程` — 一次加多个\n"
+        "• `/list` 查看所有任务与关键字"
     ))
     return _card("📘 命令帮助", THEME["info"], elements)
 
