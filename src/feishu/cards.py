@@ -350,14 +350,17 @@ def task_detail_card(t: dict[str, Any]) -> dict[str, Any]:
         _div(f"🕐 **上次检查**：{t.get('last_checked_at') or '从未'}"),
         _div(f"🔔 **上次变更**：{t.get('last_changed_at') or '从未'}"),
         _hr(),
-        _action([
-            _btn("⚡ 立即检查", "check", t["id"], style="primary"),
-            _btn("📜 历史变更", "history", t["id"]),
-            _btn("⏸️ 暂停" if t["enabled"] else "▶️ 恢复",
-                 "pause" if t["enabled"] else "resume", t["id"]),
-            _btn("🗑️ 删除", "remove", t["id"], style="danger"),
-        ]),
     ]
+    buttons = [
+        _btn("⚡ 立即检查", "check", t["id"], style="primary"),
+        _btn("📜 历史变更", "history", t["id"]),
+    ]
+    if t.get("has_snapshot"):
+        buttons.append(_btn("📥 下载快照", "snapshot", t["id"]))
+    buttons.append(_btn("⏸️ 暂停" if t["enabled"] else "▶️ 恢复",
+                        "pause" if t["enabled"] else "resume", t["id"]))
+    buttons.append(_btn("🗑️ 删除", "remove", t["id"], style="danger"))
+    elements.append(_action(buttons))
     return _card("📄 任务详情", THEME["info"], elements, subtitle=f"#{t['id']} · {t['name']}")
 
 
