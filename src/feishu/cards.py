@@ -154,7 +154,8 @@ def help_card() -> dict[str, Any]:
          "`/list` — 列出所有任务\n"
          "`/pause <id>` / `/resume <id>` / `/remove <id>` — 暂停/恢复/删除\n"
          "`/check <id>` — 立即触发一次检查\n"
-         "`/history <id>` — 查看任务历史变更"),
+         "`/history <id>` — 查看任务历史变更\n"
+         "`/snapshot <id>` — 下载该任务最新快照文件"),
         ("🎯  精细化配置",
          "`/keyword <id> add <关键字>` — 添加关键字过滤\n"
          "`/keyword <id> remove <关键字>` — 移除关键字\n"
@@ -301,8 +302,17 @@ def task_list_card(tasks: list[dict[str, Any]]) -> dict[str, Any]:
             f"🔔 变更 `{t.get('total_changes', 0)}` 次 · "
             f"🕐 上次 `{last_time}`"
         ))
+        # 关键词（仅当配置了才显示）
+        keywords = t.get("keywords") or []
+        if keywords:
+            elements.append(_div(
+                f"🎯 **关键字**：{', '.join(f'`{k}`' for k in keywords)}"
+            ))
         btns = [_btn("⚡ 立即检查", "check", t["id"]),
                 _btn("📜 历史", "history", t["id"])]
+        # 有基准快照才展示下载按钮
+        if t.get("has_snapshot"):
+            btns.append(_btn("📥 下载快照", "snapshot", t["id"]))
         if t["enabled"]:
             btns.append(_btn("⏸️ 暂停", "pause", t["id"]))
         else:
