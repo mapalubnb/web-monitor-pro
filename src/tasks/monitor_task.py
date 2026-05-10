@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..config import SNAPSHOT_DIR, AppConfig
 from ..db import ChangeHistory, Task, session_scope
-from ..differ import compute_diff
+from ..differ import compute_diff, filter_by_keywords
 from ..feishu import FeishuClient, cards
 from ..feishu.client import ensure_upload_size
 from ..fetcher import FetchEngine, FetchResult, content_hash, extract
@@ -171,9 +171,33 @@ class MonitorRunner:
             except Exception as e:
                 logger.warning("读取上次快照失败: {}", e)
 
-        diff = compute_diff(before, extracted, is_json=(task.type == "json"))
+        full_diff = compute_diff(before, extracted, is_json=(task.type == "json"))
 
-        # 持久化
+        # 如果配置了关键词：只保留命中关键词的行，作为"用户真正关心的变化"
+        keywords = list(task.keywords or [])
+        has_keywords = any(kw and kw.strip() for kw in keywords)
+        diff = filter_by_keywords(full_diff, keywords) if has_keywords else full_diff
+
+        # 关键词模式下，如果过滤后没行 → 页面变化与关键词无关
+        # 静默推进基准：更新 hash/快照/检查时间，但不推送、不计入 total_changes
+        if has_keywords and not diff.changed:
+            logger.info(
+                "🔇 #{} [{}] 页面有变化但未触及关键字 {} → 静默更新基准",
+                task.id, task.name, [kw for kw in keywords if kw and kw.strip()],
+            )
+            snap_path = self._save_snapshot(task.id, extracted)
+            with session_scope() as s:
+                t = s.get(Task, task.id)
+                if t is None:
+                    return
+                t.last_content_hash = new_hash
+                t.last_snapshot_path = str(snap_path)
+                t.last_checked_at = datetime.utcnow()
+                t.total_checks += 1
+                t.consecutive_failures = 0
+            return
+
+        # 持久化（diff 文件写的是"过滤后"的 diff，用户下载看到的就是关心的部分）
         snap_path = self._save_snapshot(task.id, extracted)
         diff_path = self._save_diff(task.id, diff.unified_diff)
 
@@ -181,7 +205,6 @@ class MonitorRunner:
             t = s.get(Task, task.id)
             if t is None:
                 return
-            keywords = list(t.keywords or [])
             matched = self.risk.matched_keywords(diff, keywords)
 
             s.add(ChangeHistory(
@@ -204,7 +227,7 @@ class MonitorRunner:
             task_name = t.name
             task_url = t.url
 
-        # 风控过滤
+        # 风控过滤（is_muted / cooldown / 非关键词模式的占比阈值）
         should_push, reason = self.risk.should_push_change(
             task.id, diff, keywords
         )
@@ -232,6 +255,7 @@ class MonitorRunner:
             strategy=result.strategy_used,
             matched_keywords=matched,
             has_diff_file=bool(diff.unified_diff),
+            keyword_filtered=has_keywords,
         )
         file_path = (
             ensure_upload_size(diff_path)

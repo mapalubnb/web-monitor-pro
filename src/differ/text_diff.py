@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import difflib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -249,3 +249,84 @@ def _flatten_json(obj, prefix: str = "") -> list[str]:
     else:
         result.append(f"{prefix}={obj}")
     return result
+
+
+# ============================================================
+# 关键词过滤
+# ============================================================
+def filter_by_keywords(
+    diff: DiffResult,
+    keywords: list[str],
+    *,
+    max_lines_in_summary: int = 8,
+) -> DiffResult:
+    """
+    按关键词过滤一个已有的 DiffResult，只保留包含任一关键词的新增/删除行。
+
+    语义：用户配置关键词 = "我只关心这些关键词附近的变化"。
+    - 返回一个新的 DiffResult：added_lines / removed_lines / summary / unified_diff
+      都只含命中关键词的行。
+    - 若过滤后没有任何行 → `changed=False`，表示"本次变化与关键词无关"。
+    - 不修改原 DiffResult（dataclasses.replace 返回副本）。
+
+    Args:
+        diff: 原始完整 diff
+        keywords: 关键字列表（空字符串会被忽略）
+        max_lines_in_summary: 传给摘要生成器
+
+    Returns:
+        过滤后的新 DiffResult。若 keywords 为空则原样返回 diff。
+    """
+    kws = [kw.strip() for kw in (keywords or []) if kw and kw.strip()]
+    if not kws:
+        return diff
+
+    # 不区分大小写匹配；保留原始行用于展示
+    lowered_kws = [kw.lower() for kw in kws]
+
+    def _hit(line: str) -> bool:
+        ll = line.lower()
+        return any(kw in ll for kw in lowered_kws)
+
+    added = [ln for ln in diff.added_lines if _hit(ln)]
+    removed = [ln for ln in diff.removed_lines if _hit(ln)]
+
+    if not added and not removed:
+        # 变化与关键词无关：视为"对关键词来说没变化"
+        return replace(
+            diff,
+            changed=False,
+            added_lines=[],
+            removed_lines=[],
+            change_ratio=0.0,
+            similarity=1.0,
+            unified_diff="",
+            summary="",
+        )
+
+    summary = _build_text_summary(added, removed, max_lines_in_summary)
+
+    # 重建 unified_diff：从原 unified_diff 中挑出与命中行相关的 hunk 段
+    # 简化起见，直接用过滤后的 added/removed 行拼一个轻量 unified 文本
+    unified_lines = ["--- before", "+++ after"]
+    for ln in removed:
+        unified_lines.append(f"-{ln}")
+    for ln in added:
+        unified_lines.append(f"+{ln}")
+    unified = "\n".join(unified_lines)
+
+    # change_ratio 用"命中行 / 原 diff 行总数"，低估但直观
+    orig_total = max(len(diff.added_lines) + len(diff.removed_lines), 1)
+    hit_total = len(added) + len(removed)
+    change_ratio = hit_total / orig_total
+
+    return replace(
+        diff,
+        changed=True,
+        added_lines=added,
+        removed_lines=removed,
+        change_ratio=change_ratio,
+        similarity=max(0.0, 1.0 - change_ratio),
+        unified_diff=unified,
+        summary=summary,
+    )

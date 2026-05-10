@@ -127,26 +127,35 @@ class RiskController:
     def should_push_change(
         self, task_id: int, diff: DiffResult, keywords: list[str]
     ) -> tuple[bool, str]:
-        """判断变化是否值得推送。返回 (是否推, 不推的理由)。"""
+        """判断变化是否值得推送。返回 (是否推, 不推的理由)。
+
+        语义说明：
+        - 当任务配置了关键词时，调用方应该先用 `differ.filter_by_keywords`
+          过滤出"命中关键词的行"，再把过滤后的 diff 传进来。
+          此时：diff.changed=True 表示关键词所在行发生了变化 → 直接推送；
+          diff.changed=False 表示本次整页变化与关键词无关 → 不推送。
+          关键词模式下不走 `min_change_ratio` 噪音阈值（用户已经明确表达关注点）。
+        - 没有配置关键词时，走原"噪音占比"路径。
+        """
         if self.is_muted():
             return False, "服务处于免打扰期"
         if self._is_cooling(task_id):
             return False, f"任务 #{task_id} 处于推送冷却期"
         if not diff.changed:
+            # 关键词模式下意味着"变化与关键词无关"；普通模式下意味着没差异
+            kws = [kw for kw in (keywords or []) if kw and kw.strip()]
+            if kws:
+                return False, f"本次变化未触及关键字 {kws}"
             return False, "无实质变化"
-        if diff.change_ratio < self.cfg.min_change_ratio:
+
+        # 有关键词时：跳过占比阈值——关键词本身就是用户指定的"信号"
+        has_keywords = any(kw and kw.strip() for kw in (keywords or []))
+        if not has_keywords and diff.change_ratio < self.cfg.min_change_ratio:
             return (
                 False,
                 f"变化占比 {diff.change_ratio:.3%} 低于阈值 "
                 f"{self.cfg.min_change_ratio:.3%}",
             )
-        if keywords:
-            # 只保留非空关键字，空字符串 "" 会导致 `"" in text` 永真，制造假阳性
-            kws = [kw for kw in keywords if kw and kw.strip()]
-            if kws:
-                text = "\n".join(diff.added_lines + diff.removed_lines).lower()
-                if not any(kw.lower() in text for kw in kws):
-                    return False, f"未命中关键字 {kws}"
         return True, ""
 
     def matched_keywords(self, diff: DiffResult, keywords: list[str]) -> list[str]:

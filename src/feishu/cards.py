@@ -202,11 +202,15 @@ def change_card(task_id: int, task_name: str, url: str,
                 added_count: int, removed_count: int,
                 change_ratio: float, diff_summary: str, strategy: str,
                 matched_keywords: list[str] | None = None,
-                has_diff_file: bool = True) -> dict:
-    kw_line = (
-        f"🎯 **命中关键字**：`{', '.join(matched_keywords)}`\n\n"
-        if matched_keywords else ""
-    )
+                has_diff_file: bool = True,
+                keyword_filtered: bool = False) -> dict:
+    if matched_keywords:
+        kw_line = (
+            f"🎯 **命中关键字**：`{', '.join(matched_keywords)}`"
+            + ("（已按关键字过滤，仅展示相关行）\n\n" if keyword_filtered else "\n\n")
+        )
+    else:
+        kw_line = ""
     display = diff_summary or "（diff 摘要为空）"
     if len(display) > 2800:
         display = display[:2800] + "\n\n…（完整内容见附件）"
@@ -225,7 +229,10 @@ def change_card(task_id: int, task_name: str, url: str,
         _div(f"```diff\n{display}\n```"),
     ]
     if has_diff_file:
-        elements.append(_note("📎 完整 diff 已作为附件发送"))
+        note = "📎 完整 diff 已作为附件发送"
+        if keyword_filtered:
+            note = "📎 附件为关键字过滤后的 diff（仅含命中行）"
+        elements.append(_note(note))
     elements.append(_hr())
     elements.append(_action(_task_buttons(task_id, enabled=True, url=url)))
 
