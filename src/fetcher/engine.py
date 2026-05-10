@@ -1,16 +1,12 @@
 """
 多策略抓取引擎
 
-优先级（自动模式）：
-  1. curl_cffi 伪装 Chrome TLS/JA3 指纹（主力，能过多数 Cloudflare）
-  2. httpx + 浏览器请求头（轻量备选，适合 L1-L2 静态页）
-  3. 外部渲染 API（Jina Reader / Firecrawl，兜底）
+auto 模式优先级：
+  1. curl_cffi（伪装 Chrome TLS，过 Cloudflare）
+  2. httpx（轻量静态页）
+  3. Jina Reader（外部渲染兜底）
 
-所有策略都自动带：
-  - 浏览器级请求头（User-Agent、Accept、Sec-Ch-Ua 等）
-  - 可选代理
-  - 超时控制
-  - 失败自动 fallback 到下一策略
+用户指定 curl_cffi / httpx 时，若抓到空壳会自动升级到 Jina。
 """
 
 from __future__ import annotations
@@ -25,13 +21,9 @@ from ..db import Task
 from ..logger import logger
 
 
-# ============================================================
-# 结果数据结构
-# ============================================================
 @dataclass
 class FetchResult:
     """抓取结果。"""
-
     ok: bool
     url: str
     status_code: int | None = None
@@ -39,240 +31,244 @@ class FetchResult:
     content_type: str = ""
     strategy_used: str = ""
     error: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
         return self.ok
 
 
-# ============================================================
-# 浏览器请求头生成
-# ============================================================
-# curl_cffi 支持的 impersonate 目标
-SUPPORTED_IMPERSONATE = [
+# curl_cffi 支持的浏览器指纹
+SUPPORTED_IMPERSONATE = (
     "chrome131", "chrome124", "chrome120",
     "firefox133", "firefox135",
     "safari18_0", "safari17_0",
-]
+)
 
-# 备选 User-Agent（供 httpx 使用，与 curl_cffi 的 impersonate 无关）
-FALLBACK_USER_AGENTS = [
-    # Chrome 131 on Windows 11
+# httpx 用的 UA 池（随机选一个）
+_UA_POOL = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Chrome 131 on macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Firefox 133 on Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-    # Safari 18 on macOS
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/18.0 Safari/605.1.15",
-]
+)
+
+_BASE_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+}
 
 
-def _browser_headers(default_headers: dict[str, str], user_headers: dict[str, str]) -> dict[str, str]:
-    """合成一套像真实浏览器的请求头。顺序：硬编码基线 -> 全局默认 -> 任务自定义。"""
-    base = {
-        "User-Agent": random.choice(FALLBACK_USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                  "image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control": "max-age=0",
-    }
-    base.update(default_headers or {})
-    base.update(user_headers or {})
-    return base
+def _headers(default_headers: dict, user_headers: dict) -> dict:
+    """合成浏览器级请求头。"""
+    h = {"User-Agent": random.choice(_UA_POOL), **_BASE_HEADERS}
+    h.update(default_headers or {})
+    h.update(user_headers or {})
+    return h
 
 
 # ============================================================
-# 核心抓取引擎
+# HTML 空壳检测（判定是否需要 fallback 到 Jina）
+# ============================================================
+_EMBEDDED_DATA_MARKERS = (
+    "__NEXT_DATA__", "__NUXT_DATA__", "__NUXT__",
+    "__APOLLO_STATE__", "__INITIAL_STATE__", "__PRELOADED_STATE__",
+    "__REDUX_STATE__", "__INITIAL_DATA__",
+    "application/ld+json",
+    "data-sveltekit-fetched", "__remixContext",
+)
+
+_CHALLENGE_MARKERS = (
+    "checking your browser", "cf-challenge", "cf_chl_opt",
+    "just a moment", "attention required",
+    "/cdn-cgi/challenge-platform",
+)
+
+_HEAD_RE = re.compile(r"<head[^>]*>.*?</head>", re.DOTALL | re.IGNORECASE)
+_SCRIPT_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+_STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+_NAV_RE = re.compile(
+    r"<(?:nav|footer|header)[^>]*>.*?</(?:nav|footer|header)>",
+    re.DOTALL | re.IGNORECASE,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _quick_visible_text(html: str) -> str:
+    """粗略估算 body 内真实可见文本（不含 head/meta/script/style）。"""
+    text = _HEAD_RE.sub("", html)
+    text = _SCRIPT_RE.sub("", text)
+    text = _STYLE_RE.sub("", text)
+    text = _NAV_RE.sub("", text)
+    text = _TAG_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def _is_content_usable(result: FetchResult, task: Task) -> bool:
+    """判断抓取内容是否足够（避免把 SPA 空壳当成正常结果）。"""
+    if not result.ok or not (result.content or "").strip():
+        return False
+    if task.type == "json":
+        return True
+
+    text = result.content
+    if len(text) < 500:
+        return False
+    lower = text.lower()
+    if any(m in lower for m in _CHALLENGE_MARKERS):
+        return False
+    # 有内嵌数据或足够可见文本 → 可用
+    if any(m in text for m in _EMBEDDED_DATA_MARKERS):
+        return True
+    return len(_quick_visible_text(text)) >= 400
+
+
+# ============================================================
+# 抓取引擎
 # ============================================================
 class FetchEngine:
-    """多策略抓取引擎。线程安全，可被多个任务复用。"""
+    """多策略抓取引擎（线程安全，复用连接池）。"""
 
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.timeout = cfg.request_timeout
-        self.proxies = self._build_proxies()
+        proxy = cfg.https_proxy or cfg.http_proxy or None
+        self._proxies = (
+            {"http": cfg.http_proxy or cfg.https_proxy,
+             "https": cfg.https_proxy or cfg.http_proxy}
+            if proxy else None
+        )
+        self._httpx_client: Any = None  # 懒加载
+        self._httpx_client_lock = False  # 简化：同步创建，单次
 
-    def _build_proxies(self) -> dict[str, str] | None:
-        """构造 proxies 字典。"""
-        if self.cfg.http_proxy or self.cfg.https_proxy:
-            return {
-                "http": self.cfg.http_proxy or self.cfg.https_proxy,
-                "https": self.cfg.https_proxy or self.cfg.http_proxy,
-            }
-        return None
-
-    # --------------------------------------------------------
-    # 对外入口
-    # --------------------------------------------------------
+    # ----- 对外入口 -----
     def fetch(self, task: Task) -> FetchResult:
-        """
-        根据任务配置的 strategy 字段抓取。
-        strategy = 'auto'           → 依次尝试 curl_cffi → httpx → jina
-        strategy = 'curl_cffi'      → curl_cffi；若提取后内容过少自动升级 jina
-        strategy = 'httpx'          → httpx；若提取后内容过少自动升级 jina
-        strategy = 'jina'           → 仅用 Jina Reader
-        strategy = 'firecrawl'      → 仅用 Firecrawl
-        """
         strategy = (task.strategy or "auto").lower()
-        headers = _browser_headers(self.cfg.default_headers, task.headers or {})
+        headers = _headers(self.cfg.default_headers, task.headers or {})
 
-        # 强制指定 jina / firecrawl
         if strategy == "jina":
             return self._fetch_jina(task, headers)
         if strategy == "firecrawl":
             return self._fetch_firecrawl(task, headers)
 
-        # 对于 curl_cffi / httpx / auto：先尝试静态抓取
         if strategy == "curl_cffi":
             result = self._fetch_curl_cffi(task, headers)
-            return self._maybe_fallback_to_jina(task, headers, result)
-
+            return self._upgrade_to_jina_if_empty(task, headers, result)
         if strategy == "httpx":
             result = self._fetch_httpx(task, headers)
-            return self._maybe_fallback_to_jina(task, headers, result)
+            return self._upgrade_to_jina_if_empty(task, headers, result)
 
-        # auto：依次尝试
-        logger.debug("🔀 任务 [{}] 使用自动策略，开始依次尝试", task.name)
-
-        # 1) curl_cffi（最强）
+        # auto：curl_cffi → httpx → jina
         result = self._fetch_curl_cffi(task, headers)
-        if result.ok and self._has_enough_content(result, task):
+        if result.ok and _is_content_usable(result, task):
             return result
-        logger.debug(
-            "  ↪ curl_cffi 不可用（HTTP={} content_len={}），继续",
-            result.status_code, len(result.content or ""),
-        )
 
-        # 2) httpx（轻量）
         result2 = self._fetch_httpx(task, headers)
-        if result2.ok and self._has_enough_content(result2, task):
+        if result2.ok and _is_content_usable(result2, task):
             return result2
-        logger.debug(
-            "  ↪ httpx 不可用（HTTP={} content_len={}），继续",
-            result2.status_code, len(result2.content or ""),
-        )
 
-        # 3) Jina Reader（外部渲染，默认启用，无 key 走公共限流）
         result3 = self._fetch_jina(task, headers)
         if result3.ok:
-            logger.info(
-                "🔀 任务 [{}] 自动升级到 Jina Reader 获取内容（curl_cffi/httpx 拿到的是空壳）",
-                task.name,
-            )
+            logger.info("🔀 [{}] auto 升级到 Jina（前两个策略拿到空壳）", task.name)
             return result3
-        logger.debug("  ↪ Jina Reader 也失败：{}", result3.error)
 
-        # 全部失败：返回最可能有信息的结果
-        # 如果 curl_cffi 至少 HTTP 成功了（只是内容不够），依然返回它（比纯错误强）
+        # 全部失败：返回最有信息的
         if result.ok:
             return result
         result.error = result.error or "所有策略均失败"
         return result
 
-    def _maybe_fallback_to_jina(
-        self, task: Task, headers: dict[str, str], result: FetchResult
+    def _upgrade_to_jina_if_empty(
+        self, task: Task, headers: dict, result: FetchResult
     ) -> FetchResult:
-        """
-        若用户明确指定了 curl_cffi / httpx，但抓到的是空壳 SPA 页，
-        静默升级到 Jina Reader（渲染后的结果），同时在日志提示。
-        """
-        if not result.ok:
+        """明确指定 curl_cffi/httpx 但拿到空壳时，升级到 Jina。"""
+        if not result.ok or _is_content_usable(result, task):
             return result
-        if self._has_enough_content(result, task):
-            return result
-
         logger.info(
-            "🔀 任务 [{}] 策略={} 抓到空壳（content_len={}），自动升级到 Jina Reader",
+            "🔀 [{}] 策略={} 抓到空壳(len={})，自动升级 Jina",
             task.name, result.strategy_used, len(result.content or ""),
         )
         jina = self._fetch_jina(task, headers)
         if jina.ok:
             jina.strategy_used = f"{result.strategy_used}→jina"
             return jina
-        return result  # jina 也失败就返回原结果（至少有 HTML 可以看）
+        return result
 
-    # --------------------------------------------------------
-    # 具体策略实现
-    # --------------------------------------------------------
-    def _fetch_curl_cffi(self, task: Task, headers: dict[str, str]) -> FetchResult:
-        """使用 curl_cffi 伪装浏览器 TLS 指纹抓取。"""
+    # ----- 策略：curl_cffi -----
+    def _fetch_curl_cffi(self, task: Task, headers: dict) -> FetchResult:
         try:
-            from curl_cffi import requests as cc_requests
+            from curl_cffi import requests as cc
         except ImportError:
             return FetchResult(
                 ok=False, url=task.url, strategy_used="curl_cffi",
-                error="curl_cffi 未安装（请 pip install curl_cffi）",
+                error="curl_cffi 未安装",
             )
 
         impersonate = task.impersonate or "chrome131"
         if impersonate not in SUPPORTED_IMPERSONATE:
-            logger.warning("⚠️  不支持的 impersonate={}，回退到 chrome131", impersonate)
             impersonate = "chrome131"
 
         try:
-            logger.debug("🌐 [curl_cffi/{}] 正在请求：{}", impersonate, task.url)
-            resp = cc_requests.get(
-                task.url,
-                headers=headers,
-                impersonate=impersonate,
-                timeout=self.timeout,
-                proxies=self.proxies,
+            resp = cc.get(
+                task.url, headers=headers, impersonate=impersonate,
+                timeout=self.timeout, proxies=self._proxies,
                 allow_redirects=True,
             )
-            content_type = resp.headers.get("content-type", "")
             return FetchResult(
                 ok=200 <= resp.status_code < 300,
-                url=task.url,
-                status_code=resp.status_code,
+                url=task.url, status_code=resp.status_code,
                 content=resp.text,
-                content_type=content_type,
+                content_type=resp.headers.get("content-type", ""),
                 strategy_used=f"curl_cffi/{impersonate}",
-                headers=dict(resp.headers),
             )
         except Exception as e:
             return FetchResult(
-                ok=False, url=task.url, strategy_used=f"curl_cffi/{impersonate}",
+                ok=False, url=task.url,
+                strategy_used=f"curl_cffi/{impersonate}",
                 error=f"{type(e).__name__}: {e}",
             )
 
-    def _fetch_httpx(self, task: Task, headers: dict[str, str]) -> FetchResult:
-        """使用 httpx 抓取（适合静态/轻反爬页面）。"""
-        try:
-            import httpx
-        except ImportError:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="httpx",
-                error="httpx 未安装",
-            )
-
-        try:
-            logger.debug("🌐 [httpx] 正在请求：{}", task.url)
-            with httpx.Client(
+    # ----- 策略：httpx（复用 Client 连接池）-----
+    def _get_httpx_client(self):
+        """懒加载共享 httpx Client（连接池复用，省 TLS 握手）。"""
+        if self._httpx_client is None:
+            try:
+                import httpx
+            except ImportError:
+                return None
+            self._httpx_client = httpx.Client(
                 http2=True,
                 timeout=self.timeout,
                 follow_redirects=True,
                 proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
-            ) as client:
-                resp = client.get(task.url, headers=headers)
-            content_type = resp.headers.get("content-type", "")
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+        return self._httpx_client
+
+    def _fetch_httpx(self, task: Task, headers: dict) -> FetchResult:
+        client = self._get_httpx_client()
+        if client is None:
+            return FetchResult(
+                ok=False, url=task.url, strategy_used="httpx",
+                error="httpx 未安装",
+            )
+        try:
+            resp = client.get(task.url, headers=headers)
             return FetchResult(
                 ok=200 <= resp.status_code < 300,
-                url=task.url,
-                status_code=resp.status_code,
+                url=task.url, status_code=resp.status_code,
                 content=resp.text,
-                content_type=content_type,
+                content_type=resp.headers.get("content-type", ""),
                 strategy_used="httpx",
-                headers=dict(resp.headers),
             )
         except Exception as e:
             return FetchResult(
@@ -280,40 +276,30 @@ class FetchEngine:
                 error=f"{type(e).__name__}: {e}",
             )
 
-    def _fetch_jina(self, task: Task, headers: dict[str, str]) -> FetchResult:
-        """
-        使用 Jina Reader（r.jina.ai）作为兜底：
-        - 它会返回该页面的纯文本/markdown 版本，自动渲染 JS
-        - 免费额度 1M 次/月（配 API Key），无 key 也能用，但速率受限
-        """
-        try:
-            import httpx
-        except ImportError:
+    # ----- 策略：Jina Reader -----
+    def _fetch_jina(self, task: Task, headers: dict) -> FetchResult:
+        client = self._get_httpx_client()
+        if client is None:
             return FetchResult(
                 ok=False, url=task.url, strategy_used="jina",
-                error="httpx 未安装（Jina 需要）",
+                error="httpx 未安装",
             )
-
         jina_url = f"https://r.jina.ai/{task.url}"
-        jina_headers: dict[str, str] = {
+        jh = {
             "Accept": "text/plain",
             "User-Agent": headers.get("User-Agent", "web-monitor-pro/0.1"),
         }
         if self.cfg.jina_reader_api_key:
-            jina_headers["Authorization"] = f"Bearer {self.cfg.jina_reader_api_key}"
-
+            jh["Authorization"] = f"Bearer {self.cfg.jina_reader_api_key}"
         try:
-            logger.debug("🌐 [jina] 正在请求：{}", jina_url)
-            with httpx.Client(timeout=self.timeout * 2, follow_redirects=True) as client:
-                resp = client.get(jina_url, headers=jina_headers)
+            # Jina 渲染可能慢，独立超时
+            resp = client.get(jina_url, headers=jh, timeout=self.timeout * 2)
             return FetchResult(
                 ok=200 <= resp.status_code < 300,
-                url=task.url,
-                status_code=resp.status_code,
+                url=task.url, status_code=resp.status_code,
                 content=resp.text,
                 content_type=resp.headers.get("content-type", "text/plain"),
                 strategy_used="jina",
-                headers=dict(resp.headers),
             )
         except Exception as e:
             return FetchResult(
@@ -321,43 +307,40 @@ class FetchEngine:
                 error=f"{type(e).__name__}: {e}",
             )
 
-    def _fetch_firecrawl(self, task: Task, headers: dict[str, str]) -> FetchResult:
-        """使用 Firecrawl API 抓取（需要 API Key）。"""
+    # ----- 策略：Firecrawl -----
+    def _fetch_firecrawl(self, task: Task, headers: dict) -> FetchResult:
         if not self.cfg.firecrawl_api_key:
             return FetchResult(
                 ok=False, url=task.url, strategy_used="firecrawl",
                 error="未配置 FIRECRAWL_API_KEY",
             )
-
-        try:
-            import httpx
-        except ImportError:
+        client = self._get_httpx_client()
+        if client is None:
             return FetchResult(
                 ok=False, url=task.url, strategy_used="firecrawl",
-                error="httpx 未安装（Firecrawl 需要）",
+                error="httpx 未安装",
             )
-
-        api_url = "https://api.firecrawl.dev/v1/scrape"
-        payload: dict[str, Any] = {"url": task.url, "formats": ["markdown"]}
-        fc_headers = {
-            "Authorization": f"Bearer {self.cfg.firecrawl_api_key}",
-            "Content-Type": "application/json",
-        }
         try:
-            logger.debug("🌐 [firecrawl] 正在请求：{}", task.url)
-            with httpx.Client(timeout=self.timeout * 2) as client:
-                resp = client.post(api_url, headers=fc_headers, json=payload)
+            resp = client.post(
+                "https://api.firecrawl.dev/v1/scrape",
+                json={"url": task.url, "formats": ["markdown"]},
+                headers={
+                    "Authorization": f"Bearer {self.cfg.firecrawl_api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=self.timeout * 2,
+            )
             if resp.status_code != 200:
                 return FetchResult(
                     ok=False, url=task.url, status_code=resp.status_code,
                     strategy_used="firecrawl",
-                    error=f"Firecrawl HTTP {resp.status_code}: {resp.text[:200]}",
+                    error=f"Firecrawl HTTP {resp.status_code}",
                 )
             data = resp.json()
-            markdown = (data.get("data") or {}).get("markdown", "")
+            md = (data.get("data") or {}).get("markdown", "")
             return FetchResult(
                 ok=True, url=task.url, status_code=200,
-                content=markdown, content_type="text/markdown",
+                content=md, content_type="text/markdown",
                 strategy_used="firecrawl",
             )
         except Exception as e:
@@ -366,92 +349,15 @@ class FetchEngine:
                 error=f"{type(e).__name__}: {e}",
             )
 
-    # --------------------------------------------------------
-    # 辅助：判断抓到的内容"是否含实质内容"（不是 SPA 空壳）
-    # --------------------------------------------------------
-    @staticmethod
-    def _has_enough_content(result: FetchResult, task: Task) -> bool:
-        """
-        更严格的可用性判断：
-        - HTTP 2xx
-        - JSON 任务：只要非空就行
-        - HTML 任务：不仅要够长，还要能提取出足够的可见文本（不是 SPA 空壳）
-        """
-        if not result.ok:
-            return False
-
-        text = result.content or ""
-        if not text.strip():
-            return False
-
-        # JSON 任务：非空即可
-        if task.type == "json":
-            return True
-
-        # 小于 500 字节基本是错误页
-        if len(text) < 500:
-            return False
-
-        # Cloudflare 挑战页的特征词
-        lower = text.lower()
-        challenge_markers = (
-            "checking your browser",
-            "cf-challenge",
-            "cf_chl_opt",
-            "just a moment",
-            "attention required",
-            "/cdn-cgi/challenge-platform",
-        )
-        if any(m in lower for m in challenge_markers):
-            return False
-
-        # 如果 HTML 特别短（< 3KB），算壳
-        # 真正的 SPA 空壳判定我们放在 extractor 的后置检查里
-        # 这里做个"内嵌数据快速检测"：有任一 SPA 数据嵌入点就算可用
-        if _has_any_embedded_data(text):
-            return True
-
-        # 否则：看可见文本量（粗略估算，直接正则剥标签）
-        visible = _quick_visible_text(text)
-        return len(visible) >= 400
+    def close(self) -> None:
+        """关闭连接池。服务停止时调用。"""
+        if self._httpx_client is not None:
+            try:
+                self._httpx_client.close()
+            except Exception:
+                pass
+            self._httpx_client = None
 
 
-# ============================================================
-# 辅助：判断 HTML 是否有内嵌数据（Next/Nuxt/Apollo/window.__X__ 等）
-# ============================================================
-_EMBEDDED_DATA_MARKERS = (
-    '__NEXT_DATA__', '__NUXT_DATA__', '__NUXT__',
-    '__APOLLO_STATE__', '__INITIAL_STATE__', '__PRELOADED_STATE__',
-    '__REDUX_STATE__', '__INITIAL_DATA__',
-    'application/ld+json',
-    'data-sveltekit-fetched',
-    '__remixContext',
-)
-
-
-def _has_any_embedded_data(html: str) -> bool:
-    """检测 HTML 是否存在任一常见的数据嵌入点。"""
-    return any(marker in html for marker in _EMBEDDED_DATA_MARKERS)
-
-
-_QUICK_STRIP_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
-_QUICK_STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
-_QUICK_HEAD_RE = re.compile(r"<head[^>]*>.*?</head>", re.DOTALL | re.IGNORECASE)
-_QUICK_NAV_RE = re.compile(r"<(?:nav|footer|header)[^>]*>.*?</(?:nav|footer|header)>",
-                            re.DOTALL | re.IGNORECASE)
-_QUICK_TAG_RE = re.compile(r"<[^>]+>")
-
-
-def _quick_visible_text(html: str) -> str:
-    """
-    粗略估算 body 内的实质可见文本量（排除 head/script/style/nav/footer）。
-
-    关键：**不要把 meta 标签里的 description 等文本计入**，否则 SPA 空壳
-    （body 内几乎没东西，head 里一堆 meta）会被误判为"内容足够"。
-    """
-    text = _QUICK_HEAD_RE.sub("", html)   # 先去掉整个 <head>（含 meta）
-    text = _QUICK_STRIP_RE.sub("", text)  # 去脚本
-    text = _QUICK_STYLE_RE.sub("", text)  # 去样式
-    text = _QUICK_NAV_RE.sub("", text)    # 去导航/页脚/页眉（通常是模板固定文字）
-    text = _QUICK_TAG_RE.sub(" ", text)   # 剥所有标签
-    return " ".join(text.split())
+# 兼容导出
+_has_any_embedded_data = lambda html: any(m in html for m in _EMBEDDED_DATA_MARKERS)

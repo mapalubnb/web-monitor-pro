@@ -1,15 +1,11 @@
 """
 飞书命令解析与分发
 
-支持两种触发方式：
-1. 用户文本消息（@机器人 + /command 或 私聊 /command）
-2. 卡片按钮点击（action 回调）
+用法：
+- dispatch_text(text, user_id, chat_id)   处理文本消息
+- dispatch_action(value, user_id)          处理卡片按钮点击
 
-分发器 CommandDispatcher：
-- dispatch_text(text, user_id, chat_id, message_id)
-- dispatch_action(action_value, user_id, chat_id, message_id)
-
-每个命令返回一个 CommandResponse（卡片 + 可选附件文件）。
+每个命令返回 CommandResponse（可带卡片 + 文件附件）。
 """
 
 from __future__ import annotations
@@ -17,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import re
 import shlex
 import socket
 import time
@@ -33,21 +30,21 @@ from ..logger import get_today_log_path, logger, tail_log
 from ..risk_control import RiskController
 from . import cards
 
+__version__ = "0.2.0"
+
 
 # ============================================================
-# 命令响应
+# 响应结构
 # ============================================================
 @dataclass
 class CommandResponse:
-    """命令执行后的响应。"""
-
-    card: dict[str, Any] | None = None         # 要回复的卡片
-    text: str | None = None                    # 纯文本回复（与 card 二选一）
-    file_path: Path | None = None              # 额外发送的文件
-    file_display_name: str = ""                # 文件展示名
-    extra_cards: list[dict[str, Any]] = field(default_factory=list)  # 额外要发的卡片
-    trigger_check_task_id: int | None = None   # 请求立即触发某任务的检查
-    sync_scheduler_task_ids: list[int] = field(default_factory=list)  # 请求同步指定任务到调度器
+    card: dict[str, Any] | None = None
+    text: str | None = None
+    file_path: Path | None = None
+    file_display_name: str = ""
+    extra_cards: list[dict[str, Any]] = field(default_factory=list)
+    trigger_check_task_id: int | None = None
+    sync_scheduler_task_ids: list[int] = field(default_factory=list)
 
     @classmethod
     def err(cls, reason: str, suggestion: str = "") -> "CommandResponse":
@@ -62,22 +59,20 @@ class CommandResponse:
 # 命令分发器
 # ============================================================
 class CommandDispatcher:
-    """命令解析与分发。"""
 
-    def __init__(self, cfg: AppConfig, risk: RiskController, service_start_ts: float,
-                 engine: Any = None):
+    def __init__(self, cfg: AppConfig, risk: RiskController,
+                 service_start_ts: float, engine: Any = None):
         self.cfg = cfg
         self.risk = risk
         self.service_start_ts = service_start_ts
-        self.engine = engine  # FetchEngine 引用，供 /debug 命令使用
+        self.engine = engine
 
-        # 文本命令 → handler 方法
-        self._text_handlers: dict[str, Callable[..., CommandResponse]] = {
+        self._text_handlers: dict[str, Callable[[list[str]], CommandResponse]] = {
             "help": self._cmd_help,
             "add": self._cmd_add,
             "list": self._cmd_list,
-            "pause": self._cmd_pause,
-            "resume": self._cmd_resume,
+            "pause": lambda a: self._set_enabled(_first_int(a), False),
+            "resume": lambda a: self._set_enabled(_first_int(a), True),
             "remove": self._cmd_remove,
             "delete": self._cmd_remove,
             "check": self._cmd_check,
@@ -88,36 +83,33 @@ class CommandDispatcher:
             "logs": self._cmd_log,
             "status": self._cmd_status,
             "mute": self._cmd_mute,
-            "unmute": self._cmd_unmute,
+            "unmute": lambda _: (self.risk.unmute(),
+                                 CommandResponse.ok("🔔 已关闭免打扰"))[1],
             "sniff": self._cmd_sniff,
             "debug": self._cmd_debug,
             "interval": self._cmd_interval,
             "reset": self._cmd_reset,
         }
 
-        # 卡片按钮 action → handler 方法
-        self._action_handlers: dict[str, Callable[..., CommandResponse]] = {
-            "pause": self._action_pause,
-            "resume": self._action_resume,
-            "remove": self._action_remove,
-            "check": self._action_check,
-            "history": self._action_history,
+        self._action_handlers: dict[str, Callable[[dict], CommandResponse]] = {
+            "pause": lambda v: self._set_enabled(int(v["task_id"]), False),
+            "resume": lambda v: self._set_enabled(int(v["task_id"]), True),
+            "remove": lambda v: self._cmd_remove([str(v["task_id"])]),
+            "check": lambda v: self._cmd_check([str(v["task_id"])]),
+            "history": lambda v: self._cmd_history([str(v["task_id"])]),
             "task_detail": self._action_task_detail,
-            "open_url": self._action_noop,
+            "open_url": lambda _: None,  # 浏览器自己处理
         }
 
-    # ========================================================
-    # 入口：文本
-    # ========================================================
-    def dispatch_text(self, text: str, user_id: str, chat_id: str) -> CommandResponse | None:
-        """
-        处理文本消息。返回 None 表示不是命令（忽略）。
-        """
+    # ============================================================
+    # 入口
+    # ============================================================
+    def dispatch_text(self, text: str, user_id: str, chat_id: str
+                      ) -> CommandResponse | None:
         text = _strip_mention(text).strip()
         if not text or not text.startswith("/"):
             return None
 
-        # shlex 拆分支持带引号参数
         try:
             tokens = shlex.split(text)
         except ValueError as e:
@@ -126,10 +118,10 @@ class CommandDispatcher:
         command = tokens[0].lstrip("/").lower()
         args = tokens[1:]
 
-        if command not in self._text_handlers:
+        handler = self._text_handlers.get(command)
+        if handler is None:
             return CommandResponse.err(
-                f"未知命令：`/{command}`",
-                "发送 `/help` 查看所有命令",
+                f"未知命令：`/{command}`", "发送 `/help` 查看所有命令"
             )
 
         if not self._is_authorized(user_id):
@@ -138,21 +130,20 @@ class CommandDispatcher:
                 "管理员可通过配置 FEISHU_ADMIN_OPEN_IDS 添加你",
             )
 
-        logger.info("👤 用户 {} 执行命令 /{} 参数={}", user_id[:10] + "...", command, args)
+        logger.info("👤 /{} 用户={} 参数={}", command, user_id[:10] + "...", args)
         try:
-            return self._text_handlers[command](args)
+            return handler(args)
         except SystemExit:
-            # argparse 解析失败会调 SystemExit
-            return CommandResponse.err(f"命令 `/{command}` 参数错误", "发送 `/help` 查看用法")
+            return CommandResponse.err(
+                f"命令 `/{command}` 参数错误", "发送 `/help` 查看用法"
+            )
         except Exception as e:
-            logger.exception("命令执行异常：{}", e)
+            logger.exception("命令异常：{}", e)
             return CommandResponse.err(f"命令执行异常：{e}")
 
-    # ========================================================
-    # 入口：按钮
-    # ========================================================
-    def dispatch_action(self, action_value: dict[str, Any], user_id: str) -> CommandResponse | None:
-        action = action_value.get("action")
+    def dispatch_action(self, value: dict[str, Any], user_id: str
+                        ) -> CommandResponse | None:
+        action = value.get("action")
         if not action:
             return None
         handler = self._action_handlers.get(action)
@@ -160,48 +151,60 @@ class CommandDispatcher:
             return CommandResponse.err(f"未知按钮动作：{action}")
         if not self._is_authorized(user_id):
             return CommandResponse.err("你没有权限")
-        logger.info("🖱️  用户 {} 点击按钮 action={} value={}",
-                    user_id[:10] + "...", action, action_value)
+        logger.info("🖱️  按钮 {} value={}", action, value)
         try:
-            return handler(action_value)
+            return handler(value)
         except Exception as e:
-            logger.exception("按钮处理异常：{}", e)
+            logger.exception("按钮异常：{}", e)
             return CommandResponse.err(f"操作失败：{e}")
 
-    # ========================================================
-    # 权限
-    # ========================================================
     def _is_authorized(self, user_id: str) -> bool:
         admins = self.cfg.feishu.admin_open_ids
-        if not admins:
-            return True  # 未配置白名单则默认允许（也有 /help 等无害命令）
-        return user_id in admins
+        return not admins or user_id in admins
 
-    # ========================================================
-    # 文本命令实现
-    # ========================================================
+    # ============================================================
+    # Task 查找通用 helper（消除 12 处重复）
+    # ============================================================
+    @staticmethod
+    def _get_task(task_id: int | None, usage: str = ""
+                  ) -> tuple[Task | None, CommandResponse | None]:
+        """
+        获取任务，返回 (task 或 None, 错误响应 或 None)。
+        任务在 session 外返回前已 expunge。
+        """
+        if task_id is None:
+            return None, CommandResponse.err(usage or "需要任务 ID")
+        with session_scope() as s:
+            t = s.get(Task, task_id)
+            if t is None:
+                return None, CommandResponse.err(f"未找到任务 #{task_id}")
+            s.expunge(t)
+            return t, None
+
+    # ============================================================
+    # /help
+    # ============================================================
     def _cmd_help(self, args: list[str]) -> CommandResponse:
         return CommandResponse(card=cards.help_card())
 
-    # ---- /add ----
+    # ============================================================
+    # /add
+    # ============================================================
     def _cmd_add(self, args: list[str]) -> CommandResponse:
         parser = _make_parser("add")
-        parser.add_argument("url", help="要监控的 URL")
-        parser.add_argument("--name", default="", help="任务名称（默认取域名+路径）")
-        parser.add_argument("--interval", type=int, default=self.cfg.default_check_interval,
-                          help="检查间隔（秒）")
-        parser.add_argument("--type", default="html", choices=["html", "json"], help="内容类型")
+        parser.add_argument("url")
+        parser.add_argument("--name", default="")
+        parser.add_argument("--interval", type=int,
+                            default=self.cfg.default_check_interval)
+        parser.add_argument("--type", default="html", choices=["html", "json"])
         parser.add_argument("--strategy", default="auto",
-                          choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"],
-                          help="抓取策略")
-        parser.add_argument("--impersonate", default="chrome131", help="curl_cffi 模拟浏览器")
-        parser.add_argument("--selector", default=None, help="CSS 选择器（仅 html 类型）")
-        parser.add_argument("--json-path", dest="json_path", default=None,
-                          help="JSON 路径，如 data[*].name（仅 json 类型）")
+                            choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"])
+        parser.add_argument("--impersonate", default="chrome131")
+        parser.add_argument("--selector", default=None)
+        parser.add_argument("--json-path", dest="json_path", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
-                          action="store_true", help="提取 Next.js __NEXT_DATA__")
-        parser.add_argument("--keyword", action="append", default=[],
-                          help="关键字（命中才推送，可多个）")
+                            action="store_true")
+        parser.add_argument("--keyword", action="append", default=[])
         ns = parser.parse_args(args)
 
         url = ns.url.strip()
@@ -211,64 +214,51 @@ class CommandDispatcher:
         name = ns.name or _url_to_name(url)
 
         with session_scope() as s:
-            # 去重：同 URL 已存在则拒绝
-            exists = s.execute(select(Task).where(Task.url == url)).scalar_one_or_none()
+            exists = s.execute(
+                select(Task).where(Task.url == url)
+            ).scalar_one_or_none()
             if exists:
                 return CommandResponse.err(
                     f"URL 已存在：任务 #{exists.id} [{exists.name}]",
-                    f"用 `/check {exists.id}` 立即检查，或 `/remove {exists.id}` 后重建",
+                    f"用 `/reset {exists.id}` 重置，或 `/remove {exists.id}` 后重建",
                 )
-            task = Task(
-                name=name,
-                url=url,
-                type=ns.type,
-                strategy=ns.strategy,
-                impersonate=ns.impersonate,
-                selector=ns.selector,
-                json_path=ns.json_path,
-                extract_next_data=ns.extract_next_data,
-                interval=ns.interval,
-                keywords=ns.keyword or [],
-                enabled=True,
+            t = Task(
+                name=name, url=url, type=ns.type, strategy=ns.strategy,
+                impersonate=ns.impersonate, selector=ns.selector,
+                json_path=ns.json_path, extract_next_data=ns.extract_next_data,
+                interval=ns.interval, keywords=ns.keyword or [], enabled=True,
             )
-            s.add(task)
+            s.add(t)
             s.flush()
-            task_id = task.id
+            task_id = t.id
 
-        logger.info("➕ 新增监控任务 #{} [{}] url={}", task_id, name, url)
+        logger.info("➕ 新增任务 #{} [{}] url={}", task_id, name, url)
         return CommandResponse(
             card=cards.success_card(
                 "任务已添加",
                 f"**#{task_id} · {name}**\n"
                 f"🔗 {url}\n"
                 f"⏱️ 间隔 {ns.interval}s · 🎯 策略 {ns.strategy}\n\n"
-                f"首次抓取完成后会自动建立基准快照并推送确认卡片。",
+                f"首次抓取后会建立基准快照并推送卡片。",
             ),
             trigger_check_task_id=task_id,
         )
 
-    # ---- /list ----
+    # ============================================================
+    # /list
+    # ============================================================
     def _cmd_list(self, args: list[str]) -> CommandResponse:
         with session_scope() as s:
             rows = s.execute(select(Task).order_by(Task.id)).scalars().all()
-            tasks = [self._task_to_dict(t) for t in rows]
+            tasks = [_task_to_dict(t) for t in rows]
         return CommandResponse(card=cards.task_list_card(tasks))
 
-    # ---- /pause ----
-    def _cmd_pause(self, args: list[str]) -> CommandResponse:
-        task_id = _parse_task_id(args)
+    # ============================================================
+    # enabled 切换（pause / resume）
+    # ============================================================
+    def _set_enabled(self, task_id: int | None, enabled: bool) -> CommandResponse:
         if task_id is None:
-            return CommandResponse.err("用法：`/pause <任务ID>`")
-        return self._set_enabled(task_id, False)
-
-    # ---- /resume ----
-    def _cmd_resume(self, args: list[str]) -> CommandResponse:
-        task_id = _parse_task_id(args)
-        if task_id is None:
-            return CommandResponse.err("用法：`/resume <任务ID>`")
-        return self._set_enabled(task_id, True)
-
-    def _set_enabled(self, task_id: int, enabled: bool) -> CommandResponse:
+            return CommandResponse.err("用法：`/pause <ID>` 或 `/resume <ID>`")
         with session_scope() as s:
             t = s.get(Task, task_id)
             if t is None:
@@ -281,11 +271,13 @@ class CommandDispatcher:
         resp.sync_scheduler_task_ids = [task_id]
         return resp
 
-    # ---- /remove ----
+    # ============================================================
+    # /remove
+    # ============================================================
     def _cmd_remove(self, args: list[str]) -> CommandResponse:
-        task_id = _parse_task_id(args)
+        task_id = _first_int(args)
         if task_id is None:
-            return CommandResponse.err("用法：`/remove <任务ID>`")
+            return CommandResponse.err("用法：`/remove <ID>`")
         with session_scope() as s:
             t = s.get(Task, task_id)
             if t is None:
@@ -294,33 +286,32 @@ class CommandDispatcher:
             s.delete(t)
         logger.info("🗑️  已删除任务 #{} [{}]", task_id, name)
         resp = CommandResponse.ok(f"🗑️ 已删除任务 #{task_id} · {name}")
-        # 关键：同步调度器，让它移除这个任务的 job
         resp.sync_scheduler_task_ids = [task_id]
         return resp
 
-    # ---- /check ----
+    # ============================================================
+    # /check
+    # ============================================================
     def _cmd_check(self, args: list[str]) -> CommandResponse:
-        task_id = _parse_task_id(args)
-        if task_id is None:
-            return CommandResponse.err("用法：`/check <任务ID>`")
-        with session_scope() as s:
-            t = s.get(Task, task_id)
-            if t is None:
-                return CommandResponse.err(f"未找到任务 #{task_id}")
-            name = t.name
+        task_id = _first_int(args)
+        t, err = self._get_task(task_id, "用法：`/check <ID>`")
+        if err is not None:
+            return err
         return CommandResponse(
             card=cards.success_card(
-                f"⚡ 已触发立即检查",
-                f"任务 #{task_id} · {name}\n抓取结果将在片刻后推送（如有变化）。",
+                "⚡ 已触发立即检查",
+                f"任务 #{task_id} · {t.name}\n抓取结果稍后推送（如有变化）。",
             ),
             trigger_check_task_id=task_id,
         )
 
-    # ---- /history ----
+    # ============================================================
+    # /history
+    # ============================================================
     def _cmd_history(self, args: list[str]) -> CommandResponse:
-        task_id = _parse_task_id(args)
+        task_id = _first_int(args)
         if task_id is None:
-            return CommandResponse.err("用法：`/history <任务ID>`")
+            return CommandResponse.err("用法：`/history <ID>`")
         with session_scope() as s:
             t = s.get(Task, task_id)
             if t is None:
@@ -341,11 +332,13 @@ class CommandDispatcher:
             name = t.name
         return CommandResponse(card=cards.history_card(name, task_id, items))
 
-    # ---- /keyword ----
+    # ============================================================
+    # /keyword
+    # ============================================================
     def _cmd_keyword(self, args: list[str]) -> CommandResponse:
         if len(args) < 3:
             return CommandResponse.err(
-                "用法：`/keyword <任务ID> add <关键字>` 或 `/keyword <任务ID> remove <关键字>`"
+                "用法：`/keyword <ID> add <关键字>` 或 `/keyword <ID> remove <关键字>`"
             )
         try:
             task_id = int(args[0])
@@ -380,15 +373,16 @@ class CommandDispatcher:
             f"任务 #{task_id} · {name}\n关键字：`{keyword}`",
         )
 
-    # ---- /config ----
+    # ============================================================
+    # /config
+    # ============================================================
     def _cmd_config(self, args: list[str]) -> CommandResponse:
-        proxy_info = self.cfg.https_proxy or self.cfg.http_proxy or "未启用"
         apis = []
         if self.cfg.jina_reader_api_key:
             apis.append("Jina Reader")
         if self.cfg.firecrawl_api_key:
             apis.append("Firecrawl")
-        cfg_summary = {
+        summary = {
             "default_check_interval": self.cfg.default_check_interval,
             "max_concurrent_fetch": self.cfg.max_concurrent_fetch,
             "domain_min_interval": self.cfg.risk_control.domain_min_interval,
@@ -396,77 +390,76 @@ class CommandDispatcher:
             "jitter_ratio": self.cfg.risk_control.jitter_ratio,
             "min_change_ratio": self.cfg.risk_control.min_change_ratio,
             "push_cooldown_seconds": self.cfg.risk_control.push_cooldown_seconds,
-            "alert_after_consecutive_failures": self.cfg.risk_control.alert_after_consecutive_failures,
-            "proxy_info": proxy_info,
+            "alert_after_consecutive_failures":
+                self.cfg.risk_control.alert_after_consecutive_failures,
+            "proxy_info": (self.cfg.https_proxy or self.cfg.http_proxy or "未启用"),
             "external_apis": "、".join(apis) if apis else "未启用",
         }
-        return CommandResponse(card=cards.config_card(cfg_summary))
+        return CommandResponse(card=cards.config_card(summary))
 
-    # ---- /log ----
+    # ============================================================
+    # /log
+    # ============================================================
     def _cmd_log(self, args: list[str]) -> CommandResponse:
         parser = _make_parser("log")
-        parser.add_argument("--tail", type=int, default=100, help="显示最近 N 行")
+        parser.add_argument("--tail", type=int, default=100)
         ns = parser.parse_args(args)
         tail_n = max(10, min(ns.tail, 2000))
 
         text = tail_log(tail_n)
         log_path = get_today_log_path()
-        size_str = "未生成"
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        if log_path.exists():
-            size = log_path.stat().st_size
-            size_str = _humanize_size(size)
+        size = _humanize_size(log_path.stat().st_size) if log_path.exists() else "未生成"
+        date = datetime.now().strftime("%Y-%m-%d")
 
         return CommandResponse(
-            card=cards.log_card(text, size_str, date_str),
+            card=cards.log_card(text, size, date),
             file_path=log_path if log_path.exists() else None,
             file_display_name=log_path.name if log_path.exists() else "",
         )
 
-    # ---- /status ----
+    # ============================================================
+    # /status
+    # ============================================================
     def _cmd_status(self, args: list[str]) -> CommandResponse:
-        uptime_sec = int(time.time() - self.service_start_ts)
-        uptime = _humanize_duration(uptime_sec)
+        uptime = _humanize_duration(int(time.time() - self.service_start_ts))
 
         with session_scope() as s:
-            total_tasks = s.execute(select(func.count()).select_from(Task)).scalar_one()
-            active_tasks = s.execute(
+            total = s.execute(select(func.count()).select_from(Task)).scalar_one()
+            active = s.execute(
                 select(func.count()).select_from(Task).where(Task.enabled.is_(True))
             ).scalar_one()
-            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            pushes_today = s.execute(
-                select(func.count()).select_from(PushLog).where(PushLog.created_at >= today_start)
+            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            pushes = s.execute(
+                select(func.count()).select_from(PushLog)
+                .where(PushLog.created_at >= today)
             ).scalar_one()
-            checks_today = s.execute(
-                select(func.sum(Task.total_checks)).select_from(Task)
+            checks = s.execute(
+                select(func.sum(Task.total_checks))
             ).scalar_one() or 0
-            errors_today = s.execute(
-                select(func.sum(Task.consecutive_failures)).select_from(Task)
+            errors = s.execute(
+                select(func.sum(Task.consecutive_failures))
             ).scalar_one() or 0
 
         mute_until = self.risk.mute_status()
-        mute_status = (
-            f"⏰ 至 {mute_until.strftime('%H:%M:%S')}"
-            if mute_until else "否"
-        )
-        mem_mb = _get_memory_mb()
+        mute_text = f"⏰ 至 {mute_until:%H:%M:%S}" if mute_until else "否"
 
-        data = {
+        return CommandResponse(card=cards.status_card({
             "uptime": uptime,
-            "total_tasks": total_tasks,
-            "active_tasks": active_tasks,
-            "pushes_today": pushes_today,
-            "checks_today": int(checks_today),
-            "errors_today": int(errors_today),
-            "mute_status": mute_status,
+            "total_tasks": total,
+            "active_tasks": active,
+            "pushes_today": pushes,
+            "checks_today": int(checks),
+            "errors_today": int(errors),
+            "mute_status": mute_text,
             "hostname": socket.gethostname(),
             "python_version": platform.python_version(),
-            "version": "0.1.0",
-            "memory": f"{mem_mb:.1f} MB" if mem_mb else "-",
-        }
-        return CommandResponse(card=cards.status_card(data))
+            "version": __version__,
+            "memory": f"{_memory_mb():.1f} MB" if _memory_mb() else "-",
+        }))
 
-    # ---- /mute, /unmute ----
+    # ============================================================
+    # /mute
+    # ============================================================
     def _cmd_mute(self, args: list[str]) -> CommandResponse:
         if not args:
             return CommandResponse.err("用法：`/mute 30m`（支持 s/m/h/d）")
@@ -476,48 +469,34 @@ class CommandDispatcher:
             return CommandResponse.err(str(e))
         return CommandResponse.ok(
             "🔇 已开启免打扰",
-            f"到期时间：**{until.strftime('%Y-%m-%d %H:%M:%S')}**\n"
-            f"期间检测到的变更不会推送，使用 `/unmute` 可提前恢复。",
+            f"到期：**{until:%Y-%m-%d %H:%M:%S}**\n`/unmute` 可提前恢复",
         )
 
-    def _cmd_unmute(self, args: list[str]) -> CommandResponse:
-        self.risk.push.unmute()
-        return CommandResponse.ok("🔔 已关闭免打扰", "变更推送已恢复")
-
-    # ---- /sniff ----
+    # ============================================================
+    # /sniff
+    # ============================================================
     def _cmd_sniff(self, args: list[str]) -> CommandResponse:
         if not args:
             return CommandResponse.err("用法：`/sniff <URL>`")
-        url = args[0].strip()
-        return CommandResponse(card=cards.sniff_helper_card(url))
+        return CommandResponse(card=cards.sniff_helper_card(args[0].strip()))
 
-    # ---- /debug ----
+    # ============================================================
+    # /debug
+    # ============================================================
     def _cmd_debug(self, args: list[str]) -> CommandResponse:
-        """
-        诊断任务的抓取情况：
-        - 抓一次页面
-        - 分析页面框架（Next/Nuxt/SPA 壳/Cloudflare 等）
-        - 列出命中的数据嵌入点
-        - 给出优化建议
-        """
-        task_id = _parse_task_id(args)
-        if task_id is None:
-            return CommandResponse.err("用法：`/debug <任务ID>`")
-
+        """抓一次 + 诊断 + 给建议 + 附 HTML。"""
+        task_id = _first_int(args)
+        t, err = self._get_task(task_id, "用法：`/debug <ID>`")
+        if err is not None:
+            return err
         if self.engine is None:
             return CommandResponse.err("诊断功能未就绪（engine 未注入）")
 
         from ..fetcher.extractor import diagnose_html
-        with session_scope() as s:
-            t = s.get(Task, task_id)
-            if t is None:
-                return CommandResponse.err(f"未找到任务 #{task_id}")
-            s.expunge(t)
-            task = t
 
-        logger.info("🔍 /debug 正在诊断任务 #{} [{}]", task_id, task.name)
+        logger.info("🔍 诊断任务 #{} [{}]", task_id, t.name)
         try:
-            result = self.engine.fetch(task)
+            result = self.engine.fetch(t)
         except Exception as e:
             return CommandResponse.err(f"抓取失败：{e}")
 
@@ -527,36 +506,32 @@ class CommandDispatcher:
                 result.error or "",
             )
 
-        findings = diagnose_html(result.content or "")
-
-        # 组装卡片内容
-        frameworks = "、".join(findings["frameworks"]) or "未识别"
-        data_points = "\n".join(findings["data_points"]) if findings["data_points"] else "❌ 未找到"
-        suggestions = "\n".join(f"• {s}" for s in findings["suggestions"])
-
+        f = diagnose_html(result.content or "")
         detail = (
             f"**📊 诊断结果**\n\n"
-            f"🔖 任务：#{task_id} · {task.name}\n"
-            f"🌐 URL：{task.url}\n"
-            f"🎯 抓取策略：`{result.strategy_used}`\n"
-            f"📏 HTML 大小：{_humanize_size(findings['html_size'])}\n"
-            f"👁️ 可见文本：{findings['visible_text_length']} 字\n"
-            f"🏗️ 框架识别：{frameworks}\n\n"
-            f"**📦 数据嵌入点**\n{data_points}\n\n"
-            f"**💡 优化建议**\n{suggestions}"
+            f"🔖 任务：#{task_id} · {t.name}\n"
+            f"🌐 URL：{t.url}\n"
+            f"🎯 策略：`{result.strategy_used}`\n"
+            f"📏 HTML：{_humanize_size(f['html_size'])}\n"
+            f"👁️ 可见文本：{f['visible_text_length']} 字\n"
+            f"🏗️ 框架：{'、'.join(f['frameworks']) or '未识别'}\n\n"
+            f"**📦 数据嵌入点**\n"
+            f"{chr(10).join(f['data_points']) if f['data_points'] else '❌ 未找到'}\n\n"
+            f"**💡 建议**\n{chr(10).join(f'• {s}' for s in f['suggestions'])}"
         )
 
-        # 把抓到的 HTML 附件化（可下载研究）
+        # 附上 HTML 文件
+        html_path: Path | None = None
         try:
             import tempfile
             fp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".html", delete=False, encoding="utf-8",
+                mode="w", suffix=".html", delete=False, encoding="utf-8"
             )
             fp.write(result.content or "")
             fp.close()
             html_path = Path(fp.name)
-        except Exception:
-            html_path = None
+        except Exception as e:
+            logger.debug("生成 HTML 附件失败：{}", e)
 
         return CommandResponse(
             card=cards.success_card("🔍 抓取诊断报告", detail),
@@ -564,11 +539,12 @@ class CommandDispatcher:
             file_display_name=f"task_{task_id}_debug.html" if html_path else "",
         )
 
-    # ---- /interval ----
+    # ============================================================
+    # /interval
+    # ============================================================
     def _cmd_interval(self, args: list[str]) -> CommandResponse:
-        """修改任务的检查间隔。用法：/interval <id> <秒>"""
         if len(args) < 2:
-            return CommandResponse.err("用法：`/interval <任务ID> <秒数>`")
+            return CommandResponse.err("用法：`/interval <ID> <秒>`")
         try:
             task_id = int(args[0])
             seconds = int(args[1])
@@ -583,46 +559,40 @@ class CommandDispatcher:
                 return CommandResponse.err(f"未找到任务 #{task_id}")
             t.interval = seconds
             name = t.name
-        logger.info("⏱️ 任务 #{} [{}] 间隔调整为 {} 秒", task_id, name, seconds)
+
+        logger.info("⏱️ 任务 #{} [{}] 间隔 → {}s", task_id, name, seconds)
         resp = CommandResponse.ok(
-            f"⏱️ 已更新间隔",
+            "⏱️ 已更新间隔",
             f"任务 #{task_id} · {name}\n新间隔：**{seconds} 秒**",
         )
         resp.sync_scheduler_task_ids = [task_id]
         return resp
 
-    # ---- /reset ----
+    # ============================================================
+    # /reset
+    # ============================================================
     def _cmd_reset(self, args: list[str]) -> CommandResponse:
-        """
-        重置任务的基准快照。下次抓取时视作"首次"，重新建立 baseline。
-        当抓取策略或页面结构变化后很实用，不用删掉重建。
-        用法：/reset <id> [--strategy xxx]
-        """
         parser = _make_parser("reset")
         parser.add_argument("task_id", type=int)
         parser.add_argument("--strategy", default=None,
-                            choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"],
-                            help="顺便切换抓取策略")
-        parser.add_argument("--impersonate", default=None, help="顺便切换 curl_cffi 指纹")
-        parser.add_argument("--selector", default=None, help="顺便设置 CSS 选择器")
+                            choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"])
+        parser.add_argument("--impersonate", default=None)
+        parser.add_argument("--selector", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
-                            action="store_true", default=None,
-                            help="打开 SPA 数据嵌入提取")
+                            action="store_true", default=None)
         try:
             ns = parser.parse_args(args)
         except SystemExit:
-            return CommandResponse.err("用法：`/reset <任务ID> [--strategy jina]`")
+            return CommandResponse.err("用法：`/reset <ID> [--strategy jina]`")
 
+        changes: list[str] = []
         with session_scope() as s:
             t = s.get(Task, ns.task_id)
             if t is None:
                 return CommandResponse.err(f"未找到任务 #{ns.task_id}")
-            # 清除基准
             t.last_content_hash = None
             t.last_snapshot_path = None
             t.consecutive_failures = 0
-            # 顺便改策略
-            changes = []
             if ns.strategy:
                 t.strategy = ns.strategy
                 changes.append(f"策略→`{ns.strategy}`")
@@ -634,92 +604,42 @@ class CommandDispatcher:
                 changes.append(f"选择器→`{ns.selector}`")
             if ns.extract_next_data:
                 t.extract_next_data = True
-                changes.append("启用 SPA 数据提取")
+                changes.append("启用 SPA 提取")
             name = t.name
 
-        logger.info("🔄 任务 #{} [{}] 已重置基准快照，{}",
-                    ns.task_id, name,
-                    "; ".join(changes) if changes else "策略不变")
-        detail = f"任务 #{ns.task_id} · {name}\n已清空基准快照，下次抓取会作为新的首次建立。"
+        logger.info("🔄 任务 #{} [{}] 已重置，{}",
+                    ns.task_id, name, "; ".join(changes) or "策略不变")
+        detail = f"任务 #{ns.task_id} · {name}\n基准已清空，下次抓取作为新首次建立。"
         if changes:
-            detail += "\n\n📝 同时调整：" + "、".join(changes)
-        resp = CommandResponse(
+            detail += "\n📝 同时调整：" + "、".join(changes)
+        return CommandResponse(
             card=cards.success_card("🔄 已重置", detail),
             trigger_check_task_id=ns.task_id,
         )
-        return resp
 
-    # ========================================================
-    # 按钮动作
-    # ========================================================
-    def _action_pause(self, v: dict[str, Any]) -> CommandResponse:
-        return self._set_enabled(int(v["task_id"]), False)
-
-    def _action_resume(self, v: dict[str, Any]) -> CommandResponse:
-        return self._set_enabled(int(v["task_id"]), True)
-
-    def _action_remove(self, v: dict[str, Any]) -> CommandResponse:
-        return self._cmd_remove([str(v["task_id"])])
-
-    def _action_check(self, v: dict[str, Any]) -> CommandResponse:
-        return self._cmd_check([str(v["task_id"])])
-
-    def _action_history(self, v: dict[str, Any]) -> CommandResponse:
-        return self._cmd_history([str(v["task_id"])])
-
+    # ============================================================
+    # 按钮：task_detail
+    # ============================================================
     def _action_task_detail(self, v: dict[str, Any]) -> CommandResponse:
         task_id = int(v["task_id"])
         with session_scope() as s:
             t = s.get(Task, task_id)
             if t is None:
                 return CommandResponse.err(f"未找到任务 #{task_id}")
-            return CommandResponse(card=cards.task_detail_card(self._task_to_dict(t)))
-
-    def _action_noop(self, v: dict[str, Any]) -> CommandResponse | None:
-        return None  # 如"打开页面"由浏览器处理，不需要后端响应
-
-    # ========================================================
-    # 工具
-    # ========================================================
-    @staticmethod
-    def _task_to_dict(t: Task) -> dict[str, Any]:
-        return {
-            "id": t.id,
-            "name": t.name,
-            "url": t.url,
-            "type": t.type,
-            "strategy": t.strategy,
-            "impersonate": t.impersonate,
-            "interval": t.interval,
-            "enabled": t.enabled,
-            "keywords": t.keywords or [],
-            "total_checks": t.total_checks,
-            "total_changes": t.total_changes,
-            "consecutive_failures": t.consecutive_failures,
-            "last_checked_at": (
-                t.last_checked_at.strftime("%Y-%m-%d %H:%M:%S")
-                if t.last_checked_at else None
-            ),
-            "last_changed_at": (
-                t.last_changed_at.strftime("%Y-%m-%d %H:%M:%S")
-                if t.last_changed_at else None
-            ),
-        }
+            return CommandResponse(card=cards.task_detail_card(_task_to_dict(t)))
 
 
 # ============================================================
-# 辅助工具函数
+# 模块级辅助函数
 # ============================================================
+_MENTION_RE = re.compile(r"^@_user_\d+\s*|<at[^>]*>.*?</at>\s*")
+
+
 def _strip_mention(text: str) -> str:
-    """移除飞书 @用户 的 markdown 前缀。"""
-    # 飞书 @ 格式通常是 "@_user_1 " 或 "<at user_id=xxx>名字</at>"
-    import re
-    text = re.sub(r"^@_user_\d+\s*", "", text)
-    text = re.sub(r"<at[^>]*>.*?</at>\s*", "", text)
-    return text
+    return _MENTION_RE.sub("", text)
 
 
-def _parse_task_id(args: list[str]) -> int | None:
+def _first_int(args: list[str]) -> int | None:
     if not args:
         return None
     try:
@@ -728,25 +648,16 @@ def _parse_task_id(args: list[str]) -> int | None:
         return None
 
 
-class _ParseError(Exception):
-    pass
-
-
 def _make_parser(prog: str) -> argparse.ArgumentParser:
-    """构造一个不会自动 exit 的 ArgumentParser。"""
-    parser = argparse.ArgumentParser(prog=f"/{prog}", add_help=False)
-
-    def _err(message):
-        raise SystemExit(f"argparse error: {message}")
-    parser.error = _err  # type: ignore[assignment]
-    return parser
+    p = argparse.ArgumentParser(prog=f"/{prog}", add_help=False)
+    p.error = lambda msg: (_ for _ in ()).throw(SystemExit(msg))  # type: ignore
+    return p
 
 
 def _url_to_name(url: str) -> str:
     from urllib.parse import urlparse
     p = urlparse(url)
-    short = p.netloc + (p.path if len(p.path) > 1 else "")
-    return short[:60]
+    return (p.netloc + (p.path if len(p.path) > 1 else ""))[:60]
 
 
 def _humanize_duration(seconds: int) -> str:
@@ -755,15 +666,11 @@ def _humanize_duration(seconds: int) -> str:
     if seconds < 3600:
         return f"{seconds // 60} 分 {seconds % 60} 秒"
     if seconds < 86400:
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        return f"{h} 小时 {m} 分"
-    d = seconds // 86400
-    h = (seconds % 86400) // 3600
-    return f"{d} 天 {h} 小时"
+        return f"{seconds // 3600} 小时 {(seconds % 3600) // 60} 分"
+    return f"{seconds // 86400} 天 {(seconds % 86400) // 3600} 小时"
 
 
-def _humanize_size(n: int) -> str:
+def _humanize_size(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {unit}"
@@ -771,17 +678,40 @@ def _humanize_size(n: int) -> str:
     return f"{n:.1f} TB"
 
 
-def _get_memory_mb() -> float | None:
-    """读取当前进程内存占用（MB），失败返回 None。"""
+def _memory_mb() -> float:
     try:
         with open("/proc/self/status") as f:
             for line in f:
                 if line.startswith("VmRSS:"):
-                    kb = int(line.split()[1])
-                    return kb / 1024.0
+                    return int(line.split()[1]) / 1024.0
     except Exception:
-        return None
-    return None
+        pass
+    return 0.0
+
+
+def _task_to_dict(t: Task) -> dict[str, Any]:
+    return {
+        "id": t.id,
+        "name": t.name,
+        "url": t.url,
+        "type": t.type,
+        "strategy": t.strategy,
+        "impersonate": t.impersonate,
+        "interval": t.interval,
+        "enabled": t.enabled,
+        "keywords": t.keywords or [],
+        "total_checks": t.total_checks,
+        "total_changes": t.total_changes,
+        "consecutive_failures": t.consecutive_failures,
+        "last_checked_at": (
+            t.last_checked_at.strftime("%Y-%m-%d %H:%M:%S")
+            if t.last_checked_at else None
+        ),
+        "last_changed_at": (
+            t.last_changed_at.strftime("%Y-%m-%d %H:%M:%S")
+            if t.last_changed_at else None
+        ),
+    }
 
 
 __all__ = ["CommandDispatcher", "CommandResponse"]
