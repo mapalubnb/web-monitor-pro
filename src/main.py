@@ -49,7 +49,8 @@ class App:
         self.feishu = FeishuClient(cfg.feishu)
         self.runner = MonitorRunner(cfg, self.engine, self.risk, self.feishu)
         self.scheduler = MonitorScheduler(cfg, self.risk, run_fn=self.runner.run_once)
-        self.dispatcher = CommandDispatcher(cfg, self.risk, self.service_start_ts)
+        self.dispatcher = CommandDispatcher(cfg, self.risk, self.service_start_ts,
+                                            engine=self.engine)
 
         self._ws_client: Any = None
 
@@ -267,6 +268,13 @@ class App:
         # 额外卡片
         for extra in response.extra_cards:
             self.feishu.send_card(chat_id, extra)
+
+        # 同步调度器（新增/暂停/恢复/删除 任务后务必调用）
+        for tid in response.sync_scheduler_task_ids:
+            try:
+                self.scheduler.sync_task(tid)
+            except Exception as e:
+                logger.warning("同步任务 #{} 到调度器失败：{}", tid, e)
 
         # 立即触发检查
         if response.trigger_check_task_id is not None:

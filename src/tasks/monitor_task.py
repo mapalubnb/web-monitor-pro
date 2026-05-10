@@ -86,8 +86,13 @@ class MonitorRunner:
             return
 
         if not extracted.strip():
-            logger.warning("任务 #{} 提取结果为空（可能是反爬页面或选择器没匹配到）", task.id)
-            self._handle_fetch_failure(task, error="提取结果为空")
+            logger.warning(
+                "任务 #{} [{}] 提取结果为空（HTTP={} strategy={} content_len={}）。"
+                "💡 在飞书发送 `/debug {}` 可查看页面诊断报告",
+                task.id, task.name, result.status_code,
+                result.strategy_used, len(result.content or ""), task.id,
+            )
+            self._handle_fetch_failure(task, error="提取结果为空（可能是纯前端 SPA，请试 /debug 或 /sniff）")
             return
 
         new_hash = content_hash(extracted)

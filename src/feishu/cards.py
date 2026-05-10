@@ -154,11 +154,13 @@ def help_card() -> dict[str, Any]:
          "`/list` — 列出所有任务\n"
          "`/pause <id>` / `/resume <id>` / `/remove <id>` — 暂停/恢复/删除\n"
          "`/check <id>` — 立即触发一次检查\n"
-         "`/history <id>` — 查看任务历史变更"),
+         "`/history <id>` — 查看任务历史变更\n"
+         "`/interval <id> <秒>` — 修改检查间隔"),
         ("🎯  精细化配置",
          "`/keyword <id> add <关键字>` — 添加关键字过滤\n"
          "`/keyword <id> remove <关键字>` — 移除关键字\n"
-         "`/sniff <url>` — 抓包助手（引导找 API）"),
+         "`/sniff <url>` — 抓包助手（引导找 API）\n"
+         "`/debug <id>` — 诊断页面（识别框架、找数据点、给建议）"),
         ("📊  服务管理",
          "`/status` — 查看运行状态\n"
          "`/config` — 查看全局配置\n"

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -117,48 +118,88 @@ class FetchEngine:
         """
         根据任务配置的 strategy 字段抓取。
         strategy = 'auto'           → 依次尝试 curl_cffi → httpx → jina
-        strategy = 'curl_cffi'      → 仅用 curl_cffi
-        strategy = 'httpx'          → 仅用 httpx
+        strategy = 'curl_cffi'      → curl_cffi；若提取后内容过少自动升级 jina
+        strategy = 'httpx'          → httpx；若提取后内容过少自动升级 jina
         strategy = 'jina'           → 仅用 Jina Reader
         strategy = 'firecrawl'      → 仅用 Firecrawl
         """
         strategy = (task.strategy or "auto").lower()
         headers = _browser_headers(self.cfg.default_headers, task.headers or {})
 
-        # 强制指定策略
-        if strategy == "curl_cffi":
-            return self._fetch_curl_cffi(task, headers)
-        if strategy == "httpx":
-            return self._fetch_httpx(task, headers)
+        # 强制指定 jina / firecrawl
         if strategy == "jina":
             return self._fetch_jina(task, headers)
         if strategy == "firecrawl":
             return self._fetch_firecrawl(task, headers)
+
+        # 对于 curl_cffi / httpx / auto：先尝试静态抓取
+        if strategy == "curl_cffi":
+            result = self._fetch_curl_cffi(task, headers)
+            return self._maybe_fallback_to_jina(task, headers, result)
+
+        if strategy == "httpx":
+            result = self._fetch_httpx(task, headers)
+            return self._maybe_fallback_to_jina(task, headers, result)
 
         # auto：依次尝试
         logger.debug("🔀 任务 [{}] 使用自动策略，开始依次尝试", task.name)
 
         # 1) curl_cffi（最强）
         result = self._fetch_curl_cffi(task, headers)
-        if result.ok and self._looks_usable(result, task):
+        if result.ok and self._has_enough_content(result, task):
             return result
-        logger.debug("  ↪ curl_cffi 失败或内容不可用：{}", result.error or f"HTTP {result.status_code}")
+        logger.debug(
+            "  ↪ curl_cffi 不可用（HTTP={} content_len={}），继续",
+            result.status_code, len(result.content or ""),
+        )
 
         # 2) httpx（轻量）
         result2 = self._fetch_httpx(task, headers)
-        if result2.ok and self._looks_usable(result2, task):
+        if result2.ok and self._has_enough_content(result2, task):
             return result2
-        logger.debug("  ↪ httpx 失败或内容不可用：{}", result2.error or f"HTTP {result2.status_code}")
+        logger.debug(
+            "  ↪ httpx 不可用（HTTP={} content_len={}），继续",
+            result2.status_code, len(result2.content or ""),
+        )
 
         # 3) Jina Reader（外部渲染，默认启用，无 key 走公共限流）
         result3 = self._fetch_jina(task, headers)
         if result3.ok:
+            logger.info(
+                "🔀 任务 [{}] 自动升级到 Jina Reader 获取内容（curl_cffi/httpx 拿到的是空壳）",
+                task.name,
+            )
             return result3
         logger.debug("  ↪ Jina Reader 也失败：{}", result3.error)
 
-        # 全部失败：返回 curl_cffi 的原始结果，带上错误信息
+        # 全部失败：返回最可能有信息的结果
+        # 如果 curl_cffi 至少 HTTP 成功了（只是内容不够），依然返回它（比纯错误强）
+        if result.ok:
+            return result
         result.error = result.error or "所有策略均失败"
         return result
+
+    def _maybe_fallback_to_jina(
+        self, task: Task, headers: dict[str, str], result: FetchResult
+    ) -> FetchResult:
+        """
+        若用户明确指定了 curl_cffi / httpx，但抓到的是空壳 SPA 页，
+        静默升级到 Jina Reader（渲染后的结果），同时在日志提示。
+        """
+        if not result.ok:
+            return result
+        if self._has_enough_content(result, task):
+            return result
+
+        logger.info(
+            "🔀 任务 [{}] 策略={} 抓到空壳（content_len={}），自动升级到 Jina Reader",
+            task.name, result.strategy_used, len(result.content or ""),
+        )
+        jina = self._fetch_jina(task, headers)
+        if jina.ok:
+            jina.strategy_used = f"{result.strategy_used}→jina"
+            return jina
+        return result  # jina 也失败就返回原结果（至少有 HTML 可以看）
 
     # --------------------------------------------------------
     # 具体策略实现
@@ -326,20 +367,28 @@ class FetchEngine:
             )
 
     # --------------------------------------------------------
-    # 辅助：判断抓到的内容"看起来是否可用"
+    # 辅助：判断抓到的内容"是否含实质内容"（不是 SPA 空壳）
     # --------------------------------------------------------
     @staticmethod
-    def _looks_usable(result: FetchResult, task: Task) -> bool:
+    def _has_enough_content(result: FetchResult, task: Task) -> bool:
         """
-        粗略判断：HTTP 2xx 且正文长度 >= 500 且不是明显的挑战页。
-        如果任务类型是 json，只要 HTTP 成功就算可用。
+        更严格的可用性判断：
+        - HTTP 2xx
+        - JSON 任务：只要非空就行
+        - HTML 任务：不仅要够长，还要能提取出足够的可见文本（不是 SPA 空壳）
         """
         if not result.ok:
             return False
-        if task.type == "json":
-            return bool(result.content.strip())
 
         text = result.content or ""
+        if not text.strip():
+            return False
+
+        # JSON 任务：非空即可
+        if task.type == "json":
+            return True
+
+        # 小于 500 字节基本是错误页
         if len(text) < 500:
             return False
 
@@ -356,4 +405,43 @@ class FetchEngine:
         if any(m in lower for m in challenge_markers):
             return False
 
-        return True
+        # 如果 HTML 特别短（< 3KB），算壳
+        # 真正的 SPA 空壳判定我们放在 extractor 的后置检查里
+        # 这里做个"内嵌数据快速检测"：有任一 SPA 数据嵌入点就算可用
+        if _has_any_embedded_data(text):
+            return True
+
+        # 否则：看可见文本量（粗略估算，直接正则剥标签）
+        visible = _quick_visible_text(text)
+        return len(visible) >= 400
+
+
+# ============================================================
+# 辅助：判断 HTML 是否有内嵌数据（Next/Nuxt/Apollo/window.__X__ 等）
+# ============================================================
+_EMBEDDED_DATA_MARKERS = (
+    '__NEXT_DATA__', '__NUXT_DATA__', '__NUXT__',
+    '__APOLLO_STATE__', '__INITIAL_STATE__', '__PRELOADED_STATE__',
+    '__REDUX_STATE__', '__INITIAL_DATA__',
+    'application/ld+json',
+    'data-sveltekit-fetched',
+    '__remixContext',
+)
+
+
+def _has_any_embedded_data(html: str) -> bool:
+    """检测 HTML 是否存在任一常见的数据嵌入点。"""
+    return any(marker in html for marker in _EMBEDDED_DATA_MARKERS)
+
+
+_QUICK_STRIP_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
+_QUICK_STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
+_QUICK_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _quick_visible_text(html: str) -> str:
+    """粗略估算可见文本量（不依赖 selectolax，避免循环导入）。"""
+    text = _QUICK_STRIP_RE.sub("", html)
+    text = _QUICK_STYLE_RE.sub("", text)
+    text = _QUICK_TAG_RE.sub(" ", text)
+    return " ".join(text.split())

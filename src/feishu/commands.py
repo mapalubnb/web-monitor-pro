@@ -47,6 +47,7 @@ class CommandResponse:
     file_display_name: str = ""                # 文件展示名
     extra_cards: list[dict[str, Any]] = field(default_factory=list)  # 额外要发的卡片
     trigger_check_task_id: int | None = None   # 请求立即触发某任务的检查
+    sync_scheduler_task_ids: list[int] = field(default_factory=list)  # 请求同步指定任务到调度器
 
     @classmethod
     def err(cls, reason: str, suggestion: str = "") -> "CommandResponse":
@@ -63,10 +64,12 @@ class CommandResponse:
 class CommandDispatcher:
     """命令解析与分发。"""
 
-    def __init__(self, cfg: AppConfig, risk: RiskController, service_start_ts: float):
+    def __init__(self, cfg: AppConfig, risk: RiskController, service_start_ts: float,
+                 engine: Any = None):
         self.cfg = cfg
         self.risk = risk
         self.service_start_ts = service_start_ts
+        self.engine = engine  # FetchEngine 引用，供 /debug 命令使用
 
         # 文本命令 → handler 方法
         self._text_handlers: dict[str, Callable[..., CommandResponse]] = {
@@ -87,6 +90,8 @@ class CommandDispatcher:
             "mute": self._cmd_mute,
             "unmute": self._cmd_unmute,
             "sniff": self._cmd_sniff,
+            "debug": self._cmd_debug,
+            "interval": self._cmd_interval,
         }
 
         # 卡片按钮 action → handler 方法
@@ -271,7 +276,9 @@ class CommandDispatcher:
             name = t.name
         verb = "▶️ 已恢复" if enabled else "⏸️ 已暂停"
         logger.info("{} 任务 #{} [{}]", verb, task_id, name)
-        return CommandResponse.ok(f"{verb} #{task_id} · {name}")
+        resp = CommandResponse.ok(f"{verb} #{task_id} · {name}")
+        resp.sync_scheduler_task_ids = [task_id]
+        return resp
 
     # ---- /remove ----
     def _cmd_remove(self, args: list[str]) -> CommandResponse:
@@ -285,7 +292,10 @@ class CommandDispatcher:
             name = t.name
             s.delete(t)
         logger.info("🗑️  已删除任务 #{} [{}]", task_id, name)
-        return CommandResponse.ok(f"🗑️ 已删除任务 #{task_id} · {name}")
+        resp = CommandResponse.ok(f"🗑️ 已删除任务 #{task_id} · {name}")
+        # 关键：同步调度器，让它移除这个任务的 job
+        resp.sync_scheduler_task_ids = [task_id]
+        return resp
 
     # ---- /check ----
     def _cmd_check(self, args: list[str]) -> CommandResponse:
@@ -479,6 +489,106 @@ class CommandDispatcher:
             return CommandResponse.err("用法：`/sniff <URL>`")
         url = args[0].strip()
         return CommandResponse(card=cards.sniff_helper_card(url))
+
+    # ---- /debug ----
+    def _cmd_debug(self, args: list[str]) -> CommandResponse:
+        """
+        诊断任务的抓取情况：
+        - 抓一次页面
+        - 分析页面框架（Next/Nuxt/SPA 壳/Cloudflare 等）
+        - 列出命中的数据嵌入点
+        - 给出优化建议
+        """
+        task_id = _parse_task_id(args)
+        if task_id is None:
+            return CommandResponse.err("用法：`/debug <任务ID>`")
+
+        if self.engine is None:
+            return CommandResponse.err("诊断功能未就绪（engine 未注入）")
+
+        from ..fetcher.extractor import diagnose_html
+        with session_scope() as s:
+            t = s.get(Task, task_id)
+            if t is None:
+                return CommandResponse.err(f"未找到任务 #{task_id}")
+            s.expunge(t)
+            task = t
+
+        logger.info("🔍 /debug 正在诊断任务 #{} [{}]", task_id, task.name)
+        try:
+            result = self.engine.fetch(task)
+        except Exception as e:
+            return CommandResponse.err(f"抓取失败：{e}")
+
+        if not result.ok:
+            return CommandResponse.err(
+                f"抓取失败 HTTP={result.status_code}",
+                result.error or "",
+            )
+
+        findings = diagnose_html(result.content or "")
+
+        # 组装卡片内容
+        frameworks = "、".join(findings["frameworks"]) or "未识别"
+        data_points = "\n".join(findings["data_points"]) if findings["data_points"] else "❌ 未找到"
+        suggestions = "\n".join(f"• {s}" for s in findings["suggestions"])
+
+        detail = (
+            f"**📊 诊断结果**\n\n"
+            f"🔖 任务：#{task_id} · {task.name}\n"
+            f"🌐 URL：{task.url}\n"
+            f"🎯 抓取策略：`{result.strategy_used}`\n"
+            f"📏 HTML 大小：{_humanize_size(findings['html_size'])}\n"
+            f"👁️ 可见文本：{findings['visible_text_length']} 字\n"
+            f"🏗️ 框架识别：{frameworks}\n\n"
+            f"**📦 数据嵌入点**\n{data_points}\n\n"
+            f"**💡 优化建议**\n{suggestions}"
+        )
+
+        # 把抓到的 HTML 附件化（可下载研究）
+        try:
+            import tempfile
+            fp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".html", delete=False, encoding="utf-8",
+            )
+            fp.write(result.content or "")
+            fp.close()
+            html_path = Path(fp.name)
+        except Exception:
+            html_path = None
+
+        return CommandResponse(
+            card=cards.success_card("🔍 抓取诊断报告", detail),
+            file_path=html_path,
+            file_display_name=f"task_{task_id}_debug.html" if html_path else "",
+        )
+
+    # ---- /interval ----
+    def _cmd_interval(self, args: list[str]) -> CommandResponse:
+        """修改任务的检查间隔。用法：/interval <id> <秒>"""
+        if len(args) < 2:
+            return CommandResponse.err("用法：`/interval <任务ID> <秒数>`")
+        try:
+            task_id = int(args[0])
+            seconds = int(args[1])
+        except ValueError:
+            return CommandResponse.err("参数必须是数字")
+        if seconds < 10:
+            return CommandResponse.err("间隔不能小于 10 秒")
+
+        with session_scope() as s:
+            t = s.get(Task, task_id)
+            if t is None:
+                return CommandResponse.err(f"未找到任务 #{task_id}")
+            t.interval = seconds
+            name = t.name
+        logger.info("⏱️ 任务 #{} [{}] 间隔调整为 {} 秒", task_id, name, seconds)
+        resp = CommandResponse.ok(
+            f"⏱️ 已更新间隔",
+            f"任务 #{task_id} · {name}\n新间隔：**{seconds} 秒**",
+        )
+        resp.sync_scheduler_task_ids = [task_id]
+        return resp
 
     # ========================================================
     # 按钮动作
