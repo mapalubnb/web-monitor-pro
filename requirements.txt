@@ -3,6 +3,9 @@
 curl_cffi>=0.7.4
 # 轻量备选：L1/L2 静态页面可直接用
 httpx[http2]>=0.27.0
+# httpx 解压 brotli/zstd 响应必需（否则抓到压缩后的乱码字节）
+brotli>=1.1.0
+zstandard>=0.22.0
 
 # ============ HTML/正文提取 ============
 selectolax>=0.3.21        # 超快 HTML 解析器（比 BeautifulSoup 快 ~30x）

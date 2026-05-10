@@ -58,7 +58,6 @@ _BASE_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
               "image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -68,9 +67,32 @@ _BASE_HEADERS = {
 }
 
 
-def _headers(default_headers: dict, user_headers: dict) -> dict:
-    """合成浏览器级请求头。"""
-    h = {"User-Agent": random.choice(_UA_POOL), **_BASE_HEADERS}
+def _can_decode(name: str) -> bool:
+    """检测 httpx 是否能解这种压缩编码。"""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+# 只广告我们真正能解压的编码；否则服务端发 br 我们没法解（乱码）
+_ACCEPT_ENCODING = ", ".join(filter(None, [
+    "gzip",
+    "deflate",
+    "br" if _can_decode("brotli") or _can_decode("brotlicffi") else None,
+    "zstd" if _can_decode("zstandard") else None,
+])) or "identity"
+
+
+def _headers(default_headers: dict, user_headers: dict,
+             accept_encoding: str | None = None) -> dict:
+    """合成浏览器级请求头。accept_encoding 允许调用方覆盖（如 httpx 分支）。"""
+    h = {
+        "User-Agent": random.choice(_UA_POOL),
+        **_BASE_HEADERS,
+        "Accept-Encoding": accept_encoding or _ACCEPT_ENCODING,
+    }
     h.update(default_headers or {})
     h.update(user_headers or {})
     return h
@@ -113,14 +135,37 @@ def _quick_visible_text(html: str) -> str:
     return " ".join(text.split())
 
 
+def _looks_like_binary_garbage(text: str) -> bool:
+    """
+    检测响应是否是未解压的二进制字节流（brotli/zstd 等解压失败的征兆）。
+    采样前 2KB，统计不可打印字符占比 > 30% 就判定为乱码。
+    """
+    if not text:
+        return False
+    sample = text[:2048]
+    if not sample:
+        return False
+    # 统计 "可疑字符"：不是 ASCII 可打印也不是 CJK 等常见范围
+    bad = sum(1 for ch in sample
+              if ord(ch) < 0x20 and ch not in "\r\n\t"
+              or 0x7F <= ord(ch) < 0xA0)  # C1 控制字符
+    return bad / len(sample) > 0.30
+
+
 def _is_content_usable(result: FetchResult, task: Task) -> bool:
-    """判断抓取内容是否足够（避免把 SPA 空壳当成正常结果）。"""
+    """判断抓取内容是否足够（避免把 SPA 空壳或乱码当成正常结果）。"""
     if not result.ok or not (result.content or "").strip():
         return False
+
+    text = result.content
+
+    # 乱码检测（未解压的压缩字节）
+    if _looks_like_binary_garbage(text):
+        return False
+
     if task.type == "json":
         return True
 
-    text = result.content
     if len(text) < 500:
         return False
     lower = text.lower()
@@ -193,9 +238,15 @@ class FetchEngine:
         """明确指定 curl_cffi/httpx 但拿到空壳时，升级到 Jina。"""
         if not result.ok or _is_content_usable(result, task):
             return result
+        # 区分原因便于排查
+        content = result.content or ""
+        if _looks_like_binary_garbage(content):
+            reason = f"响应疑似未解压（乱码字节 len={len(content)}）"
+        else:
+            reason = f"空壳/内容不足（len={len(content)}）"
         logger.info(
-            "🔀 [{}] 策略={} 抓到空壳(len={})，自动升级 Jina",
-            task.name, result.strategy_used, len(result.content or ""),
+            "🔀 [{}] 策略={} {}，自动升级 Jina",
+            task.name, result.strategy_used, reason,
         )
         jina = self._fetch_jina(task, headers)
         if jina.ok:
