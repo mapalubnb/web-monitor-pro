@@ -124,13 +124,16 @@ def _looks_like_spa_shell(html: str) -> bool:
     has_spa_markers = any(m in lower for m in spa_markers)
 
     # 有嵌入数据标记 → 直接走 SPA 提取
+    # 注意: application/ld+json 是 SEO 元数据，不代表页面有真实嵌入数据，不纳入此列表
     embed_markers = (
         "__next_data__", "__nuxt_data__", "__nuxt__",
         "__initial_state__", "__apollo_state__", "__redux_state__",
         "__gatsby_data__", "__remixcontext", "__sveltekit_data__",
-        "application/ld+json",
     )
     if any(m in lower for m in embed_markers):
+        return True
+    # self.__next_f (RSC Flight) 视为嵌入数据，但 BAILOUT 时 RSC 无实际内容，跳过
+    if "self.__next_f" in lower and "bailout_to_client_side_rendering" not in lower:
         return True
 
     # body 可见文本少 + SPA 壳特征
