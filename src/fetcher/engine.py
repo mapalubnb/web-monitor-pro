@@ -202,7 +202,19 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
 
 
 class _BrowserPool:
-    """Manages Playwright Chromium: lazy init, periodic recycling, stealth injection."""
+    """Manages Playwright Chromium rendering.
+
+    Playwright sync API is thread-bound — a browser created in thread A cannot
+    be used from thread B.  APScheduler dispatches tasks to a threadpool, so
+    different tasks (or the same task on successive runs) may land on different
+    threads.
+
+    To avoid cross-thread errors and deadlocks we use a serialisation lock that
+    covers the entire render lifecycle (launch → navigate → extract → close).
+    The browser is reused across calls that happen on the same thread and
+    recycled (closed + re-launched) when the calling thread changes, or when
+    the browser exceeds its age/page limits.
+    """
 
     MAX_AGE = 1800
     _BLOCK_TYPES = {"image", "font", "media"}
@@ -214,64 +226,65 @@ class _BrowserPool:
         self._page_count = 0
         self._created_at = 0.0
         self._owner_thread: int | None = None
+        # Serialises all Playwright operations so that only one thread
+        # touches the browser at a time.
         self._lock = threading.Lock()
 
     def _should_recycle(self) -> bool:
         if self._browser is None:
             return False
-        # Playwright sync API is thread-bound: if the current thread differs
-        # from the one that created the browser, we must recycle.
         if self._owner_thread != threading.get_ident():
             return True
         return ((time.time() - self._created_at) > self.MAX_AGE
                 or self._page_count >= self._cfg.playwright_max_pages)
 
     def _ensure_browser(self) -> Any:
-        """Ensure browser instance is alive; recycle if stale."""
-        with self._lock:
-            if self._should_recycle():
-                self.close()
-            if self._browser is not None:
-                return self._browser
+        """Ensure browser instance is alive on the current thread."""
+        if self._should_recycle():
+            self._close_internal()
+        if self._browser is not None:
+            return self._browser
 
-            try:
-                from playwright.sync_api import sync_playwright
-            except ImportError:
-                logger.warning("playwright not installed")
-                return None
-            try:
-                self._pw = sync_playwright().start()
-                self._browser = self._pw.chromium.launch(
-                    headless=True,
-                    args=["--disable-gpu", "--disable-dev-shm-usage",
-                          "--no-sandbox", "--disable-setuid-sandbox"],
-                )
-                self._page_count = 0
-                self._created_at = time.time()
-                self._owner_thread = threading.get_ident()
-                logger.info("Playwright Chromium started (thread={})", self._owner_thread)
-                return self._browser
-            except Exception as e:
-                logger.warning("Playwright launch failed: {}", e)
-                self._pw = self._browser = None
-                self._owner_thread = None
-                return None
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.warning("playwright not installed")
+            return None
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=["--disable-gpu", "--disable-dev-shm-usage",
+                      "--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            self._page_count = 0
+            self._created_at = time.time()
+            self._owner_thread = threading.get_ident()
+            logger.info("Playwright Chromium started (thread={})", self._owner_thread)
+            return self._browser
+        except Exception as e:
+            logger.warning("Playwright launch failed: {}", e)
+            self._pw = self._browser = None
+            self._owner_thread = None
+            return None
 
     def render(self, url: str, headers: dict, timeout: int) -> FetchResult:
-        """Render page; auto-retry without resource blocking on error pages."""
+        """Render page under the serialisation lock (thread-safe)."""
         if not self._cfg.enable_playwright:
             return FetchResult(ok=False, url=url, strategy_used="playwright",
                                error="Playwright disabled (ENABLE_PLAYWRIGHT=false)")
-        browser = self._ensure_browser()
-        if browser is None:
-            return FetchResult(ok=False, url=url, strategy_used="playwright",
-                               error="Playwright not installed or launch failed")
 
-        result = self._render_once(url, headers, timeout, browser, block_resources=True)
-        if result.ok and _is_error_page(result.inner_text):
-            logger.info("[{}] error page detected, retrying without resource blocking", url)
-            result = self._render_once(url, headers, timeout, browser, block_resources=False)
-        return result
+        with self._lock:
+            browser = self._ensure_browser()
+            if browser is None:
+                return FetchResult(ok=False, url=url, strategy_used="playwright",
+                                   error="Playwright not installed or launch failed")
+
+            result = self._render_once(url, headers, timeout, browser, block_resources=True)
+            if result.ok and _is_error_page(result.inner_text):
+                logger.info("[{}] error page detected, retrying without resource blocking", url)
+                result = self._render_once(url, headers, timeout, browser, block_resources=False)
+            return result
 
     def _render_once(self, url: str, headers: dict, timeout: int,
                      browser: Any, *, block_resources: bool) -> FetchResult:
@@ -326,8 +339,8 @@ class _BrowserPool:
                     except Exception:
                         pass
 
-    def close(self) -> None:
-        """Shutdown browser and playwright process."""
+    def _close_internal(self) -> None:
+        """Shutdown browser — caller must hold self._lock."""
         if self._browser:
             try:
                 self._browser.close()
@@ -341,6 +354,12 @@ class _BrowserPool:
                 pass
             self._pw = None
         self._page_count = 0
+        self._owner_thread = None
+
+    def close(self) -> None:
+        """Public shutdown (e.g. on application exit)."""
+        with self._lock:
+            self._close_internal()
 
 
 class FetchEngine:
