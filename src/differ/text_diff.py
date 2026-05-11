@@ -241,36 +241,28 @@ def _deepdiff_to_lines(dd) -> tuple[list[str], list[str]]:
 
     d = dd.to_dict() if hasattr(dd, "to_dict") else dict(dd)
 
-    # 新增的字段/项
-    for path, val in (d.get("dictionary_item_added") or {}).items() if isinstance(d.get("dictionary_item_added"), dict) else []:
+    # 新增的字段/项（DeepDiff to_dict() 返回 dict）
+    for path, val in (d.get("dictionary_item_added") or {}).items():
         added.append(f"{path} = {_short_json(val)}")
-    for path in d.get("dictionary_item_added") or []:
-        if not isinstance(d.get("dictionary_item_added"), dict):
-            added.append(str(path))
-
-    for path in d.get("iterable_item_added") or {}:
-        val = (d.get("iterable_item_added") or {}).get(path) if isinstance(d.get("iterable_item_added"), dict) else None
-        added.append(f"{path} = {_short_json(val)}" if val is not None else str(path))
+    for path, val in (d.get("iterable_item_added") or {}).items():
+        added.append(f"{path} = {_short_json(val)}")
 
     # 删除的字段/项
-    for path in d.get("dictionary_item_removed") or []:
-        removed.append(str(path))
-    for path in d.get("iterable_item_removed") or {}:
-        val = (d.get("iterable_item_removed") or {}).get(path) if isinstance(d.get("iterable_item_removed"), dict) else None
-        removed.append(f"{path} = {_short_json(val)}" if val is not None else str(path))
+    for path, val in (d.get("dictionary_item_removed") or {}).items():
+        removed.append(f"{path} = {_short_json(val)}")
+    for path, val in (d.get("iterable_item_removed") or {}).items():
+        removed.append(f"{path} = {_short_json(val)}")
 
     # 值变化
     for path, change in (d.get("values_changed") or {}).items():
-        old = _short_json(change.get("old_value") if isinstance(change, dict) else None)
-        new = _short_json(change.get("new_value") if isinstance(change, dict) else None)
-        removed.append(f"{path}: {old}")
-        added.append(f"{path}: {new}")
+        if isinstance(change, dict):
+            removed.append(f"{path}: {_short_json(change.get('old_value'))}")
+            added.append(f"{path}: {_short_json(change.get('new_value'))}")
 
     for path, change in (d.get("type_changes") or {}).items():
-        old = _short_json(change.get("old_value") if isinstance(change, dict) else None)
-        new = _short_json(change.get("new_value") if isinstance(change, dict) else None)
-        removed.append(f"{path} (type changed): {old}")
-        added.append(f"{path} (type changed): {new}")
+        if isinstance(change, dict):
+            removed.append(f"{path} (type changed): {_short_json(change.get('old_value'))}")
+            added.append(f"{path} (type changed): {_short_json(change.get('new_value'))}")
 
     return added, removed
 

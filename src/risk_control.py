@@ -37,6 +37,11 @@ class _FetchSlot:
             self._released = True
 
 
+_CLEANUP_INTERVAL = 3600  # 每小时清理一次过期记录
+_DOMAIN_EXPIRE = 86400    # 域名记录 24h 过期
+_COOLDOWN_EXPIRE = 3600   # 冷却记录 1h 过期
+
+
 class RiskController:
     """抓取 + 推送风控的统一入口。"""
 
@@ -46,6 +51,7 @@ class RiskController:
         self._cooldown_mem: dict[int, float] = {}
         self._lock = threading.Lock()
         self._sem = threading.BoundedSemaphore(max_concurrent)
+        self._last_cleanup = time.time()
 
     # ============================================================
     # 抓取侧
@@ -55,6 +61,7 @@ class RiskController:
         self._sem.acquire()
         try:
             self._wait_for_domain(url)
+            self._maybe_cleanup()
         except Exception:
             self._sem.release()
             raise
@@ -74,6 +81,36 @@ class RiskController:
         if wait > 0:
             logger.debug("⏱️  域名 [{}] 限流 {:.1f}s", domain, wait)
             time.sleep(wait)
+
+    def _maybe_cleanup(self) -> None:
+        """定期清理过期的域名限流和冷却记录，防止内存无限增长。"""
+        now = time.time()
+        if (now - self._last_cleanup) < _CLEANUP_INTERVAL:
+            return
+        with self._lock:
+            # 二次检查（避免多线程重复清理）
+            if (now - self._last_cleanup) < _CLEANUP_INTERVAL:
+                return
+            self._last_cleanup = now
+            # 清理过期域名记录
+            expired_domains = [
+                d for d, ts in self._domain_last_hit.items()
+                if (now - ts) > _DOMAIN_EXPIRE
+            ]
+            for d in expired_domains:
+                del self._domain_last_hit[d]
+            # 清理过期冷却记录
+            expired_tasks = [
+                tid for tid, ts in self._cooldown_mem.items()
+                if (now - ts) > _COOLDOWN_EXPIRE
+            ]
+            for tid in expired_tasks:
+                del self._cooldown_mem[tid]
+            if expired_domains or expired_tasks:
+                logger.debug(
+                    "🧹 风控清理：移除 {} 个域名记录、{} 个冷却记录",
+                    len(expired_domains), len(expired_tasks),
+                )
 
     def next_interval_after_failure(self, consecutive_failures: int, base: int) -> int:
         """失败后的退避间隔（秒）。"""
@@ -114,7 +151,7 @@ class RiskController:
     def _is_cooling(self, task_id: int) -> bool:
         with self._lock:
             last = self._cooldown_mem.get(task_id, 0)
-        return (time.time() - last) < self.cfg.push_cooldown_seconds
+            return (time.time() - last) < self.cfg.push_cooldown_seconds
 
     def mark_pushed(self, task_id: int, kind: str = "change",
                     message_id: str | None = None) -> None:

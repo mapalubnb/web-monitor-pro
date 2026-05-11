@@ -58,12 +58,13 @@ class MonitorScheduler:
         job_id = f"task_{task_id}"
         with session_scope() as s:
             t = s.get(Task, task_id)
-
-        if t is None or not t.enabled:
-            if self._sched.get_job(job_id):
-                self._sched.remove_job(job_id)
-                logger.info("📅 移除调度 #{}", task_id)
-            return
+            if t is None or not t.enabled:
+                if self._sched.get_job(job_id):
+                    self._sched.remove_job(job_id)
+                    logger.info("📅 移除调度 #{}", task_id)
+                return
+            # 在 session 内 expunge，确保属性已加载到内存
+            s.expunge(t)
         self._add_or_update(t)
 
     def trigger_now(self, task_id: int) -> None:

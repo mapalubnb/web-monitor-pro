@@ -15,6 +15,9 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import SNAPSHOT_DIR, AppConfig
+
+# 连续失败超过此阈值自动禁用任务（熔断）
+CIRCUIT_BREAKER_THRESHOLD = 20
 from ..db import ChangeHistory, Task, session_scope
 from ..differ import compute_diff, filter_by_keywords
 from ..feishu import FeishuClient, cards
@@ -361,19 +364,42 @@ class MonitorRunner:
             name = t.name
             url = t.url
 
-        if (
+            # 熔断：连续失败超过阈值自动禁用
+            tripped = False
+            if fails >= CIRCUIT_BREAKER_THRESHOLD:
+                t.enabled = False
+                tripped = True
+
+        chat_id = self.cfg.feishu.target_chat_id
+        if not chat_id:
+            return
+
+        if tripped:
+            logger.warning(
+                "🔌 #{} [{}] 连续失败 {} 次，触发熔断自动禁用",
+                task.id, name, fails,
+            )
+            self.feishu.send_card(
+                chat_id,
+                cards.error_card(
+                    f"🔌 任务 #{task.id} 已熔断禁用",
+                    f"任务【{name}】连续失败 {fails} 次，已自动暂停。\n"
+                    f"最后错误：{error[:200]}",
+                    f"`/resume {task.id}` 恢复，或 `/reset {task.id} --strategy playwright` 调优后重试",
+                ),
+            )
+            self.risk.mark_pushed(task.id, kind="error")
+        elif (
             self.risk.should_alert_failure(fails)
             and self.risk.can_send_failure_alert(task.id)
         ):
-            chat_id = self.cfg.feishu.target_chat_id
-            if chat_id:
-                self.feishu.send_card(
-                    chat_id,
-                    cards.fetch_failure_card(
-                        task.id, name, url, fails, error,
-                    ),
-                )
-                self.risk.mark_pushed(task.id, kind="error")
+            self.feishu.send_card(
+                chat_id,
+                cards.fetch_failure_card(
+                    task.id, name, url, fails, error,
+                ),
+            )
+            self.risk.mark_pushed(task.id, kind="error")
 
     # ============================================================
     # 持久化快照/diff（单写，无冗余时间戳备份）

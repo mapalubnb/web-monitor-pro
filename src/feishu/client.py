@@ -75,14 +75,12 @@ class FeishuClient:
         """在原消息下回复一个卡片。"""
         try:
             from lark_oapi.api.im.v1 import (
-                CreateMessageRequestBody,
                 ReplyMessageRequest,
                 ReplyMessageRequestBody,
             )
         except ImportError:
             logger.error("lark-oapi 缺少 reply_message 模块")
             return None
-        _ = CreateMessageRequestBody  # 无用，防 lint
         try:
             body = ReplyMessageRequestBody.builder() \
                 .msg_type("interactive") \
@@ -236,12 +234,19 @@ class FeishuClient:
         card_msg_id = self.send_card(chat_id, card)
         file_msg_id: str | None = None
         if file_path is not None and Path(file_path).exists():
-            file_key = self.upload_file(file_path)
+            safe = ensure_upload_size(Path(file_path))
+            file_key = self.upload_file(safe)
             if file_key:
                 file_msg_id = self.send_file(
                     chat_id, file_key,
                     file_display_name or Path(file_path).name,
                 )
+            # 清理截断产生的临时文件
+            if safe != Path(file_path):
+                try:
+                    safe.unlink(missing_ok=True)
+                except Exception:
+                    pass
         return card_msg_id, file_msg_id
 
     # --------------------------------------------------------

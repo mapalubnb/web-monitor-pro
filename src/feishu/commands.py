@@ -29,8 +29,7 @@ from ..db import ChangeHistory, PushLog, Task, session_scope
 from ..logger import get_today_log_path, logger, tail_log
 from ..risk_control import RiskController
 from . import cards
-
-__version__ = "0.2.0"
+from .. import __version__
 
 
 # ============================================================
@@ -556,8 +555,10 @@ class CommandDispatcher:
                 select(func.sum(Task.total_checks))
             ).scalar_one() or 0
             errors = s.execute(
-                select(func.sum(Task.consecutive_failures))
-            ).scalar_one() or 0
+                select(func.count()).select_from(PushLog)
+                .where(PushLog.created_at >= today)
+                .where(PushLog.kind == "error")
+            ).scalar_one()
 
         mute_until = self.risk.mute_status()
         mute_text = f"⏰ 至 {mute_until:%H:%M:%S}" if mute_until else "否"
@@ -639,18 +640,15 @@ class CommandDispatcher:
             f"**💡 建议**\n{chr(10).join(f'• {s}' for s in f['suggestions'])}"
         )
 
-        # 附上 HTML 文件
+        # 附上 HTML 文件（写入 snapshots 目录，避免临时文件泄漏）
         html_path: Path | None = None
         try:
-            import tempfile
-            fp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".html", delete=False, encoding="utf-8"
-            )
-            fp.write(result.content or "")
-            fp.close()
-            html_path = Path(fp.name)
+            from ..config import SNAPSHOT_DIR
+            html_path = SNAPSHOT_DIR / f"task_{task_id}_debug.html"
+            html_path.write_text(result.content or "", encoding="utf-8")
         except Exception as e:
             logger.debug("生成 HTML 附件失败：{}", e)
+            html_path = None
 
         return CommandResponse(
             card=cards.success_card("🔍 抓取诊断报告", detail),

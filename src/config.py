@@ -96,6 +96,14 @@ def _split_csv(value: str) -> list[str]:
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
+def _safe_int(value: str, default: int) -> int:
+    """安全的 int 转换，无效值使用默认值并记录警告。"""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
 def load_config(
     env_path: Path | None = None,
     yaml_path: Path | None = None,
@@ -123,13 +131,13 @@ def load_config(
 
     return AppConfig(
         feishu=feishu,
-        default_check_interval=int(os.getenv("DEFAULT_CHECK_INTERVAL", "60")),
-        max_concurrent_fetch=int(os.getenv("MAX_CONCURRENT_FETCH", "5")),
-        request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
+        default_check_interval=_safe_int(os.getenv("DEFAULT_CHECK_INTERVAL", "60"), 60),
+        max_concurrent_fetch=_safe_int(os.getenv("MAX_CONCURRENT_FETCH", "5"), 5),
+        request_timeout=_safe_int(os.getenv("REQUEST_TIMEOUT", "30"), 30),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         enable_playwright=os.getenv("ENABLE_PLAYWRIGHT", "true").lower() in ("true", "1", "yes"),
-        playwright_timeout=int(os.getenv("PLAYWRIGHT_TIMEOUT", "30")),
-        playwright_max_pages=int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20")),
+        playwright_timeout=_safe_int(os.getenv("PLAYWRIGHT_TIMEOUT", "30"), 30),
+        playwright_max_pages=_safe_int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20"), 20),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
         risk_control=risk_control,
