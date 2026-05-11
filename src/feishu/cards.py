@@ -139,7 +139,7 @@ def help_card() -> dict:
          "`/history <id>` — 查看变更历史\n"
          "`/snapshot <id>` — 下载该任务最新快照文件\n"
          "`/interval <id> <秒>` — 修改间隔\n"
-         "`/reset <id> [--strategy jina]` — 重置基准（策略调优用）"),
+         "`/reset <id> [--strategy playwright]` — 重置基准（策略调优用）"),
         ("🎯  精细化配置",
          "`/keyword <id> add <关键字>[, 关键字2, ...]` — 添加关键字（支持批量）\n"
          "`/keyword <id> remove <关键字>[, ...]` — 移除关键字（支持批量）\n"
@@ -450,7 +450,7 @@ def fetch_failure_card(task_id: int, task_name: str, url: str,
             _div(f"🔗 **URL**：{url}"),
             _div(f"```\n{error[:500]}\n```"),
             _hr(),
-            _note("💡 试试 `/debug <ID>` 诊断，或 `/reset <ID> --strategy jina`"),
+            _note("💡 试试 `/debug <ID>` 诊断，或 `/reset <ID> --strategy playwright`"),
             _action([
                 _btn("⚡ 立即重试", "check", task_id, style="primary"),
                 _btn("⏸️ 暂停", "pause", task_id),

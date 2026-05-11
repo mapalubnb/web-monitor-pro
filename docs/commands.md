@@ -16,7 +16,7 @@
 | `--name "名字"` | 任务名称 | URL 的域名+路径 |
 | `--interval 60` | 检查间隔（秒） | `DEFAULT_CHECK_INTERVAL` |
 | `--type html\|json` | 内容类型 | `html` |
-| `--strategy auto\|httpx\|curl_cffi\|jina\|firecrawl` | 抓取策略 | `auto` |
+| `--strategy auto\|httpx\|curl_cffi\|playwright` | 抓取策略 | `auto` |
 | `--impersonate chrome131\|chrome124\|firefox133\|safari18_0` | curl_cffi 模拟的浏览器 | `chrome131` |
 | `--selector "article"` | CSS 选择器（仅 html） | 自动抽正文 |
 | `--json-path "data[*].name"` | JSON 字段路径（仅 json） | 整个 JSON |
@@ -31,6 +31,10 @@
 
 ```
 /add https://four.meme/en/create-token --strategy curl_cffi --extract-next-data
+```
+
+```
+/add https://pfund.tech/ --strategy playwright --name PFund
 ```
 
 ```

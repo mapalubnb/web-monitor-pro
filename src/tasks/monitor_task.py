@@ -80,7 +80,7 @@ class MonitorRunner:
                 len(result.content or ""), task.id,
             )
             self._handle_failure(
-                task, "提取结果为空（疑似纯 SPA，试 /debug 或 /reset --strategy jina）"
+                task, "提取结果为空（疑似纯 SPA，试 /debug 或 /reset --strategy playwright）"
             )
             return
 

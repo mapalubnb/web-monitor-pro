@@ -4,9 +4,10 @@
 HTML 提取顺序：
 1. 用户指定 CSS 选择器
 2. SPA 嵌入数据（Next.js / Nuxt.js / Apollo / window.__X__ / JSON-LD）
-3. trafilatura 正文
-4. meta 结构化数据兜底
-5. 整页纯文本
+3. RSC Flight 数据（Next.js App Router）
+4. trafilatura 正文
+5. meta 结构化数据兜底
+6. 整页纯文本
 
 归一化：去空白、去噪音（时间戳、nonce、hash）。
 """
@@ -48,16 +49,17 @@ def extract(task: Task, result: FetchResult) -> str:
 
     content_type = (result.content_type or "").lower()
     task_type = (task.type or "html").lower()
+    strategy = result.strategy_used or ""
 
     # JSON
     if task_type == "json" or "json" in content_type:
         return _extract_json(content, task.json_path)
 
-    # Markdown（Jina / Firecrawl）
-    if "markdown" in content_type or result.strategy_used in ("jina", "firecrawl"):
-        return _normalize(_strip_jina_warnings(content))
+    # deep 提取结果已是纯文本，直接归一化
+    if strategy.endswith("→deep"):
+        return _normalize(content)
 
-    # HTML
+    # HTML（包括 Playwright 返回的渲染后 HTML）
     return _extract_html(content, task)
 
 
@@ -77,17 +79,22 @@ def _extract_html(html: str, task: Task) -> str:
         if data:
             return _normalize(data)
 
-    # 3) trafilatura 正文
+    # 3) RSC Flight 数据（Next.js App Router SSR）
+    rsc = _extract_rsc_flight(html)
+    if rsc and len(rsc) >= MIN_USEFUL_LENGTH:
+        return _normalize(rsc)
+
+    # 4) trafilatura 正文
     text = _main_content(html)
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
-    # 4) meta 元数据
+    # 5) meta 元数据
     meta = _extract_meta(html)
     if meta and len(meta) >= MIN_USEFUL_LENGTH:
         return _normalize(meta)
 
-    # 5) 兜底：整页纯文本
+    # 6) 兜底：整页纯文本
     return _normalize(_html_to_text(html)) or _normalize(meta)
 
 
@@ -101,6 +108,7 @@ def _looks_like_spa_shell(html: str) -> bool:
         "__redux_state__", "__gatsby_initial_state__", "__remixcontext",
         "__sveltekit_data__", "__app_data__", "__store__",
         "data-reactroot", "data-server-rendered",
+        "self.__next_f",
     )
     has_spa_markers = any(m in lower for m in spa_markers)
 
@@ -200,6 +208,76 @@ def _extract_spa_data(html: str) -> str | None:
                           indent=2, default=str)
     except Exception:
         return None
+
+
+# ============================================================
+# RSC Flight 数据解析（Next.js App Router）
+# ============================================================
+_RSC_PUSH_RE = re.compile(
+    r'self\.__next_f\.push\(\[\d+,(".*?")\]\)', re.DOTALL,
+)
+
+
+def _extract_rsc_flight(html: str) -> str | None:
+    """解析 Next.js App Router RSC Flight 数据流，提取文本内容。"""
+    # 检测是否有 RSC Flight 标记
+    if "self.__next_f" not in html:
+        return None
+    # CSR bailout → 无服务端数据，不可能提取出有意义的内容
+    if "BAILOUT_TO_CLIENT_SIDE_RENDERING" in html:
+        return None
+
+    # 收集所有 flight chunks
+    stream = ""
+    for m in _RSC_PUSH_RE.finditer(html):
+        try:
+            stream += json.loads(m.group(1))
+        except (json.JSONDecodeError, Exception):
+            continue
+    if not stream:
+        return None
+
+    # 从 Flight 行协议中提取文本内容
+    texts: list[str] = []
+    for line in stream.split("\n"):
+        colon = line.find(":")
+        if colon == -1:
+            continue
+        payload = line[colon + 1:]
+        # 跳过 import refs、symbols、null、hints
+        if not payload or payload == "null":
+            continue
+        if payload.startswith("I[") or payload.startswith('"$S'):
+            continue
+        if payload.startswith("HL["):
+            continue
+        # 尝试解析 JSON 数组/对象，递归提取 children 文本
+        try:
+            obj = json.loads(payload)
+            _collect_rsc_text(obj, texts)
+        except (json.JSONDecodeError, Exception):
+            continue
+
+    if not texts:
+        return None
+    return "\n".join(texts)
+
+
+def _collect_rsc_text(node: Any, texts: list[str]) -> None:
+    """递归遍历 RSC Flight 节点树，收集文本内容。"""
+    if isinstance(node, str):
+        s = node.strip()
+        # 过滤掉 React 内部标记（$L、$S 等）和短噪音
+        if s and not s.startswith("$") and len(s) > 1:
+            texts.append(s)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_rsc_text(item, texts)
+    elif isinstance(node, dict):
+        for key, val in node.items():
+            if key in ("children", "content", "title", "description",
+                       "dangerouslySetInnerHTML"):
+                _collect_rsc_text(val, texts)
 
 
 def _try_json(raw: str) -> Any | None:
@@ -389,27 +467,6 @@ def _eval_path(obj: Any, path: str) -> Any:
 
 
 # ============================================================
-# Jina Reader 元信息过滤
-# ============================================================
-# Jina Reader 会在正文前插入一些元信息行，常见形式：
-#   "Warning: This is a cached snapshot of the original page, consider retry with caching opt-out."
-#   "Warning: This page maybe not yet fully loaded, consider explicitly specify a timeout."
-#   "Warning: This page contains shadow DOM that are currently hidden..."
-#   "Note: ..."
-# 它们不是页面真实内容，但频繁变化（具体文案随 Jina 内部状态切换），
-# 会造成 diff 噪音，在比对前统一过滤掉。
-_JINA_META_RE = re.compile(
-    r"^(?:Warning|Note)\s*:.*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
-def _strip_jina_warnings(text: str) -> str:
-    """移除 Jina Reader 返回的 Warning/Note 元信息行（不属于页面正文内容）。"""
-    return _JINA_META_RE.sub("", text)
-
-
-# ============================================================
 # 归一化
 # ============================================================
 def _normalize(text: str) -> str:
@@ -429,8 +486,10 @@ def try_deep_extract(html: str) -> str:
     """
     对已拿到的 HTML 做深度提取尝试（供 engine 在判定空壳后调用）。
     与 extract() 不同：这里不依赖 Task/FetchResult，直接从原始 HTML 中
-    尝试提取 SPA 嵌入数据、trafilatura 正文、meta 元数据。
-    返回空字符串表示提取失败。
+    尝试提取 SPA 嵌入数据、RSC Flight 数据、trafilatura 正文。
+
+    注意：不兜底 meta / 纯文本 — 那些太低质量，会短路后续更好的策略
+    （如 Playwright）。返回空字符串表示提取失败。
     """
     if not html or not html.strip():
         return ""
@@ -440,21 +499,17 @@ def try_deep_extract(html: str) -> str:
     if spa and len(spa) >= MIN_USEFUL_LENGTH:
         return _normalize(spa)
 
-    # 2. trafilatura 正文
+    # 2. RSC Flight 数据（Next.js App Router SSR 页面）
+    rsc = _extract_rsc_flight(html)
+    if rsc and len(rsc) >= MIN_USEFUL_LENGTH:
+        return _normalize(rsc)
+
+    # 3. trafilatura 正文
     text = _main_content(html)
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
-    # 3. meta 元数据兜底
-    meta = _extract_meta(html)
-    if meta and len(meta) >= MIN_USEFUL_LENGTH:
-        return _normalize(meta)
-
-    # 4. 整页纯文本（最终兜底）
-    full = _html_to_text(html)
-    if full and len(full) >= MIN_USEFUL_LENGTH:
-        return _normalize(full)
-
+    # 不兜底 meta / 纯文本 → 返回空，让 auto 链继续升级到 Playwright
     return ""
 
 
@@ -473,12 +528,16 @@ def diagnose_html(html: str) -> dict[str, Any]:
     frameworks: list[str] = []
     if "__next_data__" in lower or 'id="__next"' in lower:
         frameworks.append("Next.js")
+    if "self.__next_f" in lower:
+        frameworks.append("Next.js App Router (RSC)")
     if "__nuxt__" in lower or "__nuxt_data__" in lower:
         frameworks.append("Nuxt.js / Vue SSR")
     if "data-reactroot" in lower:
         frameworks.append("React SSR")
     if any(m in lower for m in ("cloudflare", "cf-ray", "cdn-cgi")):
         frameworks.append("Cloudflare 保护")
+    if "bailout_to_client_side_rendering" in lower:
+        frameworks.append("CSR Bailout（纯客户端渲染）")
     if not frameworks and ('id="root"' in lower or 'id="app"' in lower):
         frameworks.append("纯客户端 SPA 壳")
 
@@ -491,6 +550,8 @@ def diagnose_html(html: str) -> dict[str, Any]:
             data_points.append(f"✅ window.{var}")
     if re.search(r'type=["\']application/ld\+json["\']', html, re.IGNORECASE):
         data_points.append("✅ JSON-LD")
+    if "self.__next_f" in html and "BAILOUT_TO_CLIENT_SIDE_RENDERING" not in html:
+        data_points.append("✅ RSC Flight（有服务端数据）")
 
     visible_len = len(_html_to_text(html))
 
@@ -498,15 +559,15 @@ def diagnose_html(html: str) -> dict[str, Any]:
     suggestions: list[str] = []
     if data_points:
         suggestions.append("页面内嵌结构化数据，当前提取策略应能拿到")
+    elif "CSR Bailout" in "".join(frameworks) or "纯客户端 SPA" in "".join(frameworks):
+        suggestions.append(
+            "纯客户端 SPA（数据由 JS 动态加载）。建议 `/sniff <url>` 找内部 API "
+            "用 `--type json` 监控，或 `--strategy playwright` 让浏览器渲染"
+        )
     elif "Cloudflare 保护" in frameworks and visible_len < 400:
         suggestions.append(
             "疑似 Cloudflare 挑战，建议 `--impersonate chrome124/firefox133` 换指纹，"
-            "或 `--strategy jina` 用外部渲染"
-        )
-    elif visible_len < 400 and any("SPA" in f for f in frameworks):
-        suggestions.append(
-            "纯客户端 SPA。建议 `/sniff <url>` 找内部 API 用 `--type json` 监控，"
-            "或 `--strategy jina` 让外部服务渲染"
+            "或 `--strategy playwright` 用浏览器渲染"
         )
     else:
         suggestions.append(f"抓取正常，可见文本 {visible_len} 字")

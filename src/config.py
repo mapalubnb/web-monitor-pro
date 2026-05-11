@@ -74,10 +74,9 @@ class AppConfig:
     request_timeout: int = 30
     log_level: str = "INFO"
 
-    jina_reader_api_key: str = ""
-    jina_reader_api_keys: list[str] = field(default_factory=list)
-    firecrawl_api_key: str = ""
-    enable_google_cache: bool = True
+    enable_playwright: bool = True
+    playwright_timeout: int = 30
+    playwright_max_pages: int = 20
     http_proxy: str = ""
     https_proxy: str = ""
 
@@ -128,10 +127,9 @@ def load_config(
         max_concurrent_fetch=int(os.getenv("MAX_CONCURRENT_FETCH", "5")),
         request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        jina_reader_api_key=os.getenv("JINA_READER_API_KEY", ""),
-        jina_reader_api_keys=_split_csv(os.getenv("JINA_READER_API_KEYS", "")),
-        firecrawl_api_key=os.getenv("FIRECRAWL_API_KEY", ""),
-        enable_google_cache=os.getenv("ENABLE_GOOGLE_CACHE", "true").lower() in ("true", "1", "yes"),
+        enable_playwright=os.getenv("ENABLE_PLAYWRIGHT", "true").lower() in ("true", "1", "yes"),
+        playwright_timeout=int(os.getenv("PLAYWRIGHT_TIMEOUT", "30")),
+        playwright_max_pages=int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20")),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
         risk_control=risk_control,

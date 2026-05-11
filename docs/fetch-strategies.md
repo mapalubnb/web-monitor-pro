@@ -1,6 +1,6 @@
 # 抓取策略详解
 
-web-monitor-pro 采用**多策略递进式抓取**，不依赖 Playwright 等浏览器，资源占用极低。
+web-monitor-pro 采用**四级递进式抓取**，全自建无外部 API 依赖。
 
 ---
 
@@ -17,11 +17,20 @@ web-monitor-pro 采用**多策略递进式抓取**，不依赖 Playwright 等浏
 │ 策略 2: httpx + 浏览器请求头      │  ← 备选
 │  轻量，适合 L1-L2 静态页面        │
 └────────────┬───────────────────┘
-             │ 失败
+             │ 失败或空壳
              ↓
 ┌────────────────────────────────┐
-│ 策略 3: Jina Reader API        │  ← 兜底
-│  外部渲染，纯文本/Markdown 输出    │
+│ 策略 3: 深度提取                 │  ← 零网络开销
+│  SPA 嵌入数据 / RSC Flight 解析   │
+│  trafilatura 正文提取             │
+└────────────┬───────────────────┘
+             │ 无有效内容
+             ↓
+┌────────────────────────────────┐
+│ 策略 4: Playwright              │  ← 终极兜底
+│  headless Chromium 渲染          │
+│  stealth 隐藏无头特征            │
+│  按需启动，用完释放               │
 └────────────────────────────────┘
 ```
 
@@ -35,7 +44,7 @@ web-monitor-pro 采用**多策略递进式抓取**，不依赖 Playwright 等浏
 | **L2 Cookie/UA 检查** | 弱反爬，浏览器请求头即过 | 企业官网 | `httpx` + 浏览器头 |
 | **L3 TLS 指纹校验** | Cloudflare 基础防护 | x.com、电商 | **`curl_cffi`** |
 | **L4 SPA / Next.js** | HTML 是空壳，数据走内部 API | four.meme, pump.fun | `curl_cffi` + `--extract-next-data` 或 **API 逆向** ⭐ |
-| **L5 强动态 + JS 挑战** | Turnstile、滑块、WAF | 交易所、Booking | `jina` 或 `firecrawl` |
+| **L5 纯 CSR / DeFi** | 纯客户端渲染，数据来自链上/API | pfund.tech、交易所 | **`playwright`** |
 
 ---
 
@@ -97,10 +106,22 @@ web-monitor-pro 采用**多策略递进式抓取**，不依赖 Playwright 等浏
 
 ---
 
-## 提取 Next.js `__NEXT_DATA__`
+## 深度提取（SSR 嵌入数据 + RSC Flight）
 
-很多基于 Next.js 的 SPA 会把首屏数据塞在 `<script id="__NEXT_DATA__">`。
-这是比 API 逆向**更简单的 L4 方案**：
+很多基于 Next.js、Nuxt.js、Remix 等框架的 SPA 会把首屏数据嵌入到 HTML 中。
+深度提取会自动识别并解析这些嵌入数据，**零额外网络开销**。
+
+### 支持的框架
+
+- Next.js Pages Router（`__NEXT_DATA__`）
+- Next.js App Router（RSC Flight 数据流）
+- Nuxt.js（`__NUXT__` / `__NUXT_DATA__`）
+- Remix（`__remixContext`）
+- SvelteKit（`__SVELTEKIT_DATA__`）
+- Gatsby（`__GATSBY_DATA__`）
+- 通用：`__INITIAL_STATE__`、`__APOLLO_STATE__`、`__REDUX_STATE__`、JSON-LD
+
+### 使用方法
 
 ```
 /add https://four.meme/en/create-token \
@@ -108,26 +129,31 @@ web-monitor-pro 采用**多策略递进式抓取**，不依赖 Playwright 等浏
   --extract-next-data
 ```
 
-工具会自动：
-1. 用 curl_cffi 拉到 HTML（过 Cloudflare）
-2. 提取 `__NEXT_DATA__` 里的 JSON
-3. 对比 `props.pageProps` 的变化
-
 ---
 
-## Jina Reader（兜底）
+## Playwright（纯 CSR 站点兜底）
 
-[r.jina.ai](https://r.jina.ai) 是 Jina 提供的 Reader API，能渲染任何网页为纯文本。
-免费额度 1M 次/月（配 API Key）。
+对于纯客户端渲染的站点（如 DeFi 前端、数据完全由 JS 动态加载），
+Playwright 会启动 headless Chromium 渲染页面并提取完整 DOM。
 
-**何时用**：
-- curl_cffi 也过不了的硬核防护
-- 页面有复杂的 JS 渲染/无限滚动
-- 作为完全自动的兜底
+### 特性
+
+- **按需启动**：只在需要时才启动浏览器，大多数任务不触发
+- **Stealth 隐藏**：使用 `playwright-stealth` 隐藏无头浏览器特征
+- **资源屏蔽**：自动屏蔽图片/CSS/字体/媒体加载，节省内存
+- **定期回收**：每处理 N 页或运行 30 分钟后自动回收浏览器实例，防内存泄漏
+
+### 使用方法
 
 ```
-/add https://hard-site.com --strategy jina
+/add https://pfund.tech/ --strategy playwright --name PFund
 ```
+
+### 资源占用
+
+- 空闲时（未启动浏览器）：0 额外开销
+- 渲染时峰值：~700MB（含 Chromium 子进程）
+- 渲染完毕：内存自动释放
 
 ---
 
@@ -144,5 +170,6 @@ web-monitor-pro 采用**多策略递进式抓取**，不依赖 Playwright 等浏
 - ✅ 全局并发信号量（默认 5）
 - ✅ Cookie 自动持久化
 - ✅ Cloudflare 挑战页自动识别 + fallback
+- ✅ Playwright stealth（隐藏无头浏览器特征）
 
 **进阶**：如需代理，在 `.env` 中配置 `HTTPS_PROXY=socks5://host:port` 即可。

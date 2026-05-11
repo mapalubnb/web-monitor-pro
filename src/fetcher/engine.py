@@ -4,70 +4,23 @@
 auto 模式优先级：
   1. curl_cffi（伪装 Chrome TLS，过 Cloudflare）
   2. httpx（轻量静态页）
-  3. Jina Reader（外部渲染兜底）
+  3. 深度提取（SPA 嵌入数据 + RSC Flight，零网络开销）
+  4. Playwright（headless Chromium 渲染，纯 CSR 兜底）
 
-用户指定 curl_cffi / httpx 时，若抓到空壳会自动升级到 Jina。
+用户指定 curl_cffi / httpx 时，若抓到空壳会自动逐级升级。
 """
 
 from __future__ import annotations
 
 import random
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
-
-import time
 
 from ..config import AppConfig
 from ..db import Task
 from ..logger import logger
-
-
-# ============================================================
-# Jina 多 Key 轮换池
-# ============================================================
-class _JinaKeyPool:
-    """管理多个 Jina API Key，支持 round-robin 和失效标记。"""
-
-    def __init__(self, keys: list[str]):
-        self._keys = [k for k in keys if k]
-        self._index = 0
-        self._disabled: dict[str, float] = {}  # key -> 恢复时间戳
-        self._disable_duration = 86400  # 配额耗尽后禁用 24h
-
-    def get_key(self) -> str | None:
-        """获取下一个可用 key，全部失效返回 None。"""
-        if not self._keys:
-            return None
-        now = time.time()
-        # 清理已恢复的 key
-        self._disabled = {k: t for k, t in self._disabled.items() if t > now}
-        # 尝试找一个可用的
-        for _ in range(len(self._keys)):
-            key = self._keys[self._index % len(self._keys)]
-            self._index += 1
-            if key not in self._disabled:
-                return key
-        return None
-
-    def mark_exhausted(self, key: str) -> None:
-        """标记某个 key 配额用完（429/402），禁用一段时间。"""
-        self._disabled[key] = time.time() + self._disable_duration
-        available = len(self._keys) - len(self._disabled)
-        logger.warning(
-            "🔑 Jina key ...{} 配额耗尽，已禁用 {}h（剩余可用 {}/{}）",
-            key[-6:], self._disable_duration // 3600,
-            max(available, 0), len(self._keys),
-        )
-
-    @property
-    def total(self) -> int:
-        return len(self._keys)
-
-    @property
-    def available(self) -> int:
-        now = time.time()
-        return sum(1 for k in self._keys if k not in self._disabled or self._disabled[k] <= now)
 
 
 @dataclass
@@ -148,7 +101,7 @@ def _headers(default_headers: dict, user_headers: dict,
 
 
 # ============================================================
-# HTML 空壳检测（判定是否需要 fallback 到 Jina）
+# HTML 空壳检测（判定是否需要 fallback）
 # ============================================================
 _EMBEDDED_DATA_MARKERS = (
     "__NEXT_DATA__", "__NUXT_DATA__", "__NUXT__",
@@ -227,6 +180,154 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
 
 
 # ============================================================
+# Playwright 浏览器池（懒加载 + 定期回收 + 资源屏蔽）
+# ============================================================
+_BLOCK_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
+
+
+class _BrowserPool:
+    """管理 Playwright Chromium 实例，懒加载、定期回收、stealth 注入。"""
+
+    MAX_AGE = 1800  # 30 分钟强制回收
+
+    def __init__(self, cfg: AppConfig):
+        self._cfg = cfg
+        self._pw: Any = None
+        self._browser: Any = None
+        self._page_count = 0
+        self._created_at = 0.0
+
+    def _should_recycle(self) -> bool:
+        if self._browser is None:
+            return False
+        age_exceeded = (time.time() - self._created_at) > self.MAX_AGE
+        pages_exceeded = self._page_count >= self._cfg.playwright_max_pages
+        return age_exceeded or pages_exceeded
+
+    def _ensure_browser(self) -> Any:
+        """确保浏览器实例存在且健康，需要时回收重建。"""
+        if self._should_recycle():
+            self._close_browser()
+
+        if self._browser is not None:
+            return self._browser
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            logger.warning("🎭 playwright 未安装，无法启动浏览器渲染")
+            return None
+
+        try:
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ],
+            )
+            self._page_count = 0
+            self._created_at = time.time()
+            logger.info("🎭 Playwright Chromium 已启动")
+            return self._browser
+        except Exception as e:
+            logger.warning("🎭 Playwright 启动失败: {}", e)
+            self._pw = None
+            self._browser = None
+            return None
+
+    def render(self, url: str, headers: dict, timeout: int) -> FetchResult:
+        """渲染页面并返回完整 HTML。"""
+        if not self._cfg.enable_playwright:
+            return FetchResult(
+                ok=False, url=url, strategy_used="playwright",
+                error="Playwright 未启用（ENABLE_PLAYWRIGHT=false）",
+            )
+
+        browser = self._ensure_browser()
+        if browser is None:
+            return FetchResult(
+                ok=False, url=url, strategy_used="playwright",
+                error="Playwright 未安装或启动失败",
+            )
+
+        context = None
+        page = None
+        try:
+            context = browser.new_context(
+                user_agent=headers.get("User-Agent", _UA_POOL[0]),
+            )
+
+            # 注入 stealth 脚本
+            try:
+                from playwright_stealth import stealth_sync
+                stealth_sync(context)
+            except ImportError:
+                pass  # stealth 未安装也能用，只是可能被检测
+
+            page = context.new_page()
+
+            # 屏蔽图片/CSS/字体/媒体，节省内存和带宽
+            page.route(
+                "**/*",
+                lambda route: (
+                    route.abort()
+                    if route.request.resource_type in _BLOCK_RESOURCE_TYPES
+                    else route.continue_()
+                ),
+            )
+
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            content = page.content()
+            self._page_count += 1
+
+            return FetchResult(
+                ok=True, url=url, status_code=200,
+                content=content,
+                content_type="text/html",
+                strategy_used="playwright",
+            )
+        except Exception as e:
+            return FetchResult(
+                ok=False, url=url, strategy_used="playwright",
+                error=f"{type(e).__name__}: {e}",
+            )
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+    def _close_browser(self) -> None:
+        if self._browser:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._pw:
+            try:
+                self._pw.stop()
+            except Exception:
+                pass
+            self._pw = None
+        self._page_count = 0
+
+    def close(self) -> None:
+        """服务停止时调用。"""
+        self._close_browser()
+
+
+# ============================================================
 # 抓取引擎
 # ============================================================
 class FetchEngine:
@@ -242,26 +343,15 @@ class FetchEngine:
             if proxy else None
         )
         self._httpx_client: Any = None  # 懒加载，首次使用时创建
-
-        # 构建 Jina Key 池：优先用多 key 列表，fallback 到单 key
-        jina_keys = list(cfg.jina_reader_api_keys)
-        if cfg.jina_reader_api_key and cfg.jina_reader_api_key not in jina_keys:
-            jina_keys.insert(0, cfg.jina_reader_api_key)
-        self._jina_pool = _JinaKeyPool(jina_keys)
-        if self._jina_pool.total > 1:
-            logger.info("🔑 Jina Key 池已加载 {} 个 key", self._jina_pool.total)
+        self._browser_pool = _BrowserPool(cfg)
 
     # ----- 对外入口 -----
     def fetch(self, task: Task) -> FetchResult:
         strategy = (task.strategy or "auto").lower()
         headers = _headers(self.cfg.default_headers, task.headers or {})
 
-        if strategy == "jina":
-            return self._fetch_jina(task, headers)
-        if strategy == "firecrawl":
-            return self._fetch_firecrawl(task, headers)
-        if strategy == "google_cache":
-            return self._fetch_google_cache(task, headers)
+        if strategy == "playwright":
+            return self._fetch_playwright(task, headers)
 
         if strategy == "curl_cffi":
             result = self._fetch_curl_cffi(task, headers)
@@ -270,7 +360,7 @@ class FetchEngine:
             result = self._fetch_httpx(task, headers)
             return self._upgrade_if_empty(task, headers, result)
 
-        # auto：curl_cffi → httpx → 深度提取 → Google Cache → Jina → Firecrawl
+        # auto：curl_cffi → httpx → 深度提取 → Playwright
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
             return result
@@ -279,31 +369,18 @@ class FetchEngine:
         if result2.ok and _is_content_usable(result2, task):
             return result2
 
-        # ★ 深度提取：从已拿到的 HTML 中挖掘 SSR 嵌入数据
+        # ★ 深度提取：从已拿到的 HTML 中挖掘 SSR 嵌入数据 / RSC Flight
         best_html = result if result.ok else result2
         if best_html.ok and best_html.content:
             deep = self._try_deep_extract(task, best_html)
             if deep is not None:
                 return deep
 
-        # ★ Google Cache：借用 Google 渲染结果
-        if self.cfg.enable_google_cache:
-            cache = self._fetch_google_cache(task, headers)
-            if cache.ok:
-                logger.info("🔀 [{}] auto 升级到 Google Cache", task.name)
-                return cache
-
-        # Jina（多 key 轮换）
-        result3 = self._fetch_jina(task, headers)
-        if result3.ok:
-            logger.info("🔀 [{}] auto 升级到 Jina（前置策略均未获得有效内容）", task.name)
-            return result3
-
-        # Firecrawl 兜底
-        result4 = self._fetch_firecrawl(task, headers)
-        if result4.ok:
-            logger.info("🔀 [{}] auto 升级到 Firecrawl", task.name)
-            return result4
+        # ★ Playwright（最终兜底）
+        pw_result = self._fetch_playwright(task, headers)
+        if pw_result.ok:
+            logger.info("🎭 [{}] auto 升级到 Playwright（前置策略均未获得有效内容）", task.name)
+            return pw_result
 
         # 全部失败：返回最有信息的
         if result.ok:
@@ -354,20 +431,16 @@ class FetchEngine:
         else:
             reason = f"空壳/内容不足（len={len(content)}）"
 
-        # Google Cache
-        if self.cfg.enable_google_cache:
-            cache = self._fetch_google_cache(task, headers)
-            if cache.ok:
-                cache.strategy_used = f"{result.strategy_used}→google_cache"
-                logger.info("🔀 [{}] {} → 升级到 Google Cache", task.name, reason)
-                return cache
+        # Playwright
+        logger.info(
+            "🎭 [{}] 策略={} {}，自动升级 Playwright",
+            task.name, result.strategy_used, reason,
+        )
+        pw = self._fetch_playwright(task, headers)
+        if pw.ok:
+            pw.strategy_used = f"{result.strategy_used}→playwright"
+            return pw
 
-        # Jina
-        logger.info("🔀 [{}] 策略={} {}，自动升级 Jina", task.name, result.strategy_used, reason)
-        jina = self._fetch_jina(task, headers)
-        if jina.ok:
-            jina.strategy_used = f"{result.strategy_used}→jina"
-            return jina
         return result
 
     # ----- 策略：curl_cffi -----
@@ -443,178 +516,18 @@ class FetchEngine:
                 error=f"{type(e).__name__}: {e}",
             )
 
-    # ----- 策略：Google Cache -----
-    def _fetch_google_cache(self, task: Task, headers: dict) -> FetchResult:
-        """从 Google 网页缓存获取已渲染的页面内容。"""
-        cache_url = (
-            f"https://webcache.googleusercontent.com/search?q=cache:{task.url}"
+    # ----- 策略：Playwright（headless Chromium 渲染）-----
+    def _fetch_playwright(self, task: Task, headers: dict) -> FetchResult:
+        return self._browser_pool.render(
+            task.url, headers, self.cfg.playwright_timeout,
         )
-        try:
-            from curl_cffi import requests as cc
-        except ImportError:
-            # fallback 到 httpx
-            client = self._get_httpx_client()
-            if client is None:
-                return FetchResult(
-                    ok=False, url=task.url, strategy_used="google_cache",
-                    error="curl_cffi 和 httpx 均未安装",
-                )
-            try:
-                resp = client.get(cache_url, headers=headers, timeout=self.timeout)
-                if resp.status_code != 200:
-                    return FetchResult(
-                        ok=False, url=task.url, status_code=resp.status_code,
-                        strategy_used="google_cache",
-                        error=f"Google Cache HTTP {resp.status_code}",
-                    )
-                content = self._strip_google_cache_banner(resp.text)
-                return FetchResult(
-                    ok=True, url=task.url, status_code=200,
-                    content=content,
-                    content_type=resp.headers.get("content-type", ""),
-                    strategy_used="google_cache",
-                )
-            except Exception as e:
-                return FetchResult(
-                    ok=False, url=task.url, strategy_used="google_cache",
-                    error=f"{type(e).__name__}: {e}",
-                )
-        # 优先用 curl_cffi（Google 也有反爬）
-        try:
-            resp = cc.get(
-                cache_url, headers=headers, impersonate="chrome131",
-                timeout=self.timeout, proxies=self._proxies,
-                allow_redirects=True,
-            )
-            if resp.status_code != 200:
-                return FetchResult(
-                    ok=False, url=task.url, status_code=resp.status_code,
-                    strategy_used="google_cache",
-                    error=f"Google Cache HTTP {resp.status_code}",
-                )
-            content = self._strip_google_cache_banner(resp.text)
-            return FetchResult(
-                ok=True, url=task.url, status_code=200,
-                content=content,
-                content_type=resp.headers.get("content-type", ""),
-                strategy_used="google_cache",
-            )
-        except Exception as e:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="google_cache",
-                error=f"{type(e).__name__}: {e}",
-            )
-
-    @staticmethod
-    def _strip_google_cache_banner(html: str) -> str:
-        """去掉 Google Cache 页面顶部的横幅 div。"""
-        # Google 在缓存页面顶部插入一个 div，id 为 "google-cache-hdr"
-        import re
-        return re.sub(
-            r'<div[^>]*id="google-cache-hdr"[^>]*>.*?</div>\s*</div>',
-            "", html, count=1, flags=re.DOTALL | re.IGNORECASE,
-        )
-
-    # ----- 策略：Jina Reader（多 Key 轮换）-----
-    def _fetch_jina(self, task: Task, headers: dict) -> FetchResult:
-        client = self._get_httpx_client()
-        if client is None:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="jina",
-                error="httpx 未安装",
-            )
-        jina_url = f"https://r.jina.ai/{task.url}"
-        jh = {
-            "Accept": "text/plain",
-            "User-Agent": headers.get("User-Agent", "web-monitor-pro/0.1"),
-            "x-no-cache": "true",
-        }
-
-        # 从 key 池获取可用 key
-        api_key = self._jina_pool.get_key()
-        if api_key:
-            jh["Authorization"] = f"Bearer {api_key}"
-        elif self._jina_pool.total > 0:
-            # 所有 key 都被禁用
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="jina",
-                error="所有 Jina API Key 配额已耗尽",
-            )
-
-        try:
-            resp = client.get(jina_url, headers=jh, timeout=self.timeout * 2)
-
-            # 配额耗尽检测（429/402）→ 标记 key 失效，尝试下一个
-            if resp.status_code in (429, 402) and api_key:
-                self._jina_pool.mark_exhausted(api_key)
-                # 尝试用下一个 key 重试一次
-                next_key = self._jina_pool.get_key()
-                if next_key:
-                    jh["Authorization"] = f"Bearer {next_key}"
-                    resp = client.get(jina_url, headers=jh, timeout=self.timeout * 2)
-                    if resp.status_code in (429, 402):
-                        self._jina_pool.mark_exhausted(next_key)
-
-            return FetchResult(
-                ok=200 <= resp.status_code < 300,
-                url=task.url, status_code=resp.status_code,
-                content=resp.text,
-                content_type=resp.headers.get("content-type", "text/plain"),
-                strategy_used="jina",
-            )
-        except Exception as e:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="jina",
-                error=f"{type(e).__name__}: {e}",
-            )
-
-    # ----- 策略：Firecrawl -----
-    def _fetch_firecrawl(self, task: Task, headers: dict) -> FetchResult:
-        if not self.cfg.firecrawl_api_key:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="firecrawl",
-                error="未配置 FIRECRAWL_API_KEY",
-            )
-        client = self._get_httpx_client()
-        if client is None:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="firecrawl",
-                error="httpx 未安装",
-            )
-        try:
-            resp = client.post(
-                "https://api.firecrawl.dev/v1/scrape",
-                json={"url": task.url, "formats": ["markdown"]},
-                headers={
-                    "Authorization": f"Bearer {self.cfg.firecrawl_api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=self.timeout * 2,
-            )
-            if resp.status_code != 200:
-                return FetchResult(
-                    ok=False, url=task.url, status_code=resp.status_code,
-                    strategy_used="firecrawl",
-                    error=f"Firecrawl HTTP {resp.status_code}",
-                )
-            data = resp.json()
-            md = (data.get("data") or {}).get("markdown", "")
-            return FetchResult(
-                ok=True, url=task.url, status_code=200,
-                content=md, content_type="text/markdown",
-                strategy_used="firecrawl",
-            )
-        except Exception as e:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="firecrawl",
-                error=f"{type(e).__name__}: {e}",
-            )
 
     def close(self) -> None:
-        """关闭连接池。服务停止时调用。"""
+        """关闭连接池和浏览器。服务停止时调用。"""
         if self._httpx_client is not None:
             try:
                 self._httpx_client.close()
             except Exception:
                 pass
             self._httpx_client = None
+        self._browser_pool.close()

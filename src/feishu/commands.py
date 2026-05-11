@@ -200,7 +200,7 @@ class CommandDispatcher:
                             default=self.cfg.default_check_interval)
         parser.add_argument("--type", default="html", choices=["html", "json"])
         parser.add_argument("--strategy", default="auto",
-                            choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"])
+                            choices=["auto", "httpx", "curl_cffi", "playwright"])
         parser.add_argument("--impersonate", default="chrome131")
         parser.add_argument("--selector", default=None)
         parser.add_argument("--json-path", dest="json_path", default=None)
@@ -499,10 +499,8 @@ class CommandDispatcher:
     # ============================================================
     def _cmd_config(self, args: list[str]) -> CommandResponse:
         apis = []
-        if self.cfg.jina_reader_api_key:
-            apis.append("Jina Reader")
-        if self.cfg.firecrawl_api_key:
-            apis.append("Firecrawl")
+        if self.cfg.enable_playwright:
+            apis.append("Playwright 渲染")
         summary = {
             "default_check_interval": self.cfg.default_check_interval,
             "max_concurrent_fetch": self.cfg.max_concurrent_fetch,
@@ -696,7 +694,7 @@ class CommandDispatcher:
         parser = _make_parser("reset")
         parser.add_argument("task_id", type=int)
         parser.add_argument("--strategy", default=None,
-                            choices=["auto", "httpx", "curl_cffi", "jina", "firecrawl"])
+                            choices=["auto", "httpx", "curl_cffi", "playwright"])
         parser.add_argument("--impersonate", default=None)
         parser.add_argument("--selector", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
@@ -704,7 +702,7 @@ class CommandDispatcher:
         try:
             ns = parser.parse_args(args)
         except SystemExit:
-            return CommandResponse.err("用法：`/reset <ID> [--strategy jina]`")
+            return CommandResponse.err("用法：`/reset <ID> [--strategy playwright]`")
 
         changes: list[str] = []
         with session_scope() as s:
