@@ -278,32 +278,51 @@ def task_detail_card(t: dict) -> dict:
     fails = t.get("consecutive_failures", 0)
     fail_text = f"**{fails}** 次" if fails else "无"
 
-    return _card(
-        f"📄 任务详情　#{t['id']}", THEME["info"],
-        [
-            _div(f"**{t['name']}**　{status}"),
-            _div(f"[🔗 {t['url']}]({t['url']})"),
-            _hr(),
-            _fields([
-                ("类型", t.get("type", "html"), True),
-                ("策略", t.get("strategy", "auto"), True),
-                ("检查间隔", f"{t['interval']} 秒", True),
-                ("浏览器指纹", t.get("impersonate", "chrome131"), True),
-                ("累计检查", str(t.get("total_checks", 0)), True),
-                ("累计变更", str(t.get("total_changes", 0)), True),
-            ]),
-            _hr(),
-            _div(f"**关键字**：{keywords}"),
-            _fields([
-                ("上次检查", t.get("last_checked_at") or "从未", True),
-                ("上次变更", t.get("last_changed_at") or "从未", True),
-                ("连续失败", fail_text, True),
-            ]),
-            _hr(),
-            _note("`/check` 立即检查 · `/history` 变更历史 · `/snapshot` 下载快照"),
-        ],
-        subtitle=t["name"],
-    )
+    # 实际使用的策略（优先显示）和配置策略
+    actual = t.get("last_strategy_used") or ""
+    configured = t.get("strategy", "auto")
+    strategy_text = f"`{actual}`" if actual else f"`{configured}`（未执行）"
+
+    elements: list[dict] = [
+        _div(f"**{t['name']}**　{status}"),
+        _div(f"[🔗 {t['url']}]({t['url']})"),
+        _hr(),
+        _fields([
+            ("类型", t.get("type", "html"), True),
+            ("实际策略", strategy_text, True),
+            ("配置策略", f"`{configured}`", True),
+            ("浏览器指纹", t.get("impersonate", "chrome131"), True),
+            ("检查间隔", f"{t['interval']} 秒", True),
+            ("累计检查", str(t.get("total_checks", 0)), True),
+            ("累计变更", str(t.get("total_changes", 0)), True),
+            ("连续失败", fail_text, True),
+        ]),
+    ]
+
+    # 提取配置（仅在配置了时显示）
+    extract_parts: list[str] = []
+    if t.get("selector"):
+        extract_parts.append(f"CSS 选择器：`{t['selector']}`")
+    if t.get("json_path"):
+        extract_parts.append(f"JSON Path：`{t['json_path']}`")
+    if t.get("extract_next_data"):
+        extract_parts.append("SPA 数据提取：已启用")
+    if extract_parts:
+        elements.append(_hr())
+        elements.append(_div("**提取配置**\n" + "\n".join(extract_parts)))
+
+    elements.append(_hr())
+    elements.append(_div(f"**关键字**：{keywords}"))
+    elements.append(_fields([
+        ("上次检查", t.get("last_checked_at") or "从未", True),
+        ("上次变更", t.get("last_changed_at") or "从未", True),
+    ]))
+    elements.append(_hr())
+    elements.append(
+        _note("`/check` 立即检查 · `/history` 变更历史 · `/snapshot` 下载快照"))
+
+    return _card(f"📄 任务详情　#{t['id']}", THEME["info"], elements,
+                 subtitle=t["name"])
 
 
 # ============================================================

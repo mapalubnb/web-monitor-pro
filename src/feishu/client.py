@@ -167,14 +167,15 @@ class FeishuClient:
     # --------------------------------------------------------
     # 文件上传 / 发送
     # --------------------------------------------------------
-    def upload_file(self, path: str | Path, file_type: str = "stream") -> str | None:
+    def upload_file(self, path: str | Path, file_type: str = "stream",
+                    file_name: str = "") -> str | None:
         """
         上传文件到飞书。返回 file_key 供后续发送使用。
 
         Args:
             path: 本地文件路径
-            file_type: opus/mp4/pdf/doc/xls/ppt/stream
-                      普通文本文件用 stream
+            file_type: opus/mp4/pdf/doc/xls/ppt/stream（普通文本用 stream）
+            file_name: 飞书端显示的文件名（默认用本地文件名）
         """
         try:
             from lark_oapi.api.im.v1 import (
@@ -191,11 +192,12 @@ class FeishuClient:
             return None
 
         try:
+            display_name = file_name or p.name
             file_size = p.stat().st_size
             with p.open("rb") as f:
                 body = CreateFileRequestBody.builder() \
                     .file_type(file_type) \
-                    .file_name(p.name) \
+                    .file_name(display_name) \
                     .file(f) \
                     .build()
                 # 某些 SDK 版本需要 file_size
@@ -213,12 +215,9 @@ class FeishuClient:
             logger.error("飞书文件上传异常: {}", e)
             return None
 
-    def send_file(self, chat_id: str, file_key: str, file_name: str = "") -> str | None:
-        """发送已上传的文件。"""
-        content = {"file_key": file_key}
-        if file_name:
-            content["file_name"] = file_name
-        return self._send_message(chat_id, "file", content)
+    def send_file(self, chat_id: str, file_key: str) -> str | None:
+        """发送已上传的文件（显示名由 upload_file 的 file_name 决定）。"""
+        return self._send_message(chat_id, "file", {"file_key": file_key})
 
     def send_card_and_file(
         self,
@@ -235,12 +234,10 @@ class FeishuClient:
         file_msg_id: str | None = None
         if file_path is not None and Path(file_path).exists():
             safe = ensure_upload_size(Path(file_path))
-            file_key = self.upload_file(safe)
+            file_key = self.upload_file(
+                safe, file_name=file_display_name or Path(file_path).name)
             if file_key:
-                file_msg_id = self.send_file(
-                    chat_id, file_key,
-                    file_display_name or Path(file_path).name,
-                )
+                file_msg_id = self.send_file(chat_id, file_key)
             # 清理截断产生的临时文件
             if safe != Path(file_path):
                 try:

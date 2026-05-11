@@ -331,11 +331,12 @@ class MonitorRunner:
             return
 
         if tripped:
-            logger.warning("#{} [{}] circuit breaker tripped ({} failures)", task.id, name, fails)
+            logger.warning("#{} [{}] 熔断触发（连续 {} 次失败）", task.id, name, fails)
             self.feishu.send_card(chat_id, cards.error_card(
-                f"Task #{task.id} circuit breaker",
-                f"Task [{name}] failed {fails} times, auto-disabled.\nLast error: {error[:200]}",
-                f"`/resume {task.id}` to restore"))
+                f"🔌 任务 #{task.id} 已熔断",
+                f"任务 **{name}** 连续失败 **{fails}** 次，已自动禁用。\n"
+                f"最后错误：{error[:200]}",
+                f"`/resume {task.id}` 恢复任务 · `/debug {task.id}` 诊断问题"))
             self.risk.mark_pushed(task.id, kind="error")
         elif (self.risk.should_alert_failure(fails)
               and self.risk.can_send_failure_alert(task.id)):

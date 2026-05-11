@@ -209,12 +209,15 @@ class App:
 
         if resp.file_path is not None and resp.file_path.exists():
             safe = ensure_upload_size(resp.file_path)
-            key = self.feishu.upload_file(safe)
+            key = self.feishu.upload_file(
+                safe, file_name=resp.file_display_name or resp.file_path.name)
             if key:
-                self.feishu.send_file(
-                    chat_id, key,
-                    resp.file_display_name or resp.file_path.name,
-                )
+                self.feishu.send_file(chat_id, key)
+            if safe != resp.file_path:
+                try:
+                    safe.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         for extra in resp.extra_cards:
             self.feishu.send_card(chat_id, extra)
