@@ -119,7 +119,7 @@ def _looks_like_spa_shell(html: str) -> bool:
         "__redux_state__", "__gatsby_initial_state__", "__remixcontext",
         "__sveltekit_data__", "__app_data__", "__store__",
         "data-reactroot", "data-server-rendered",
-        "self.__next_f", "application/ld+json",
+        "self.__next_f",
     )
     has_spa_markers = any(m in lower for m in spa_markers)
 
