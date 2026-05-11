@@ -113,8 +113,38 @@ _SessionFactory = sessionmaker(bind=_ENGINE, expire_on_commit=False, autoflush=F
 
 
 def init_db() -> None:
-    """建表。"""
+    """建表 + 自动迁移（给已有表补齐新列）。"""
     Base.metadata.create_all(_ENGINE)
+    _auto_migrate()
+
+
+def _auto_migrate() -> None:
+    """检查并补齐 ORM 模型中定义但 SQLite 表中缺失的列。"""
+    from sqlalchemy import inspect as sa_inspect, text
+    inspector = sa_inspect(_ENGINE)
+    for table_name, model_table in Base.metadata.tables.items():
+        if not inspector.has_table(table_name):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table_name)}
+        for col in model_table.columns:
+            if col.name not in existing:
+                col_type = col.type.compile(dialect=_ENGINE.dialect)
+                default = ""
+                if col.default is not None:
+                    val = col.default.arg
+                    if callable(val):
+                        default = ""
+                    elif isinstance(val, str):
+                        default = f" DEFAULT '{val}'"
+                    elif isinstance(val, (int, float)):
+                        default = f" DEFAULT {val}"
+                with _ENGINE.begin() as conn:
+                    conn.execute(text(
+                        f"ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type}{default}"
+                    ))
+                    from .logger import logger
+                    logger.info("migrated: ALTER TABLE {} ADD COLUMN {} {}",
+                                table_name, col.name, col_type)
 
 
 @contextmanager
