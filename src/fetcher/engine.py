@@ -421,6 +421,18 @@ class FetchEngine:
             logger.info("[{}] auto escalated to Playwright", task.name)
             return pw
 
+        # All strategies exhausted. Only return an HTTP-OK result if the content
+        # was actually deemed usable; otherwise treat as failure so the task
+        # records a failure instead of locking onto an unusable strategy.
+        best = result if result.ok else result2
+        if best.ok and not _is_content_usable(best, task):
+            pw_err = pw.error or ""
+            logger.warning("[{}] all strategies failed (content unusable, playwright: {})",
+                           task.name, pw_err)
+            return FetchResult(
+                ok=False, url=task.url, strategy_used=best.strategy_used,
+                error=f"content unusable and playwright failed ({pw_err})")
+
         return result if result.ok else FetchResult(
             ok=False, url=task.url, error=result.error or "all strategies failed",
             strategy_used=result.strategy_used)
