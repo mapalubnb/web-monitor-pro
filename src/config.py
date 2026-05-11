@@ -75,7 +75,9 @@ class AppConfig:
     log_level: str = "INFO"
 
     jina_reader_api_key: str = ""
+    jina_reader_api_keys: list[str] = field(default_factory=list)
     firecrawl_api_key: str = ""
+    enable_google_cache: bool = True
     http_proxy: str = ""
     https_proxy: str = ""
 
@@ -127,7 +129,9 @@ def load_config(
         request_timeout=int(os.getenv("REQUEST_TIMEOUT", "30")),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         jina_reader_api_key=os.getenv("JINA_READER_API_KEY", ""),
+        jina_reader_api_keys=_split_csv(os.getenv("JINA_READER_API_KEYS", "")),
         firecrawl_api_key=os.getenv("FIRECRAWL_API_KEY", ""),
+        enable_google_cache=os.getenv("ENABLE_GOOGLE_CACHE", "true").lower() in ("true", "1", "yes"),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
         risk_control=risk_control,

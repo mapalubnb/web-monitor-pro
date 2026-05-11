@@ -92,28 +92,44 @@ def _extract_html(html: str, task: Task) -> str:
 
 
 def _looks_like_spa_shell(html: str) -> bool:
-    """body 文本少 + 有 SPA 特征 = 空壳。"""
+    """body 文本少 + 有 SPA 特征 = 空壳，应尝试提取嵌入数据。"""
+    lower = html.lower()
+    spa_markers = (
+        'id="root"', 'id="app"', 'id="__next"',
+        "__next_data__", "__nuxt__", "__nuxt_data__",
+        "__apollo_state__", "__initial_state__", "__preloaded_state__",
+        "__redux_state__", "__gatsby_initial_state__", "__remixcontext",
+        "__sveltekit_data__", "__app_data__", "__store__",
+        "data-reactroot", "data-server-rendered",
+    )
+    has_spa_markers = any(m in lower for m in spa_markers)
+
+    # 有嵌入数据标记 → 直接走 SPA 提取（不管可见文本多少）
+    embed_markers = (
+        "__next_data__", "__nuxt_data__", "__nuxt__",
+        "__initial_state__", "__apollo_state__", "__redux_state__",
+        "__gatsby_data__", "__remixcontext", "__sveltekit_data__",
+        "application/ld+json",
+    )
+    if any(m in lower for m in embed_markers):
+        return True
+
+    # body 可见文本少 + SPA 壳特征
     try:
         from selectolax.parser import HTMLParser
     except ImportError:
-        return False
+        return has_spa_markers
     try:
         tree = HTMLParser(html)
     except Exception:
-        return False
+        return has_spa_markers
     if tree.body is None:
         return True
     for tag in tree.css("script, style, noscript"):
         tag.decompose()
     visible = tree.body.text(separator=" ", strip=True) if tree.body else ""
 
-    lower = html.lower()
-    spa_markers = (
-        'id="root"', 'id="app"', "__next_data__", "__nuxt__", "__nuxt_data__",
-        "__apollo_state__", "__initial_state__", "__preloaded_state__",
-        "data-reactroot", "data-server-rendered",
-    )
-    return any(m in lower for m in spa_markers) and len(visible) < 400
+    return has_spa_markers and len(visible) < 400
 
 
 # SPA 数据嵌入点
@@ -126,10 +142,24 @@ _SPA_PATTERNS = (
         r'<script[^>]*id=["\']__NUXT_DATA__["\'][^>]*>(.*?)</script>',
         re.DOTALL | re.IGNORECASE,
     )),
+    ("remix_context", re.compile(
+        r'<script[^>]*id=["\']__remixContext["\'][^>]*>(.*?)</script>',
+        re.DOTALL | re.IGNORECASE,
+    )),
+    ("sveltekit_data", re.compile(
+        r'<script[^>]*id=["\']__SVELTEKIT_DATA__["\'][^>]*>(.*?)</script>',
+        re.DOTALL | re.IGNORECASE,
+    )),
+    ("gatsby_data", re.compile(
+        r'<script[^>]*id=["\']__GATSBY_DATA__["\'][^>]*>(.*?)</script>',
+        re.DOTALL | re.IGNORECASE,
+    )),
 )
 _INLINE_ASSIGNMENTS = (
     "__NUXT__", "__INITIAL_STATE__", "__INITIAL_DATA__",
     "__PRELOADED_STATE__", "__APOLLO_STATE__", "__REDUX_STATE__",
+    "__GATSBY_INITIAL_STATE__", "__remixContext", "__APP_DATA__",
+    "__STORE__", "_sharedData",
 )
 
 
@@ -393,6 +423,39 @@ def _normalize(text: str) -> str:
     text = _WS_RE.sub(" ", text)
     text = _BLANK_RE.sub("\n\n", text)
     return text.strip()
+
+
+def try_deep_extract(html: str) -> str:
+    """
+    对已拿到的 HTML 做深度提取尝试（供 engine 在判定空壳后调用）。
+    与 extract() 不同：这里不依赖 Task/FetchResult，直接从原始 HTML 中
+    尝试提取 SPA 嵌入数据、trafilatura 正文、meta 元数据。
+    返回空字符串表示提取失败。
+    """
+    if not html or not html.strip():
+        return ""
+
+    # 1. SPA 嵌入数据（优先级最高 — 结构化数据最完整）
+    spa = _extract_spa_data(html)
+    if spa and len(spa) >= MIN_USEFUL_LENGTH:
+        return _normalize(spa)
+
+    # 2. trafilatura 正文
+    text = _main_content(html)
+    if text and len(text) >= MIN_USEFUL_LENGTH:
+        return _normalize(text)
+
+    # 3. meta 元数据兜底
+    meta = _extract_meta(html)
+    if meta and len(meta) >= MIN_USEFUL_LENGTH:
+        return _normalize(meta)
+
+    # 4. 整页纯文本（最终兜底）
+    full = _html_to_text(html)
+    if full and len(full) >= MIN_USEFUL_LENGTH:
+        return _normalize(full)
+
+    return ""
 
 
 def content_hash(text: str) -> str:

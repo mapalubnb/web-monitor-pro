@@ -16,9 +16,58 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+import time
+
 from ..config import AppConfig
 from ..db import Task
 from ..logger import logger
+
+
+# ============================================================
+# Jina 多 Key 轮换池
+# ============================================================
+class _JinaKeyPool:
+    """管理多个 Jina API Key，支持 round-robin 和失效标记。"""
+
+    def __init__(self, keys: list[str]):
+        self._keys = [k for k in keys if k]
+        self._index = 0
+        self._disabled: dict[str, float] = {}  # key -> 恢复时间戳
+        self._disable_duration = 86400  # 配额耗尽后禁用 24h
+
+    def get_key(self) -> str | None:
+        """获取下一个可用 key，全部失效返回 None。"""
+        if not self._keys:
+            return None
+        now = time.time()
+        # 清理已恢复的 key
+        self._disabled = {k: t for k, t in self._disabled.items() if t > now}
+        # 尝试找一个可用的
+        for _ in range(len(self._keys)):
+            key = self._keys[self._index % len(self._keys)]
+            self._index += 1
+            if key not in self._disabled:
+                return key
+        return None
+
+    def mark_exhausted(self, key: str) -> None:
+        """标记某个 key 配额用完（429/402），禁用一段时间。"""
+        self._disabled[key] = time.time() + self._disable_duration
+        available = len(self._keys) - len(self._disabled)
+        logger.warning(
+            "🔑 Jina key ...{} 配额耗尽，已禁用 {}h（剩余可用 {}/{}）",
+            key[-6:], self._disable_duration // 3600,
+            max(available, 0), len(self._keys),
+        )
+
+    @property
+    def total(self) -> int:
+        return len(self._keys)
+
+    @property
+    def available(self) -> int:
+        now = time.time()
+        return sum(1 for k in self._keys if k not in self._disabled or self._disabled[k] <= now)
 
 
 @dataclass
@@ -194,6 +243,14 @@ class FetchEngine:
         )
         self._httpx_client: Any = None  # 懒加载，首次使用时创建
 
+        # 构建 Jina Key 池：优先用多 key 列表，fallback 到单 key
+        jina_keys = list(cfg.jina_reader_api_keys)
+        if cfg.jina_reader_api_key and cfg.jina_reader_api_key not in jina_keys:
+            jina_keys.insert(0, cfg.jina_reader_api_key)
+        self._jina_pool = _JinaKeyPool(jina_keys)
+        if self._jina_pool.total > 1:
+            logger.info("🔑 Jina Key 池已加载 {} 个 key", self._jina_pool.total)
+
     # ----- 对外入口 -----
     def fetch(self, task: Task) -> FetchResult:
         strategy = (task.strategy or "auto").lower()
@@ -203,15 +260,17 @@ class FetchEngine:
             return self._fetch_jina(task, headers)
         if strategy == "firecrawl":
             return self._fetch_firecrawl(task, headers)
+        if strategy == "google_cache":
+            return self._fetch_google_cache(task, headers)
 
         if strategy == "curl_cffi":
             result = self._fetch_curl_cffi(task, headers)
-            return self._upgrade_to_jina_if_empty(task, headers, result)
+            return self._upgrade_if_empty(task, headers, result)
         if strategy == "httpx":
             result = self._fetch_httpx(task, headers)
-            return self._upgrade_to_jina_if_empty(task, headers, result)
+            return self._upgrade_if_empty(task, headers, result)
 
-        # auto：curl_cffi → httpx → jina
+        # auto：curl_cffi → httpx → 深度提取 → Google Cache → Jina → Firecrawl
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
             return result
@@ -220,10 +279,31 @@ class FetchEngine:
         if result2.ok and _is_content_usable(result2, task):
             return result2
 
+        # ★ 深度提取：从已拿到的 HTML 中挖掘 SSR 嵌入数据
+        best_html = result if result.ok else result2
+        if best_html.ok and best_html.content:
+            deep = self._try_deep_extract(task, best_html)
+            if deep is not None:
+                return deep
+
+        # ★ Google Cache：借用 Google 渲染结果
+        if self.cfg.enable_google_cache:
+            cache = self._fetch_google_cache(task, headers)
+            if cache.ok:
+                logger.info("🔀 [{}] auto 升级到 Google Cache", task.name)
+                return cache
+
+        # Jina（多 key 轮换）
         result3 = self._fetch_jina(task, headers)
         if result3.ok:
-            logger.info("🔀 [{}] auto 升级到 Jina（前两个策略拿到空壳）", task.name)
+            logger.info("🔀 [{}] auto 升级到 Jina（前置策略均未获得有效内容）", task.name)
             return result3
+
+        # Firecrawl 兜底
+        result4 = self._fetch_firecrawl(task, headers)
+        if result4.ok:
+            logger.info("🔀 [{}] auto 升级到 Firecrawl", task.name)
+            return result4
 
         # 全部失败：返回最有信息的
         if result.ok:
@@ -231,22 +311,59 @@ class FetchEngine:
         result.error = result.error or "所有策略均失败"
         return result
 
-    def _upgrade_to_jina_if_empty(
-        self, task: Task, headers: dict, result: FetchResult
+    def _try_deep_extract(
+        self, task: Task, html_result: FetchResult,
+    ) -> FetchResult | None:
+        """对已拿到的 HTML 做深度 SSR 数据提取，成功返回 FetchResult，失败返回 None。"""
+        try:
+            from .extractor import try_deep_extract
+            text = try_deep_extract(html_result.content)
+            if text and len(text) >= 120:
+                logger.info(
+                    "🔍 [{}] 深度提取成功（{} 字，策略={}→deep）",
+                    task.name, len(text), html_result.strategy_used,
+                )
+                return FetchResult(
+                    ok=True, url=task.url,
+                    status_code=html_result.status_code,
+                    content=text,
+                    content_type="text/plain",
+                    strategy_used=f"{html_result.strategy_used}→deep",
+                )
+        except Exception as e:
+            logger.debug("深度提取异常: {}", e)
+        return None
+
+    def _upgrade_if_empty(
+        self, task: Task, headers: dict, result: FetchResult,
     ) -> FetchResult:
-        """明确指定 curl_cffi/httpx 但拿到空壳时，升级到 Jina。"""
+        """明确指定 curl_cffi/httpx 但拿到空壳时，逐级升级。"""
         if not result.ok or _is_content_usable(result, task):
             return result
+
+        # ★ 先尝试深度提取
+        if result.content:
+            deep = self._try_deep_extract(task, result)
+            if deep is not None:
+                return deep
+
         # 区分原因便于排查
         content = result.content or ""
         if _looks_like_binary_garbage(content):
             reason = f"响应疑似未解压（乱码字节 len={len(content)}）"
         else:
             reason = f"空壳/内容不足（len={len(content)}）"
-        logger.info(
-            "🔀 [{}] 策略={} {}，自动升级 Jina",
-            task.name, result.strategy_used, reason,
-        )
+
+        # Google Cache
+        if self.cfg.enable_google_cache:
+            cache = self._fetch_google_cache(task, headers)
+            if cache.ok:
+                cache.strategy_used = f"{result.strategy_used}→google_cache"
+                logger.info("🔀 [{}] {} → 升级到 Google Cache", task.name, reason)
+                return cache
+
+        # Jina
+        logger.info("🔀 [{}] 策略={} {}，自动升级 Jina", task.name, result.strategy_used, reason)
         jina = self._fetch_jina(task, headers)
         if jina.ok:
             jina.strategy_used = f"{result.strategy_used}→jina"
@@ -326,7 +443,79 @@ class FetchEngine:
                 error=f"{type(e).__name__}: {e}",
             )
 
-    # ----- 策略：Jina Reader -----
+    # ----- 策略：Google Cache -----
+    def _fetch_google_cache(self, task: Task, headers: dict) -> FetchResult:
+        """从 Google 网页缓存获取已渲染的页面内容。"""
+        cache_url = (
+            f"https://webcache.googleusercontent.com/search?q=cache:{task.url}"
+        )
+        try:
+            from curl_cffi import requests as cc
+        except ImportError:
+            # fallback 到 httpx
+            client = self._get_httpx_client()
+            if client is None:
+                return FetchResult(
+                    ok=False, url=task.url, strategy_used="google_cache",
+                    error="curl_cffi 和 httpx 均未安装",
+                )
+            try:
+                resp = client.get(cache_url, headers=headers, timeout=self.timeout)
+                if resp.status_code != 200:
+                    return FetchResult(
+                        ok=False, url=task.url, status_code=resp.status_code,
+                        strategy_used="google_cache",
+                        error=f"Google Cache HTTP {resp.status_code}",
+                    )
+                content = self._strip_google_cache_banner(resp.text)
+                return FetchResult(
+                    ok=True, url=task.url, status_code=200,
+                    content=content,
+                    content_type=resp.headers.get("content-type", ""),
+                    strategy_used="google_cache",
+                )
+            except Exception as e:
+                return FetchResult(
+                    ok=False, url=task.url, strategy_used="google_cache",
+                    error=f"{type(e).__name__}: {e}",
+                )
+        # 优先用 curl_cffi（Google 也有反爬）
+        try:
+            resp = cc.get(
+                cache_url, headers=headers, impersonate="chrome131",
+                timeout=self.timeout, proxies=self._proxies,
+                allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                return FetchResult(
+                    ok=False, url=task.url, status_code=resp.status_code,
+                    strategy_used="google_cache",
+                    error=f"Google Cache HTTP {resp.status_code}",
+                )
+            content = self._strip_google_cache_banner(resp.text)
+            return FetchResult(
+                ok=True, url=task.url, status_code=200,
+                content=content,
+                content_type=resp.headers.get("content-type", ""),
+                strategy_used="google_cache",
+            )
+        except Exception as e:
+            return FetchResult(
+                ok=False, url=task.url, strategy_used="google_cache",
+                error=f"{type(e).__name__}: {e}",
+            )
+
+    @staticmethod
+    def _strip_google_cache_banner(html: str) -> str:
+        """去掉 Google Cache 页面顶部的横幅 div。"""
+        # Google 在缓存页面顶部插入一个 div，id 为 "google-cache-hdr"
+        import re
+        return re.sub(
+            r'<div[^>]*id="google-cache-hdr"[^>]*>.*?</div>\s*</div>',
+            "", html, count=1, flags=re.DOTALL | re.IGNORECASE,
+        )
+
+    # ----- 策略：Jina Reader（多 Key 轮换）-----
     def _fetch_jina(self, task: Task, headers: dict) -> FetchResult:
         client = self._get_httpx_client()
         if client is None:
@@ -338,13 +527,34 @@ class FetchEngine:
         jh = {
             "Accept": "text/plain",
             "User-Agent": headers.get("User-Agent", "web-monitor-pro/0.1"),
-            "x-no-cache": "true",  # 禁用 Jina 缓存，确保每次拿到最新页面
+            "x-no-cache": "true",
         }
-        if self.cfg.jina_reader_api_key:
-            jh["Authorization"] = f"Bearer {self.cfg.jina_reader_api_key}"
+
+        # 从 key 池获取可用 key
+        api_key = self._jina_pool.get_key()
+        if api_key:
+            jh["Authorization"] = f"Bearer {api_key}"
+        elif self._jina_pool.total > 0:
+            # 所有 key 都被禁用
+            return FetchResult(
+                ok=False, url=task.url, strategy_used="jina",
+                error="所有 Jina API Key 配额已耗尽",
+            )
+
         try:
-            # Jina 渲染可能慢，独立超时
             resp = client.get(jina_url, headers=jh, timeout=self.timeout * 2)
+
+            # 配额耗尽检测（429/402）→ 标记 key 失效，尝试下一个
+            if resp.status_code in (429, 402) and api_key:
+                self._jina_pool.mark_exhausted(api_key)
+                # 尝试用下一个 key 重试一次
+                next_key = self._jina_pool.get_key()
+                if next_key:
+                    jh["Authorization"] = f"Bearer {next_key}"
+                    resp = client.get(jina_url, headers=jh, timeout=self.timeout * 2)
+                    if resp.status_code in (429, 402):
+                        self._jina_pool.mark_exhausted(next_key)
+
             return FetchResult(
                 ok=200 <= resp.status_code < 300,
                 url=task.url, status_code=resp.status_code,
