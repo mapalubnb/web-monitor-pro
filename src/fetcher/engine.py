@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -212,40 +213,49 @@ class _BrowserPool:
         self._browser: Any = None
         self._page_count = 0
         self._created_at = 0.0
+        self._owner_thread: int | None = None
+        self._lock = threading.Lock()
 
     def _should_recycle(self) -> bool:
         if self._browser is None:
             return False
+        # Playwright sync API is thread-bound: if the current thread differs
+        # from the one that created the browser, we must recycle.
+        if self._owner_thread != threading.get_ident():
+            return True
         return ((time.time() - self._created_at) > self.MAX_AGE
                 or self._page_count >= self._cfg.playwright_max_pages)
 
     def _ensure_browser(self) -> Any:
         """Ensure browser instance is alive; recycle if stale."""
-        if self._should_recycle():
-            self.close()
-        if self._browser is not None:
-            return self._browser
+        with self._lock:
+            if self._should_recycle():
+                self.close()
+            if self._browser is not None:
+                return self._browser
 
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            logger.warning("playwright not installed")
-            return None
-        try:
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
-                headless=True,
-                args=["--disable-gpu", "--disable-dev-shm-usage",
-                      "--no-sandbox", "--disable-setuid-sandbox"],
-            )
-            self._page_count = 0
-            self._created_at = time.time()
-            logger.info("Playwright Chromium started")
-            return self._browser
-        except Exception as e:
-            logger.warning("Playwright launch failed: {}", e)
-            self._pw = self._browser = None
-            return None
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                logger.warning("playwright not installed")
+                return None
+            try:
+                self._pw = sync_playwright().start()
+                self._browser = self._pw.chromium.launch(
+                    headless=True,
+                    args=["--disable-gpu", "--disable-dev-shm-usage",
+                          "--no-sandbox", "--disable-setuid-sandbox"],
+                )
+                self._page_count = 0
+                self._created_at = time.time()
+                self._owner_thread = threading.get_ident()
+                logger.info("Playwright Chromium started (thread={})", self._owner_thread)
+                return self._browser
+            except Exception as e:
+                logger.warning("Playwright launch failed: {}", e)
+                self._pw = self._browser = None
+                self._owner_thread = None
+                return None
 
     def render(self, url: str, headers: dict, timeout: int) -> FetchResult:
         """Render page; auto-retry without resource blocking on error pages."""
