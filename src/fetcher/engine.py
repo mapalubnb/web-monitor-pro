@@ -206,12 +206,20 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
         return False
 
     # 有内嵌结构化数据（__NEXT_DATA__ / __NUXT__ / JSON-LD 等）→ extract() 能处理
-    if any(m in text for m in _EMBEDDED_DATA_MARKERS):
+    # 但如果同时存在 SPA 壳特征且可见文本极少，说明页面主要靠 CSR 渲染
+    # （例如 Next.js 站点的 JSON-LD 只有 SEO 元数据，真实内容靠 JS 渲染）
+    has_embedded = any(m in text for m in _EMBEDDED_DATA_MARKERS)
+    has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
+
+    if has_embedded:
+        if has_spa_shell and len(visible) < 200:
+            # SPA 壳 + 嵌入数据但可见文本极少 → 不可信，需要 Playwright
+            return False
         return True
 
     # 有 SPA 壳特征但无内嵌数据 → 不可信，让 auto 链走 deep extract → Playwright
     # 包括: id="__next"/id="root"/self.__next_f/data-reactroot 等
-    if any(m in lower for m in _SPA_SHELL_MARKERS):
+    if has_spa_shell:
         return False
 
     # 无 SPA 壳特征 → 普通页面（可能很小如 Coming Soon），有内容就行
