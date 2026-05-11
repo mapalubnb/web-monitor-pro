@@ -178,6 +178,14 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
         return False
 
     has_embedded = any(m in text for m in _EMBEDDED_DATA_MARKERS)
+    # RSC Flight with BAILOUT_TO_CLIENT_SIDE_RENDERING means the embedded RSC markers
+    # (self.__next_f) are present but contain no extractable content — treat as no data.
+    if has_embedded and "BAILOUT_TO_CLIENT_SIDE_RENDERING" in text:
+        has_rsc_only = all(
+            m not in text for m in _EMBEDDED_DATA_MARKERS if m != "self.__next_f"
+        )
+        if has_rsc_only:
+            has_embedded = False
     has_jsonld_only = (not has_embedded) and (_JSONLD_MARKER in lower)
     has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
 
