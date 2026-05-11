@@ -181,24 +181,14 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     if any(m in lower for m in _CHALLENGE_MARKERS):
         return False
 
-    # CSR bailout（如 Next.js BAILOUT_TO_CLIENT_SIDE_RENDERING）
-    # → HTML 只是空壳，必须用浏览器渲染
-    if "bailout_to_client_side_rendering" in lower:
-        return False
-
-    # 有内嵌数据（__NEXT_DATA__ / __NUXT__ / JSON-LD 等）→ 可用
+    # 有内嵌结构化数据（__NEXT_DATA__ / __NUXT__ / JSON-LD 等）→ extract() 能处理
     if any(m in text for m in _EMBEDDED_DATA_MARKERS):
         return True
 
-    # RSC Flight 数据（self.__next_f 且非 bailout）→ deep extract 能处理
-    if "self.__next_f" in text:
-        return True
-
-    # 检查是否是 SPA 空壳
-    has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
-    if has_spa_shell:
-        # 有 SPA 壳特征 → 需要较多可见文本才算可用
-        return len(_quick_visible_text(text)) >= 400
+    # 有 SPA 壳特征但无内嵌数据 → 不可信，让 auto 链走 deep extract → Playwright
+    # 包括: id="__next"/id="root"/self.__next_f/data-reactroot 等
+    if any(m in lower for m in _SPA_SHELL_MARKERS):
+        return False
 
     # 无 SPA 壳特征 → 普通页面（可能很小如 Coming Soon），有内容就行
     return True
