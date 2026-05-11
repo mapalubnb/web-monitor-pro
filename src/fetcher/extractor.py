@@ -60,9 +60,9 @@ def extract(task: Task, result: FetchResult) -> str:
         return _normalize(content)
 
     # Playwright 渲染后的 HTML 已是完整 DOM，跳过 SPA/RSC 解析
-    # 直接提取可见文本（selector → trafilatura → 全文 → meta）
+    # 直接提取可见文本（selector → trafilatura → innerText → 全文 → meta）
     if "playwright" in strategy:
-        return _extract_rendered_html(content, task)
+        return _extract_rendered_html(content, task, result.inner_text)
 
     # 原始 HTML（curl_cffi / httpx）
     return _extract_html(content, task)
@@ -71,7 +71,7 @@ def extract(task: Task, result: FetchResult) -> str:
 # ============================================================
 # Playwright 渲染后 HTML（已是完整 DOM，无需 SPA/RSC 解析）
 # ============================================================
-def _extract_rendered_html(html: str, task: Task) -> str:
+def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
     """从 Playwright 渲染后的 HTML 提取文本。跳过 SPA/RSC 解析。"""
     # 1) CSS 选择器（用户指定）
     if task.selector:
@@ -84,12 +84,16 @@ def _extract_rendered_html(html: str, task: Task) -> str:
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
-    # 3) 整页可见文本（body innerText 去掉 script/style）
+    # 3) Playwright 直接提供的 body.innerText（浏览器可见文本，比 HTML 重解析更可靠）
+    if inner_text and len(inner_text) >= MIN_USEFUL_LENGTH:
+        return _normalize(inner_text)
+
+    # 4) 整页可见文本（body innerText 去掉 script/style）
     text = _html_to_text(html)
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
-    # 4) meta 兜底
+    # 5) meta 兜底
     meta = _extract_meta(html)
     return _normalize(meta) if meta else ""
 

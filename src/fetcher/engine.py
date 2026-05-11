@@ -33,6 +33,7 @@ class FetchResult:
     content_type: str = ""
     strategy_used: str = ""
     error: str | None = None
+    inner_text: str = ""  # Playwright 直接提取的 body.innerText
 
     def __bool__(self) -> bool:
         return self.ok
@@ -117,6 +118,22 @@ _CHALLENGE_MARKERS = (
     "/cdn-cgi/challenge-platform",
 )
 
+# 客户端错误页面标记（Next.js Error Boundary / 5xx / 通用错误）
+_ERROR_PAGE_MARKERS = (
+    "application error: a client-side exception has occurred",
+    "this page isn't working",
+    "500 internal server error",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "an unexpected error has occurred",
+    "something went wrong",
+    "error: chunk load failed",
+    "unhandled runtime error",
+    "hydration failed because",
+    "there was an error while hydrating",
+)
+
 _HEAD_RE = re.compile(r"<head[^>]*>.*?</head>", re.DOTALL | re.IGNORECASE)
 _SCRIPT_RE = re.compile(r"<script[^>]*>.*?</script>", re.DOTALL | re.IGNORECASE)
 _STYLE_RE = re.compile(r"<style[^>]*>.*?</style>", re.DOTALL | re.IGNORECASE)
@@ -181,6 +198,13 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     if any(m in lower for m in _CHALLENGE_MARKERS):
         return False
 
+    # 错误页面检测（Error Boundary / 5xx / hydration 失败）
+    if result.inner_text and _is_error_page(result.inner_text):
+        return False
+    visible = _quick_visible_text(text)
+    if _is_error_page(visible):
+        return False
+
     # 有内嵌结构化数据（__NEXT_DATA__ / __NUXT__ / JSON-LD 等）→ extract() 能处理
     if any(m in text for m in _EMBEDDED_DATA_MARKERS):
         return True
@@ -194,10 +218,21 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     return True
 
 
+def _is_error_page(text: str) -> bool:
+    """检测页面是否为错误页面（Error Boundary / 5xx / hydration 失败等）。"""
+    if not text:
+        return False
+    lower = text.lower().strip()
+    # 内容很长的页面不太可能是错误页面
+    if len(lower) > 2000:
+        return False
+    return any(m in lower for m in _ERROR_PAGE_MARKERS)
+
+
 # ============================================================
 # Playwright 浏览器池（懒加载 + 定期回收 + 资源屏蔽）
 # ============================================================
-_BLOCK_RESOURCE_TYPES = {"image", "stylesheet", "font", "media"}
+_BLOCK_RESOURCE_TYPES = {"image", "font", "media"}  # 不拦截 stylesheet，避免破坏 CSR 应用 hydration
 
 
 class _BrowserPool:
@@ -255,7 +290,7 @@ class _BrowserPool:
             return None
 
     def render(self, url: str, headers: dict, timeout: int) -> FetchResult:
-        """渲染页面并返回完整 HTML。"""
+        """渲染页面并返回完整 HTML；检测到错误页面时自动关闭资源拦截重试。"""
         if not self._cfg.enable_playwright:
             return FetchResult(
                 ok=False, url=url, strategy_used="playwright",
@@ -269,11 +304,32 @@ class _BrowserPool:
                 error="Playwright 未安装或启动失败",
             )
 
+        # 首次尝试（带资源拦截）
+        result = self._render_once(url, headers, timeout, browser,
+                                   block_resources=True)
+
+        # 检测到错误页面 → 关闭资源拦截重试一次
+        if result.ok and _is_error_page(result.inner_text):
+            logger.info(
+                "🎭 [{}] 检测到错误页面（{}），关闭资源拦截重试",
+                url, result.inner_text[:80],
+            )
+            result = self._render_once(url, headers, timeout, browser,
+                                       block_resources=False)
+
+        return result
+
+    def _render_once(self, url: str, headers: dict, timeout: int,
+                     browser: Any, *, block_resources: bool) -> FetchResult:
+        """单次渲染尝试。"""
         context = None
         page = None
         try:
             context = browser.new_context(
                 user_agent=headers.get("User-Agent", _UA_POOL[0]),
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
             )
 
             # 注入 stealth 脚本
@@ -285,15 +341,16 @@ class _BrowserPool:
 
             page = context.new_page()
 
-            # 屏蔽图片/CSS/字体/媒体，节省内存和带宽
-            page.route(
-                "**/*",
-                lambda route: (
-                    route.abort()
-                    if route.request.resource_type in _BLOCK_RESOURCE_TYPES
-                    else route.continue_()
-                ),
-            )
+            # 条件性资源拦截（不拦截 stylesheet，避免破坏 CSR 应用）
+            if block_resources:
+                page.route(
+                    "**/*",
+                    lambda route: (
+                        route.abort()
+                        if route.request.resource_type in _BLOCK_RESOURCE_TYPES
+                        else route.continue_()
+                    ),
+                )
 
             page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
 
@@ -325,6 +382,10 @@ class _BrowserPool:
                 except Exception:
                     pass
 
+            # 捕获浏览器直接可见文本（比 HTML 重解析更可靠）
+            inner_text = page.evaluate(
+                "() => (document.body && document.body.innerText || '').trim()"
+            )
             content = page.content()
             self._page_count += 1
 
@@ -333,6 +394,7 @@ class _BrowserPool:
                 content=content,
                 content_type="text/html",
                 strategy_used="playwright",
+                inner_text=inner_text,
             )
         except Exception as e:
             return FetchResult(
