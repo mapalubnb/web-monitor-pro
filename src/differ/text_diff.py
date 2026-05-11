@@ -1,15 +1,10 @@
-"""
-Diff 引擎
-
-- 文本：基于 difflib 的行级 diff + 相似度计算
-- JSON：基于 deepdiff 的结构化 diff
-- 输出：DiffResult（含新增/删除行、统计、人类可读摘要、完整 diff 文本）
-"""
+"""Diff 引擎：文本行级 diff 和 JSON 结构化 diff。"""
 
 from __future__ import annotations
 
 import difflib
 import json
+from collections import Counter
 from dataclasses import dataclass, field, replace
 
 
@@ -17,19 +12,16 @@ from dataclasses import dataclass, field, replace
 class DiffResult:
     """Diff 结果。"""
 
-    changed: bool = False              # 是否有变化
+    changed: bool = False
     added_lines: list[str] = field(default_factory=list)
     removed_lines: list[str] = field(default_factory=list)
-    change_ratio: float = 0.0          # 变化占比（0.0 - 1.0）
-    similarity: float = 1.0            # 相似度（0.0 - 1.0）
-    unified_diff: str = ""             # 完整 unified diff（写文件）
-    summary: str = ""                  # 人类可读摘要（飞书卡片用）
-    is_json: bool = False              # 是否为 JSON 结构化 diff
+    change_ratio: float = 0.0
+    similarity: float = 1.0
+    unified_diff: str = ""
+    summary: str = ""
+    is_json: bool = False
 
 
-# ============================================================
-# 对外入口
-# ============================================================
 def compute_diff(
     before: str,
     after: str,
@@ -37,18 +29,7 @@ def compute_diff(
     is_json: bool = False,
     max_lines_in_summary: int = 8,
 ) -> DiffResult:
-    """
-    计算两段文本的 diff。
-
-    Args:
-        before: 上一次快照内容
-        after: 本次抓取内容
-        is_json: 若 True，尝试用 deepdiff 做结构化比对
-        max_lines_in_summary: 摘要中每侧最多展示多少行
-
-    Returns:
-        DiffResult
-    """
+    """计算两段文本的 diff，返回 DiffResult。"""
     if before == after:
         return DiffResult(changed=False, similarity=1.0)
 
@@ -57,14 +38,11 @@ def compute_diff(
     return _compute_text_diff(before, after, max_lines_in_summary)
 
 
-# ============================================================
-# 文本 diff
-# ============================================================
 def _compute_text_diff(before: str, after: str, max_lines_in_summary: int) -> DiffResult:
+    """基于 difflib 的行级文本 diff。"""
     before_lines = before.splitlines()
     after_lines = after.splitlines()
 
-    # SequenceMatcher 计算相似度 & 变化行
     matcher = difflib.SequenceMatcher(a=before_lines, b=after_lines, autojunk=False)
     similarity = matcher.ratio()
 
@@ -76,18 +54,15 @@ def _compute_text_diff(before: str, after: str, max_lines_in_summary: int) -> Di
         if tag in ("insert", "replace"):
             added.extend(after_lines[j1:j2])
 
-    # 过滤空行
     added = [line for line in added if line.strip()]
     removed = [line for line in removed if line.strip()]
 
-    # 消除"位置移动"：内容相同的行同时出现在 added 和 removed 里，
-    # 说明只是顺序变了而非真正的增删。逐一抵消（保持计数匹配）。
+    # 消除位置移动产生的假 diff
     added, removed = _cancel_moved_lines(added, removed)
 
     total_lines = max(len(before_lines), len(after_lines), 1)
     change_ratio = (len(added) + len(removed)) / total_lines
 
-    # unified diff 完整内容（写文件下载用）
     unified = "\n".join(
         difflib.unified_diff(
             before_lines,
@@ -114,7 +89,7 @@ def _compute_text_diff(before: str, after: str, max_lines_in_summary: int) -> Di
 
 
 def _build_text_summary(added: list[str], removed: list[str], max_lines: int) -> str:
-    """生成给飞书卡片用的人类可读摘要。"""
+    """生成人类可读摘要。"""
     parts: list[str] = []
     if added:
         parts.append(f"➕ 新增 {len(added)} 行：")
@@ -134,30 +109,15 @@ def _build_text_summary(added: list[str], removed: list[str], max_lines: int) ->
 
 
 def _cancel_moved_lines(added: list[str], removed: list[str]) -> tuple[list[str], list[str]]:
-    """
-    消除"位置移动"产生的假 diff。
-
-    如果同一行内容同时出现在 added 和 removed 中，说明它只是换了位置，
-    不是真正的增删。按计数逐一抵消。
-
-    例如：
-      removed = ["A", "B", "A"]
-      added   = ["A", "C"]
-    → removed 里有 2 个 "A"，added 里有 1 个 "A"，抵消 1 对：
-      removed = ["B", "A"]   （仍有 1 个多余的 "A" 真被删了）
-      added   = ["C"]
-    """
-    from collections import Counter
+    """消除位置移动产生的假 diff，按计数逐一抵消相同内容的行。"""
     add_counts = Counter(added)
     rem_counts = Counter(removed)
-    # 找出双方都有的行，抵消 min(出现次数) 对
     cancel: dict[str, int] = {}
     for line in add_counts:
         if line in rem_counts:
             cancel[line] = min(add_counts[line], rem_counts[line])
     if not cancel:
         return added, removed
-    # 从两侧各去掉相应数量
     new_added: list[str] = []
     cancel_add = dict(cancel)
     for ln in added:
@@ -179,36 +139,27 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
-# ============================================================
-# JSON diff
-# ============================================================
 def _compute_json_diff(before: str, after: str, max_lines_in_summary: int) -> DiffResult:
-    """
-    JSON 结构化 diff。若解析失败则退化为文本 diff。
-    """
+    """JSON 结构化 diff，解析失败则退化为文本 diff。"""
     try:
         before_obj = json.loads(before) if before.strip() else {}
         after_obj = json.loads(after) if after.strip() else {}
     except json.JSONDecodeError:
-        result = _compute_text_diff(before, after, max_lines_in_summary)
-        return result
+        return _compute_text_diff(before, after, max_lines_in_summary)
 
     try:
         from deepdiff import DeepDiff
     except ImportError:
-        result = _compute_text_diff(before, after, max_lines_in_summary)
-        return result
+        return _compute_text_diff(before, after, max_lines_in_summary)
 
     dd = DeepDiff(before_obj, after_obj, ignore_order=True, verbose_level=2)
     changed = bool(dd)
     if not changed:
         return DiffResult(changed=False, similarity=1.0, is_json=True)
 
-    # 把 deepdiff 结果转成人类可读摘要
     added_lines, removed_lines = _deepdiff_to_lines(dd)
     summary = _build_text_summary(added_lines, removed_lines, max_lines_in_summary)
 
-    # 完整 diff 用 deepdiff 的 pretty 输出
     try:
         pretty = dd.pretty()
     except Exception:
@@ -241,19 +192,16 @@ def _deepdiff_to_lines(dd) -> tuple[list[str], list[str]]:
 
     d = dd.to_dict() if hasattr(dd, "to_dict") else dict(dd)
 
-    # 新增的字段/项（DeepDiff to_dict() 返回 dict）
     for path, val in (d.get("dictionary_item_added") or {}).items():
         added.append(f"{path} = {_short_json(val)}")
     for path, val in (d.get("iterable_item_added") or {}).items():
         added.append(f"{path} = {_short_json(val)}")
 
-    # 删除的字段/项
     for path, val in (d.get("dictionary_item_removed") or {}).items():
         removed.append(f"{path} = {_short_json(val)}")
     for path, val in (d.get("iterable_item_removed") or {}).items():
         removed.append(f"{path} = {_short_json(val)}")
 
-    # 值变化
     for path, change in (d.get("values_changed") or {}).items():
         if isinstance(change, dict):
             removed.append(f"{path}: {_short_json(change.get('old_value'))}")
@@ -276,7 +224,7 @@ def _short_json(v) -> str:
 
 
 def _flatten_json(obj, prefix: str = "") -> list[str]:
-    """简单展平 JSON，统计"有多少个叶子"作为 diff 比例分母。"""
+    """展平 JSON 计算叶子数量，用作 diff 比例分母。"""
     result: list[str] = []
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -289,37 +237,17 @@ def _flatten_json(obj, prefix: str = "") -> list[str]:
     return result
 
 
-# ============================================================
-# 关键词过滤
-# ============================================================
 def filter_by_keywords(
     diff: DiffResult,
     keywords: list[str],
     *,
     max_lines_in_summary: int = 8,
 ) -> DiffResult:
-    """
-    按关键词过滤一个已有的 DiffResult，只保留包含任一关键词的新增/删除行。
-
-    语义：用户配置关键词 = "我只关心这些关键词附近的变化"。
-    - 返回一个新的 DiffResult：added_lines / removed_lines / summary / unified_diff
-      都只含命中关键词的行。
-    - 若过滤后没有任何行 → `changed=False`，表示"本次变化与关键词无关"。
-    - 不修改原 DiffResult（dataclasses.replace 返回副本）。
-
-    Args:
-        diff: 原始完整 diff
-        keywords: 关键字列表（空字符串会被忽略）
-        max_lines_in_summary: 传给摘要生成器
-
-    Returns:
-        过滤后的新 DiffResult。若 keywords 为空则原样返回 diff。
-    """
+    """按关键词过滤 DiffResult，只保留包含任一关键词的变化行。"""
     kws = [kw.strip() for kw in (keywords or []) if kw and kw.strip()]
     if not kws:
         return diff
 
-    # 不区分大小写匹配；保留原始行用于展示
     lowered_kws = [kw.lower() for kw in kws]
 
     def _hit(line: str) -> bool:
@@ -329,11 +257,9 @@ def filter_by_keywords(
     added = [ln for ln in diff.added_lines if _hit(ln)]
     removed = [ln for ln in diff.removed_lines if _hit(ln)]
 
-    # 消除"位置移动"：内容相同的行同时在 added 和 removed 中出现
     added, removed = _cancel_moved_lines(added, removed)
 
     if not added and not removed:
-        # 变化与关键词无关：视为"对关键词来说没变化"
         return replace(
             diff,
             changed=False,
@@ -347,8 +273,6 @@ def filter_by_keywords(
 
     summary = _build_text_summary(added, removed, max_lines_in_summary)
 
-    # 重建 unified_diff：从原 unified_diff 中挑出与命中行相关的 hunk 段
-    # 简化起见，直接用过滤后的 added/removed 行拼一个轻量 unified 文本
     unified_lines = ["--- before", "+++ after"]
     for ln in removed:
         unified_lines.append(f"-{ln}")
@@ -356,7 +280,6 @@ def filter_by_keywords(
         unified_lines.append(f"+{ln}")
     unified = "\n".join(unified_lines)
 
-    # change_ratio 用"命中行 / 原 diff 行总数"，低估但直观
     orig_total = max(len(diff.added_lines) + len(diff.removed_lines), 1)
     hit_total = len(added) + len(removed)
     change_ratio = hit_total / orig_total

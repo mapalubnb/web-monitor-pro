@@ -1,9 +1,4 @@
-"""
-任务调度器（APScheduler 封装）
-
-- 启动时加载所有 enabled 任务
-- 支持动态 sync_task（新增/暂停/删除）、trigger_now（立即触发）
-"""
+"""任务调度器（APScheduler 封装）。"""
 
 from __future__ import annotations
 
@@ -54,7 +49,7 @@ class MonitorScheduler:
             pass
 
     def sync_task(self, task_id: int) -> None:
-        """根据 DB 状态同步调度。disabled / 不存在 → 移除；enabled → 添加/更新。"""
+        """根据 DB 状态同步调度。"""
         job_id = f"task_{task_id}"
         with session_scope() as s:
             t = s.get(Task, task_id)
@@ -63,20 +58,13 @@ class MonitorScheduler:
                     self._sched.remove_job(job_id)
                     logger.info("📅 移除调度 #{}", task_id)
                 return
-            # 在 session 内 expunge，确保属性已加载到内存
             s.expunge(t)
         self._add_or_update(t)
 
     def trigger_now(self, task_id: int) -> None:
-        """立即触发一次检查（异步执行）。
-
-        同时把对应的 interval 定期任务的 next_run_time 推迟一个完整周期，
-        避免 sync_task() 注册的定期作业与本次 one-shot 作业同时执行
-        （两者 job_id 不同，max_instances=1 无法拦截）。
-        """
+        """立即触发一次检查（异步执行）。"""
         logger.info("⚡ 立即触发任务 #{}", task_id)
 
-        # 推迟 interval 作业的下次执行，防止与 one-shot 撞车
         interval_job_id = f"task_{task_id}"
         interval_job = self._sched.get_job(interval_job_id)
         if interval_job is not None:
@@ -84,10 +72,6 @@ class MonitorScheduler:
                 interval_sec = interval_job.trigger.interval.total_seconds()
                 new_next = datetime.utcnow() + timedelta(seconds=interval_sec)
                 self._sched.modify_job(interval_job_id, next_run_time=new_next)
-                logger.debug(
-                    "📅 推迟 interval 作业 {} 至 {} ({}s 后)",
-                    interval_job_id, new_next, interval_sec,
-                )
             except Exception as e:
                 logger.warning("推迟 interval 作业失败: {}", e)
 

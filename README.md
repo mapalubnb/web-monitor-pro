@@ -1,51 +1,69 @@
 # web-monitor-pro
 
-> 🕵️ 高风控友好的网页变化监控服务，以飞书交互机器人为入口。支持 Cloudflare 防护网页、SPA、JSON API，纯 CSR 站点通过 Playwright 按需渲染。
+高风控友好的网页变化监控服务，以飞书交互机器人为入口。
 
----
-
-## 核心特性
-
-- 🎯 **多策略抓取引擎**：API 逆向 → `curl_cffi` 伪造 Chrome TLS/JA3 指纹 → `httpx` → 深度 SSR 提取 → `Playwright` 浏览器渲染兜底，全自建无外部 API 依赖
-- 🔎 **精准变化识别**：文本级 diff (`difflib`) + JSON 结构化 diff (`deepdiff`)，精确到行、字段
-- 🤖 **飞书深度交互**：WebSocket 长连接（**服务器无需公网端口**）、卡片推送、按钮交互、命令系统
-- 🛡️ **风控友好**：TLS 指纹伪装 / 浏览器请求头 / 单域名限流 / 请求抖动 / 指数退避 / 推送冷却 / 相似度阈值过滤
-- 🎭 **Playwright 渲染**：纯 CSR / DeFi 前端等 JS 动态页面，按需启动 Chromium 渲染（stealth 隐藏无头特征）
-- 📝 **中文日志**：`loguru` 全中文日志，按天轮转，`/log` 命令附完整日志文件下载
-- 📦 **一键部署**：`install.sh` + `systemd`，针对 Ubuntu 24.04 LTS 优化
+支持 Cloudflare 防护网页、SPA（Next.js / Nuxt / React）、JSON API、纯 CSR 站点。全自建无外部 API 依赖。
 
 ---
 
 ## 架构
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                    web-monitor-pro                        │
-├───────────────────────────────────────────────────────────┤
-│                                                           │
-│   APScheduler ──► FetchEngine ──► Extractor ──► Differ    │
-│                        │              │           │        │
-│                        ▼              ▼           ▼        │
-│   [curl_cffi] [httpx] [playwright] [trafilatura] [difflib]│
-│                                    [selectolax]  [deepdiff]│
-│                        │                                  │
-│                        ▼                                  │
-│                  RiskControl ──► FeishuClient             │
-│                                      │                    │
-├──────────────────────────────────────┼────────────────────┤
-│                                      ▼                    │
-│                     飞书开放平台（WebSocket 长连接）         │
-└──────────────────────────────────────┬────────────────────┘
-                                       │
-                                       ▼
-                       用户在群 / 私聊里用命令和按钮交互
+                    ┌─────────────────────────────────┐
+                    │         APScheduler              │
+                    │   (interval / on-demand trigger) │
+                    └──────────┬──────────────────────┘
+                               │
+                               ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      MonitorRunner                           │
+│  fetch ──► extract ──► hash ──► diff ──► risk gate ──► push │
+└──┬────────────┬──────────────────────┬───────────────────┬──┘
+   │            │                      │                   │
+   ▼            ▼                      ▼                   ▼
+FetchEngine  Extractor             DiffEngine        FeishuClient
+ ├ curl_cffi   ├ CSS selector       ├ text diff       ├ WebSocket
+ ├ httpx       ├ SPA/RSC data       └ JSON diff       ├ cards
+ ├ deep SSR    ├ trafilatura                          └ file upload
+ └ Playwright  └ innerText
+       │
+       ▼
+  RiskController
+   ├ domain throttle
+   ├ concurrency semaphore
+   ├ push cooldown
+   └ noise filter
 ```
+
+### 抓取策略（四级递进）
+
+| 级别 | 策略 | 适用场景 | 耗时 |
+|------|------|---------|------|
+| L1 | `httpx` | 静态页面（政府、新闻、博客） | <1s |
+| L2 | `curl_cffi` | Cloudflare 防护站点（TLS/JA3 指纹伪装） | 1-3s |
+| L3 | Deep Extract | SPA 嵌入数据（Next.js `__NEXT_DATA__` / RSC Flight / Nuxt / Apollo） | <0.1s |
+| L4 | `Playwright` | 纯 CSR / DeFi 前端（headless Chromium 渲染） | 10-20s |
+
+`auto` 模式下自动从 L1 逐级尝试，首次成功后锁定策略（后续复用，失效再降级）。
+
+### 变化检测
+
+- **内容归一化**：移除 CSRF token、nonce、buildId、时间戳等动态噪音后再 hash
+- **二次确认**：首次检测到变化写 pending，下次再确认相同才推送（防 SPA 渲染抖动）
+- **策略一致性**：pending 阶段检查策略是否一致，不同策略的提取结果不可比
+- **基准保护**：策略切换时静默更新基准，避免假 diff
 
 ---
 
 ## 快速开始
 
-### 1. 克隆并安装
+### 环境要求
+
+- **Python** >= 3.11
+- **OS**: Ubuntu 24.04 LTS（推荐）
+- **飞书**：企业自建应用（需 WebSocket 长连接权限）
+
+### 安装
 
 ```bash
 git clone https://github.com/mapalubnb/web-monitor-pro.git
@@ -53,125 +71,125 @@ cd web-monitor-pro
 sudo bash install.sh
 ```
 
-安装脚本会自动：
-- 安装系统依赖（Python 3.11+、libcurl 等）
-- 创建 `venv` 并安装 Python 依赖
-- 安装 Playwright Chromium（约 120MB）
-- 初始化 `.env` 和 `config.yaml`
-- 注册 systemd 服务
+`install.sh` 自动完成：系统依赖安装 → venv 创建 → pip install → Playwright Chromium 安装 → systemd 服务注册。
 
-### 2. 配置飞书凭证
+### 配置
 
 ```bash
-sudo vim .env
+cp .env.example .env
+vim .env
 ```
 
-至少填入：
+必填项：
+
 ```ini
 FEISHU_APP_ID=cli_xxxxxxxxxx
 FEISHU_APP_SECRET=xxxxxxxxxxxx
 FEISHU_TARGET_CHAT_ID=oc_xxxxxxxxxx
 ```
 
-👉 详细步骤见 [docs/feishu-setup.md](docs/feishu-setup.md)
+飞书应用配置详见 [docs/feishu-setup.md](docs/feishu-setup.md)。
 
-### 3. 启动
+可选业务配置 `config.yaml`（风控参数、种子任务等）参照 `config.example.yaml`。
+
+### 启动
 
 ```bash
 sudo systemctl start web-monitor-pro
 sudo journalctl -u web-monitor-pro -f
 ```
 
-启动后群里会收到 `🚀 Web Monitor Pro 已启动` 的卡片。
-
-### 4. 添加第一个监控
-
-在飞书里 @机器人 发送：
-
-```
-/add https://github.com/trending --name GitHub趋势 --interval 300
-```
-
-或者针对 SPA 网页（如 four.meme）：
-
-```
-/add https://four.meme/en/create-token --strategy curl_cffi --extract-next-data
-```
-
-或纯 CSR 站点（如 DeFi 前端）：
-
-```
-/add https://pfund.tech/ --strategy playwright --name PFund
-```
-
-或 API 监控：
-
-```
-/add https://api.example.com/v1/items --type json --json-path "data[*].name"
-```
-
 ---
 
-## 飞书命令速查
-
-在群里 `@机器人 /命令` 或私聊直接发 `/命令`：
+## 飞书命令
 
 | 命令 | 说明 |
-| --- | --- |
-| `/help` | 查看所有命令 |
-| `/add <url> [选项]` | 新增监控任务 |
+|------|------|
+| `/add <url> [options]` | 新增监控（支持 `--name` `--strategy` `--interval` `--type json` 等） |
 | `/list` | 列出所有任务 |
-| `/pause <id>` `/resume <id>` `/remove <id>` | 任务管理 |
 | `/check <id>` | 立即触发检查 |
-| `/history <id>` | 查看变更历史 |
-| `/keyword <id> add/remove <关键字>` | 自定义关键字过滤 |
-| `/config` | 查看全局配置 |
-| `/log [--tail N]` | 查看日志（附完整日志下载） |
+| `/pause <id>` / `/resume <id>` | 暂停 / 恢复 |
+| `/remove <id>` | 删除任务 |
+| `/history <id>` | 变更历史 |
+| `/keyword <id> add/remove <kw>` | 关键字过滤 |
+| `/interval <id> <seconds>` | 修改检查间隔 |
+| `/debug <id>` | 诊断（识别框架、嵌入数据、建议） |
+| `/sniff <url>` | 抓包辅助（引导找 API） |
+| `/reset <id>` | 重置快照基准 |
+| `/mute <30m/2h/1d>` / `/unmute` | 免打扰 |
+| `/log [--tail N]` | 查看日志（附文件下载） |
 | `/status` | 服务健康状态 |
-| `/mute 30m` / `/unmute` | 临时免打扰 |
-| `/sniff <url>` | 抓包助手：引导你找 API |
+| `/config` | 全局配置 |
 
-完整命令说明：[docs/commands.md](docs/commands.md)
+完整说明：[docs/commands.md](docs/commands.md)
 
 ---
 
-## 抓取策略说明
+## 依赖
 
-web-monitor-pro 采用**四级递进式抓取**，全自建无外部 API 依赖，见 [docs/fetch-strategies.md](docs/fetch-strategies.md)：
+| 分类 | 库 | 用途 |
+|------|-----|------|
+| HTTP | `curl_cffi` | TLS/JA3 指纹伪装，过 Cloudflare |
+| HTTP | `httpx[http2]` | 轻量 HTTP/2 客户端 |
+| 解压 | `brotli` `zstandard` | br/zstd 响应解压 |
+| 解析 | `selectolax` | 高性能 HTML 解析 |
+| 提取 | `trafilatura` `readability-lxml` | 正文提取 |
+| Diff | `deepdiff` | JSON 结构化 diff |
+| 飞书 | `lark-oapi` | 官方 SDK（WebSocket + 消息 API） |
+| 调度 | `APScheduler` | 后台任务调度 |
+| 存储 | `SQLAlchemy` `aiosqlite` | ORM + SQLite |
+| 配置 | `PyYAML` `python-dotenv` | YAML / .env 解析 |
+| 日志 | `loguru` | 中文日志，按天轮转 |
+| 渲染 | `playwright` `playwright-stealth` | 无头浏览器（纯 CSR 兜底） |
+| 重试 | `tenacity` | 指数退避重试 |
 
-| 等级 | 特征 | 推荐策略 |
-| --- | --- | --- |
-| L1-L2 静态 | 政府、新闻、博客 | `httpx` |
-| L3 Cloudflare | x.com、电商 | `curl_cffi` |
-| L4 SPA | four.meme / pump.fun | `curl_cffi --extract-next-data` 或 **API 逆向** ⭐ |
-| L5 纯 CSR / DeFi | pfund.tech、交易所 | `playwright` |
+---
 
-**推荐打法**：先用 `/sniff <url>` 找到内部 API，再用 `--type json` 监控——又快又稳又省。
+## 风控策略
+
+- **TLS/JA3 指纹伪装**：`curl_cffi` 模拟 Chrome/Firefox/Safari 握手特征
+- **浏览器请求头**：完整 `Sec-Fetch-*` / UA 轮换 / `Accept-Encoding` 自适应
+- **单域名限流**：默认 10s 间隔（±30% 抖动，避免固定周期）
+- **并发控制**：信号量限制最大并发抓取数（默认 5）
+- **失败退避**：60s → 5min → 15min → 1h 阶梯退避
+- **熔断**：连续失败 20 次自动禁用任务
+- **推送冷却**：同任务 30s 内最多推一次
+- **噪音过滤**：变化占比 < 0.5% 视为噪音不推送
+- **Playwright stealth**：隐藏无头浏览器特征
+
+---
+
+## 项目结构
+
+```
+src/
+├── main.py              # 入口：初始化 + 飞书 WebSocket 事件循环
+├── config.py            # 配置加载（.env + config.yaml）
+├── db.py                # SQLAlchemy ORM（tasks / change_history / push_log）
+├── logger.py            # loguru 日志（按天轮转）
+├── scheduler.py         # APScheduler 封装
+├── risk_control.py      # 风控（抓取限流 + 推送过滤）
+├── fetcher/
+│   ├── engine.py        # 四级递进抓取引擎
+│   └── extractor.py     # 内容提取 + 归一化
+├── differ/
+│   └── text_diff.py     # 文本/JSON diff + 关键字过滤
+├── tasks/
+│   └── monitor_task.py  # 单任务执行闭环（二次确认 + 策略锁定）
+└── feishu/
+    ├── client.py        # 飞书 SDK 封装
+    ├── commands.py       # 命令分发
+    └── cards.py          # 卡片模板
+```
 
 ---
 
 ## 文档
 
-- 📘 [飞书应用配置指南](docs/feishu-setup.md)
-- 🚀 [部署指南](docs/deploy.md)
-- 🎯 [抓取策略详解](docs/fetch-strategies.md)
-- 📖 [命令完整说明](docs/commands.md)
-
----
-
-## 风控与优雅
-
-- **TLS/JA3 指纹伪装**：`curl_cffi` 模拟真实 Chrome/Firefox/Safari
-- **浏览器请求头**：完整的 `Sec-Fetch-*` / `Sec-Ch-Ua`，User-Agent 轮换
-- **单域名限流**：默认 10 秒（可配）
-- **请求抖动**：±30%，避免固定周期被识别
-- **失败指数退避**：60s → 5min → 15min → 1h
-- **推送冷却**：同任务 30 秒内只推一次
-- **噪音过滤**：变化占比低于 0.5% 视为噪音
-- **连续失败告警**：连续 3 次失败才推送告警（单次抖动不刷屏）
-- **Playwright stealth**：隐藏无头浏览器特征，降低反爬检测
-
----
+- [飞书应用配置指南](docs/feishu-setup.md)
+- [部署指南](docs/deploy.md)
+- [抓取策略详解](docs/fetch-strategies.md)
+- [命令完整说明](docs/commands.md)
 
 ## 许可
 

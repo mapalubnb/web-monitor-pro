@@ -1,13 +1,4 @@
-"""
-单个监控任务的执行闭环
-
-MonitorRunner.run_once(task_id):
-  1. 加载 Task（若禁用/不存在则跳过）
-  2. 风控放行 + 抓取
-  3. 提取 + hash
-  4. 与上次快照对比 → 首次 / 无变化 / 变化
-  5. 推送飞书卡片 + 附件
-"""
+"""Monitor task execution: fetch -> extract -> diff -> notify."""
 
 from __future__ import annotations
 
@@ -15,9 +6,6 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import SNAPSHOT_DIR, AppConfig
-
-# 连续失败超过此阈值自动禁用任务（熔断）
-CIRCUIT_BREAKER_THRESHOLD = 20
 from ..db import ChangeHistory, Task, session_scope
 from ..differ import compute_diff, filter_by_keywords
 from ..feishu import FeishuClient, cards
@@ -26,9 +14,11 @@ from ..fetcher import FetchEngine, FetchResult, content_hash, extract
 from ..logger import logger
 from ..risk_control import RiskController
 
+CIRCUIT_BREAKER_THRESHOLD = 20
+
 
 class MonitorRunner:
-    """单任务执行器（无状态，调度器并发调用）。"""
+    """Executes a single monitoring task (stateless, called by scheduler)."""
 
     def __init__(self, cfg: AppConfig, engine: FetchEngine,
                  risk: RiskController, feishu: FeishuClient):
@@ -37,57 +27,43 @@ class MonitorRunner:
         self.risk = risk
         self.feishu = feishu
 
-    # ============================================================
-    # 入口
-    # ============================================================
     def run_once(self, task_id: int) -> None:
-        """执行一次监控；内部异常全部捕获不向上抛。"""
+        """Run one check cycle; all exceptions caught internally."""
         task = self._load_task(task_id)
         if task is None:
             return
 
-        logger.info("⚡ 检查 #{} [{}]", task.id, task.name)
+        logger.info("check #{} [{}]", task.id, task.name)
 
-        # 抓取
+        # Fetch
         try:
             with self.risk.acquire_fetch(task.url):
                 result = self.engine.fetch(task)
         except Exception as e:
-            logger.exception("抓取异常: {}", e)
+            logger.exception("fetch error: {}", e)
             self._handle_failure(task, str(e))
             return
 
         if not result.ok:
-            logger.warning(
-                "❌ #{} 失败 HTTP={} err={}",
-                task.id, result.status_code, result.error,
-            )
-            self._handle_failure(
-                task, result.error or f"HTTP {result.status_code}"
-            )
+            logger.warning("#{} failed HTTP={} err={}", task.id, result.status_code, result.error)
+            self._handle_failure(task, result.error or f"HTTP {result.status_code}")
             return
 
-        # 提取 + 归一化
+        # Extract + normalize
         try:
             extracted = extract(task, result)
         except Exception as e:
-            logger.exception("提取异常: {}", e)
-            self._handle_failure(task, f"提取失败: {e}")
+            logger.exception("extraction error: {}", e)
+            self._handle_failure(task, f"extraction failed: {e}")
             return
 
         if not extracted.strip():
-            logger.warning(
-                "#{} [{}] 提取结果为空 (strategy={} len={}) "
-                "→ 建议 `/debug {}`",
-                task.id, task.name, result.strategy_used,
-                len(result.content or ""), task.id,
-            )
-            self._handle_failure(
-                task, "提取结果为空（疑似纯 SPA，试 /debug 或 /reset --strategy playwright）"
-            )
+            logger.warning("#{} [{}] empty extraction (strategy={} len={})",
+                           task.id, task.name, result.strategy_used, len(result.content or ""))
+            self._handle_failure(task, "empty extraction (try /debug or /reset --strategy playwright)")
             return
 
-        # 对比
+        # Compare
         new_hash = content_hash(extracted)
         if task.last_content_hash is None:
             self._handle_first(task, result, extracted, new_hash)
@@ -96,243 +72,194 @@ class MonitorRunner:
         else:
             self._handle_change(task, result, extracted, new_hash)
 
-    # ============================================================
-    # 内部：加载任务
-    # ============================================================
+    # --- Task DB helpers ---
+
     def _load_task(self, task_id: int) -> Task | None:
+        """Load and expunge task if it exists and is enabled."""
         with session_scope() as s:
             t = s.get(Task, task_id)
-            if t is None:
-                logger.warning("任务 #{} 不存在，跳过", task_id)
-                return None
-            if not t.enabled:
+            if t is None or not t.enabled:
                 return None
             s.expunge(t)
             return t
 
-    # ============================================================
-    # 情况 1：首次
-    # ============================================================
-    def _handle_first(self, task: Task, result: FetchResult,
-                      extracted: str, new_hash: str) -> None:
-        logger.info(
-            "📸 #{} [{}] 建立首次快照（{} 字，策略={}）",
-            task.id, task.name, len(extracted), result.strategy_used,
-        )
-        snap_path = self._save_snapshot(task.id, extracted)
-
+    def _touch_task(self, task_id: int) -> None:
+        """Update check timestamp and reset failure counter."""
         with session_scope() as s:
-            t = s.get(Task, task.id)
+            t = s.get(Task, task_id)
+            if t is None:
+                return
+            t.last_checked_at = datetime.utcnow()
+            t.total_checks += 1
+            t.consecutive_failures = 0
+
+    def _update_baseline(self, task_id: int, new_hash: str,
+                         snap_path: Path, strategy: str) -> None:
+        """Update baseline snapshot, hash, strategy and reset counters."""
+        with session_scope() as s:
+            t = s.get(Task, task_id)
             if t is None:
                 return
             t.last_content_hash = new_hash
             t.last_snapshot_path = str(snap_path)
-            t.last_strategy_used = result.strategy_used
+            t.last_strategy_used = strategy
             t.last_checked_at = datetime.utcnow()
             t.total_checks += 1
             t.consecutive_failures = 0
+
+    # --- Pending file helpers ---
+
+    @staticmethod
+    def _pending_path(task_id: int) -> Path:
+        return SNAPSHOT_DIR / f"task_{task_id}_pending.hash"
+
+    @staticmethod
+    def _read_pending(path: Path) -> tuple[str | None, str]:
+        """Read pending file. Returns (hash, strategy) or (None, '')."""
+        if not path.exists():
+            return None, ""
+        try:
+            data = path.read_text(encoding="utf-8").strip()
+            if not data:
+                return None, ""
+            if "|" in data:
+                h, s = data.split("|", 1)
+                return h, s
+            return data, ""
+        except Exception:
+            return None, ""
+
+    @staticmethod
+    def _write_pending(path: Path, hash_val: str, strategy: str) -> None:
+        path.write_text(f"{hash_val}|{strategy}", encoding="utf-8")
+
+    @staticmethod
+    def _clear_pending(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # --- Snapshot helpers ---
+
+    @staticmethod
+    def _save_snapshot(task_id: int, content: str) -> Path:
+        path = SNAPSHOT_DIR / f"task_{task_id}_latest.txt"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    @staticmethod
+    def _save_diff(task_id: int, unified: str) -> Path:
+        path = SNAPSHOT_DIR / f"task_{task_id}_latest.diff"
+        path.write_text(unified or "", encoding="utf-8")
+        return path
+
+    # --- Case 1: First snapshot ---
+
+    def _handle_first(self, task: Task, result: FetchResult,
+                      extracted: str, new_hash: str) -> None:
+        logger.info("#{} [{}] first snapshot ({} chars, strategy={})",
+                    task.id, task.name, len(extracted), result.strategy_used)
+        snap_path = self._save_snapshot(task.id, extracted)
+        self._update_baseline(task.id, new_hash, snap_path, result.strategy_used)
 
         chat_id = self.cfg.feishu.target_chat_id
         if not chat_id:
             return
-
         card = cards.first_snapshot_card(
             task_id=task.id, task_name=task.name, url=task.url,
-            content_length=len(extracted), strategy=result.strategy_used,
-        )
+            content_length=len(extracted), strategy=result.strategy_used)
         self.feishu.send_card_and_file(
-            chat_id, card,
-            ensure_upload_size(snap_path),
-            f"[{task.name}] 首次快照.txt",
-        )
+            chat_id, card, ensure_upload_size(snap_path),
+            f"[{task.name}] first_snapshot.txt")
         self.risk.mark_pushed(task.id, kind="first_snapshot")
 
-    # ============================================================
-    # 情况 2：无变化
-    # ============================================================
+    # --- Case 2: No change ---
+
     def _handle_no_change(self, task: Task) -> None:
-        logger.debug("✅ #{} 无变化", task.id)
-        # 如果之前有 pending（上次检测到变化但还没确认），现在内容恢复了
-        # → 说明是闪烁，清除 pending
         pending_path = self._pending_path(task.id)
         if pending_path.exists():
             self._clear_pending(pending_path)
-            logger.info(
-                "🔄 #{} [{}] 内容恢复到基准（闪烁），已清除 pending",
-                task.id, task.name,
-            )
-        with session_scope() as s:
-            t = s.get(Task, task.id)
-            if t is None:
-                return
-            t.last_checked_at = datetime.utcnow()
-            t.total_checks += 1
-            t.consecutive_failures = 0
+            logger.debug("#{} [{}] content restored to baseline (flicker), pending cleared",
+                         task.id, task.name)
+        self._touch_task(task.id)
 
-    # ============================================================
-    # 情况 3：变化（含二次确认，防止页面闪烁/抖动）
-    # ============================================================
+    # --- Case 3: Change detected (with two-phase confirmation) ---
+
     def _handle_change(self, task: Task, result: FetchResult,
                        extracted: str, new_hash: str) -> None:
-        """
-        变化处理流程（二次确认机制 + 策略一致性检查）：
-
-        为了防止页面内容闪烁（如 SPA 渲染不稳定、CDN 缓存切换）或策略
-        跳变（auto 模式不同策略产出不同内容）导致假阳性推送，采用：
-
-        1. 首次发现变化 → 写 pending 标记（含 hash + 策略名）→ 不推送
-        2. 下次检查时：
-           - 若策略与 pending 不一致 → 视为策略跳变导致的假变化 → 重置 pending
-           - 若内容 hash 仍与 pending 一致 → 确认为真变化 → 推送
-           - 若内容恢复为基准 hash → 闪烁 → 清除 pending、不推送
-           - 若内容变成第三种 hash → 更新 pending、等待再次确认
-        """
+        """Two-phase confirmation with strategy consistency checks."""
         keywords = list(task.keywords or [])
         has_keywords = any(kw and kw.strip() for kw in keywords)
-        current_strategy = result.strategy_used or ""
+        strategy = result.strategy_used or ""
 
         pending_path = self._pending_path(task.id)
-        pending_data = self._read_pending(pending_path)
+        pending_hash, pending_strategy = self._read_pending(pending_path)
 
-        # pending 格式升级：hash|strategy（兼容旧格式纯 hash）
-        pending_hash: str | None = None
-        pending_strategy: str = ""
-        if pending_data is not None:
-            if "|" in pending_data:
-                pending_hash, pending_strategy = pending_data.split("|", 1)
-            else:
-                pending_hash = pending_data
-                pending_strategy = ""
-
+        # Phase 1: First detection -> write pending, don't push
         if pending_hash is None:
-            # === 首次发现变化：标记 pending（含策略），不推送 ===
-            self._write_pending(pending_path, f"{new_hash}|{current_strategy}")
-            logger.info(
-                "⏳ #{} [{}] 发现变化（策略={}），等待下次确认（防闪烁）",
-                task.id, task.name, current_strategy,
-            )
-            with session_scope() as s:
-                t = s.get(Task, task.id)
-                if t is None:
-                    return
-                t.last_checked_at = datetime.utcnow()
-                t.total_checks += 1
-                t.consecutive_failures = 0
+            self._write_pending(pending_path, new_hash, strategy)
+            logger.info("#{} [{}] change detected (strategy={}), awaiting confirmation",
+                        task.id, task.name, strategy)
+            self._touch_task(task.id)
             return
 
-        # === 策略一致性检查 ===
-        # 如果本次策略和写入 pending 时的策略不同，说明 auto 链选了不同路径
-        # 不同策略的提取结果结构不同，hash 对比无意义 → 重置 pending
-        if pending_strategy and current_strategy != pending_strategy:
-            self._write_pending(pending_path, f"{new_hash}|{current_strategy}")
-            logger.info(
-                "🔀 #{} [{}] 策略跳变（{}→{}），重置 pending 等待同策略确认",
-                task.id, task.name, pending_strategy, current_strategy,
-            )
-            with session_scope() as s:
-                t = s.get(Task, task.id)
-                if t is None:
-                    return
-                t.last_checked_at = datetime.utcnow()
-                t.total_checks += 1
-                t.consecutive_failures = 0
+        # Strategy consistency: if strategy changed, reset pending
+        if pending_strategy and strategy != pending_strategy:
+            self._write_pending(pending_path, new_hash, strategy)
+            logger.info("#{} [{}] strategy drift ({}->{}), pending reset",
+                        task.id, task.name, pending_strategy, strategy)
+            self._touch_task(task.id)
             return
 
-        # === 有 pending 标记且策略一致 ===
+        # Restored to baseline -> flicker
         if new_hash == task.last_content_hash:
-            # 恢复到基准 → 页面闪烁，清除 pending
             self._clear_pending(pending_path)
-            logger.info(
-                "🔄 #{} [{}] 内容恢复原样（页面闪烁），已清除 pending",
-                task.id, task.name,
-            )
-            with session_scope() as s:
-                t = s.get(Task, task.id)
-                if t is None:
-                    return
-                t.last_checked_at = datetime.utcnow()
-                t.total_checks += 1
-                t.consecutive_failures = 0
+            logger.debug("#{} [{}] content restored (flicker), pending cleared",
+                         task.id, task.name)
+            self._touch_task(task.id)
             return
 
+        # Third hash -> update pending, keep waiting
         if new_hash != pending_hash:
-            # 变成了第三种内容 → 更新 pending，继续等
-            self._write_pending(pending_path, f"{new_hash}|{current_strategy}")
-            logger.info(
-                "⏳ #{} [{}] 内容再次变化（不同于上次 pending），重新等待确认",
-                task.id, task.name,
-            )
-            with session_scope() as s:
-                t = s.get(Task, task.id)
-                if t is None:
-                    return
-                t.last_checked_at = datetime.utcnow()
-                t.total_checks += 1
-                t.consecutive_failures = 0
+            self._write_pending(pending_path, new_hash, strategy)
+            logger.info("#{} [{}] content changed again, pending updated", task.id, task.name)
+            self._touch_task(task.id)
             return
 
-        # === new_hash == pending_hash 且策略一致：二次确认通过 → 确认变化 ===
+        # Phase 2: Confirmed (hash == pending_hash, same strategy)
         self._clear_pending(pending_path)
-        logger.info(
-            "✅ #{} [{}] 二次确认通过（策略={}），确认为真实变化",
-            task.id, task.name, current_strategy,
-        )
+        logger.info("#{} [{}] change confirmed (strategy={})", task.id, task.name, strategy)
 
-        # 策略一致性保护：如果基准快照是旧策略产出的，不同策略的提取结果
-        # 结构不同（如 curl_cffi 提取 SPA JSON vs playwright 提取 innerText），
-        # 直接 diff 会产出大量无意义差异。此时将当前内容作为新基准，跳过推送。
+        # Strategy drift protection: baseline from different strategy -> silent rebase
         baseline_strategy = getattr(task, "last_strategy_used", None) or ""
-        if baseline_strategy and current_strategy != baseline_strategy:
-            logger.info(
-                "🔀 #{} [{}] 策略从 {} 切换到 {}，基准与当前不可比 → 静默更新基准",
-                task.id, task.name, baseline_strategy, current_strategy,
-            )
+        if baseline_strategy and strategy != baseline_strategy:
+            logger.info("#{} [{}] strategy switched ({}->{}), silent rebase",
+                        task.id, task.name, baseline_strategy, strategy)
             snap_path = self._save_snapshot(task.id, extracted)
-            with session_scope() as s:
-                t = s.get(Task, task.id)
-                if t is None:
-                    return
-                t.last_content_hash = new_hash
-                t.last_snapshot_path = str(snap_path)
-                t.last_strategy_used = current_strategy
-                t.last_checked_at = datetime.utcnow()
-                t.total_checks += 1
-                t.consecutive_failures = 0
+            self._update_baseline(task.id, new_hash, snap_path, strategy)
             return
 
-        # 读取基准快照做 diff
+        # Compute diff against baseline
         before = ""
         if task.last_snapshot_path and Path(task.last_snapshot_path).exists():
             try:
-                before = Path(task.last_snapshot_path).read_text(
-                    encoding="utf-8", errors="replace"
-                )
+                before = Path(task.last_snapshot_path).read_text(encoding="utf-8", errors="replace")
             except Exception as e:
-                logger.warning("读取上次快照失败: {}", e)
+                logger.warning("failed to read baseline snapshot: {}", e)
 
         full_diff = compute_diff(before, extracted, is_json=(task.type == "json"))
         diff = filter_by_keywords(full_diff, keywords) if has_keywords else full_diff
 
-        # 关键词模式下，过滤后没行 → 静默推进基准
+        # Keyword mode: filtered diff empty -> silent baseline advance
         if has_keywords and not diff.changed:
-            logger.info(
-                "🔇 #{} [{}] 页面有变化但未触及关键字 {} → 静默更新基准",
-                task.id, task.name, [kw for kw in keywords if kw and kw.strip()],
-            )
+            logger.info("#{} [{}] change doesn't match keywords, silent advance",
+                        task.id, task.name)
             snap_path = self._save_snapshot(task.id, extracted)
-            with session_scope() as s:
-                t = s.get(Task, task.id)
-                if t is None:
-                    return
-                t.last_content_hash = new_hash
-                t.last_snapshot_path = str(snap_path)
-                t.last_strategy_used = current_strategy
-                t.last_checked_at = datetime.utcnow()
-                t.total_checks += 1
-                t.consecutive_failures = 0
+            self._update_baseline(task.id, new_hash, snap_path, strategy)
             return
 
-        # 持久化
+        # Persist change
         snap_path = self._save_snapshot(task.id, extracted)
         diff_path = self._save_diff(task.id, diff.unified_diff)
 
@@ -341,42 +268,31 @@ class MonitorRunner:
             if t is None:
                 return
             matched = self.risk.matched_keywords(diff, keywords)
-
             s.add(ChangeHistory(
-                task_id=task.id,
-                added_lines=len(diff.added_lines),
+                task_id=task.id, added_lines=len(diff.added_lines),
                 removed_lines=len(diff.removed_lines),
                 change_ratio=diff.change_ratio,
-                matched_keywords=matched,
-                diff_path=str(diff_path),
-            ))
+                matched_keywords=matched, diff_path=str(diff_path)))
 
             t.last_content_hash = new_hash
             t.last_snapshot_path = str(snap_path)
-            t.last_strategy_used = current_strategy
+            t.last_strategy_used = strategy
             t.last_checked_at = datetime.utcnow()
             t.last_changed_at = datetime.utcnow()
             t.total_checks += 1
             t.total_changes += 1
             t.consecutive_failures = 0
+            task_name, task_url = t.name, t.url
 
-            task_name = t.name
-            task_url = t.url
-
-        # 风控过滤
-        should_push, reason = self.risk.should_push_change(
-            task.id, diff, keywords
-        )
+        # Push decision
+        should_push, reason = self.risk.should_push_change(task.id, diff, keywords)
         if not should_push:
-            logger.info("🔇 #{} 有变化但未推送：{}", task.id, reason)
+            logger.info("#{} change suppressed: {}", task.id, reason)
             return
 
-        logger.info(
-            "🔔 #{} [{}] 推送变化：➕{} ➖{} 占比={:.2%} 关键字={}",
-            task.id, task_name,
-            len(diff.added_lines), len(diff.removed_lines),
-            diff.change_ratio, matched,
-        )
+        logger.info("#{} [{}] pushing change: +{} -{} ratio={:.2%}",
+                     task.id, task_name, len(diff.added_lines),
+                     len(diff.removed_lines), diff.change_ratio)
 
         chat_id = self.cfg.feishu.target_chat_id
         if not chat_id:
@@ -384,28 +300,19 @@ class MonitorRunner:
 
         card = cards.change_card(
             task_id=task.id, task_name=task_name, url=task_url,
-            added_count=len(diff.added_lines),
-            removed_count=len(diff.removed_lines),
-            change_ratio=diff.change_ratio,
-            diff_summary=diff.summary,
-            strategy=result.strategy_used,
-            matched_keywords=matched,
-            has_diff_file=bool(diff.unified_diff),
-            keyword_filtered=has_keywords,
-        )
-        file_path = (
-            ensure_upload_size(diff_path)
-            if diff_path and diff_path.exists() else None
-        )
+            added_count=len(diff.added_lines), removed_count=len(diff.removed_lines),
+            change_ratio=diff.change_ratio, diff_summary=diff.summary,
+            strategy=result.strategy_used, matched_keywords=matched,
+            has_diff_file=bool(diff.unified_diff), keyword_filtered=has_keywords)
+
+        file_path = ensure_upload_size(diff_path) if diff_path and diff_path.exists() else None
         card_msg_id, _ = self.feishu.send_card_and_file(
             chat_id, card, file_path,
-            f"[{task_name}] diff.txt" if file_path else "",
-        )
+            f"[{task_name}] diff.txt" if file_path else "")
         self.risk.mark_pushed(task.id, kind="change", message_id=card_msg_id)
 
-    # ============================================================
-    # 失败处理（连续失败 N 次才告警）
-    # ============================================================
+    # --- Failure handling ---
+
     def _handle_failure(self, task: Task, error: str) -> None:
         with session_scope() as s:
             t = s.get(Task, task.id)
@@ -414,95 +321,26 @@ class MonitorRunner:
             t.consecutive_failures += 1
             t.last_checked_at = datetime.utcnow()
             t.total_checks += 1
-            fails = t.consecutive_failures
-            name = t.name
-            url = t.url
-
-            # 熔断：连续失败超过阈值自动禁用
-            tripped = False
-            if fails >= CIRCUIT_BREAKER_THRESHOLD:
+            fails, name, url = t.consecutive_failures, t.name, t.url
+            tripped = fails >= CIRCUIT_BREAKER_THRESHOLD
+            if tripped:
                 t.enabled = False
-                tripped = True
 
         chat_id = self.cfg.feishu.target_chat_id
         if not chat_id:
             return
 
         if tripped:
-            logger.warning(
-                "🔌 #{} [{}] 连续失败 {} 次，触发熔断自动禁用",
-                task.id, name, fails,
-            )
-            self.feishu.send_card(
-                chat_id,
-                cards.error_card(
-                    f"🔌 任务 #{task.id} 已熔断禁用",
-                    f"任务【{name}】连续失败 {fails} 次，已自动暂停。\n"
-                    f"最后错误：{error[:200]}",
-                    f"`/resume {task.id}` 恢复，或 `/reset {task.id} --strategy playwright` 调优后重试",
-                ),
-            )
+            logger.warning("#{} [{}] circuit breaker tripped ({} failures)", task.id, name, fails)
+            self.feishu.send_card(chat_id, cards.error_card(
+                f"Task #{task.id} circuit breaker",
+                f"Task [{name}] failed {fails} times, auto-disabled.\nLast error: {error[:200]}",
+                f"`/resume {task.id}` to restore"))
             self.risk.mark_pushed(task.id, kind="error")
-        elif (
-            self.risk.should_alert_failure(fails)
-            and self.risk.can_send_failure_alert(task.id)
-        ):
-            self.feishu.send_card(
-                chat_id,
-                cards.fetch_failure_card(
-                    task.id, name, url, fails, error,
-                ),
-            )
+        elif (self.risk.should_alert_failure(fails)
+              and self.risk.can_send_failure_alert(task.id)):
+            self.feishu.send_card(chat_id, cards.fetch_failure_card(task.id, name, url, fails, error))
             self.risk.mark_pushed(task.id, kind="error")
-
-    # ============================================================
-    # 持久化快照/diff（单写，无冗余时间戳备份）
-    # ============================================================
-    @staticmethod
-    def _save_snapshot(task_id: int, content: str) -> Path:
-        """保存当前快照到 latest 文件，不再写时间戳副本节省磁盘。"""
-        path = SNAPSHOT_DIR / f"task_{task_id}_latest.txt"
-        path.write_text(content, encoding="utf-8")
-        return path
-
-    @staticmethod
-    def _save_diff(task_id: int, unified: str) -> Path:
-        """保存 diff；只保留最新（旧的在 DB 里有记录）。"""
-        path = SNAPSHOT_DIR / f"task_{task_id}_latest.diff"
-        path.write_text(unified or "", encoding="utf-8")
-        return path
-
-    # ============================================================
-    # Pending（二次确认）文件操作
-    # ============================================================
-    @staticmethod
-    def _pending_path(task_id: int) -> Path:
-        """pending 标记文件路径。"""
-        return SNAPSHOT_DIR / f"task_{task_id}_pending.hash"
-
-    @staticmethod
-    def _read_pending(path: Path) -> str | None:
-        """读取 pending hash；不存在返回 None。"""
-        if path.exists():
-            try:
-                content = path.read_text(encoding="utf-8").strip()
-                return content if content else None
-            except Exception:
-                return None
-        return None
-
-    @staticmethod
-    def _write_pending(path: Path, hash_val: str) -> None:
-        """写入 pending hash。"""
-        path.write_text(hash_val, encoding="utf-8")
-
-    @staticmethod
-    def _clear_pending(path: Path) -> None:
-        """清除 pending 标记。"""
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
 
 
 __all__ = ["MonitorRunner"]

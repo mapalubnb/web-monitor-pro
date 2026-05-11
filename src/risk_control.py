@@ -1,10 +1,4 @@
-"""
-风控模块（抓取 + 推送合一）
-
-职责：
-- 抓取：单域名限流、请求抖动、并发控制、失败指数退避
-- 推送：冷却期、变化噪音过滤、连续失败告警节流、免打扰
-"""
+"""风控模块（抓取限流 + 推送冷却）。"""
 
 from __future__ import annotations
 
@@ -53,11 +47,8 @@ class RiskController:
         self._sem = threading.BoundedSemaphore(max_concurrent)
         self._last_cleanup = time.time()
 
-    # ============================================================
-    # 抓取侧
-    # ============================================================
     def acquire_fetch(self, url: str) -> _FetchSlot:
-        """获取抓取机会（阻塞直到满足风控）。用法: with r.acquire_fetch(url): ...."""
+        """获取抓取机会（阻塞直到满足风控）。"""
         self._sem.acquire()
         try:
             self._wait_for_domain(url)
@@ -79,7 +70,6 @@ class RiskController:
             wait = last + interval - now + jitter
             self._domain_last_hit[domain] = now + max(wait, 0)
         if wait > 0:
-            logger.debug("⏱️  域名 [{}] 限流 {:.1f}s", domain, wait)
             time.sleep(wait)
 
     def _maybe_cleanup(self) -> None:
@@ -88,29 +78,21 @@ class RiskController:
         if (now - self._last_cleanup) < _CLEANUP_INTERVAL:
             return
         with self._lock:
-            # 二次检查（避免多线程重复清理）
             if (now - self._last_cleanup) < _CLEANUP_INTERVAL:
                 return
             self._last_cleanup = now
-            # 清理过期域名记录
             expired_domains = [
                 d for d, ts in self._domain_last_hit.items()
                 if (now - ts) > _DOMAIN_EXPIRE
             ]
             for d in expired_domains:
                 del self._domain_last_hit[d]
-            # 清理过期冷却记录
             expired_tasks = [
                 tid for tid, ts in self._cooldown_mem.items()
                 if (now - ts) > _COOLDOWN_EXPIRE
             ]
             for tid in expired_tasks:
                 del self._cooldown_mem[tid]
-            if expired_domains or expired_tasks:
-                logger.debug(
-                    "🧹 风控清理：移除 {} 个域名记录、{} 个冷却记录",
-                    len(expired_domains), len(expired_tasks),
-                )
 
     def next_interval_after_failure(self, consecutive_failures: int, base: int) -> int:
         """失败后的退避间隔（秒）。"""
@@ -120,10 +102,8 @@ class RiskController:
         idx = min(consecutive_failures - 1, len(ladder) - 1)
         return max(base, ladder[idx])
 
-    # ============================================================
-    # 推送侧
-    # ============================================================
     def is_muted(self) -> bool:
+        """是否处于免打扰期。"""
         ts = get_state("mute_until", 0)
         try:
             return float(ts) > time.time()
@@ -138,9 +118,11 @@ class RiskController:
         return datetime.fromtimestamp(until)
 
     def unmute(self) -> None:
+        """取消免打扰。"""
         set_state("mute_until", 0)
 
     def mute_status(self) -> datetime | None:
+        """返回免打扰截止时间，已过期则返回 None。"""
         ts = get_state("mute_until", 0)
         try:
             t = float(ts)
@@ -164,28 +146,17 @@ class RiskController:
     def should_push_change(
         self, task_id: int, diff: DiffResult, keywords: list[str]
     ) -> tuple[bool, str]:
-        """判断变化是否值得推送。返回 (是否推, 不推的理由)。
-
-        语义说明：
-        - 当任务配置了关键词时，调用方应该先用 `differ.filter_by_keywords`
-          过滤出"命中关键词的行"，再把过滤后的 diff 传进来。
-          此时：diff.changed=True 表示关键词所在行发生了变化 → 直接推送；
-          diff.changed=False 表示本次整页变化与关键词无关 → 不推送。
-          关键词模式下不走 `min_change_ratio` 噪音阈值（用户已经明确表达关注点）。
-        - 没有配置关键词时，走原"噪音占比"路径。
-        """
+        """判断变化是否值得推送。返回 (是否推, 不推的理由)。"""
         if self.is_muted():
             return False, "服务处于免打扰期"
         if self._is_cooling(task_id):
             return False, f"任务 #{task_id} 处于推送冷却期"
         if not diff.changed:
-            # 关键词模式下意味着"变化与关键词无关"；普通模式下意味着没差异
             kws = [kw for kw in (keywords or []) if kw and kw.strip()]
             if kws:
                 return False, f"本次变化未触及关键字 {kws}"
             return False, "无实质变化"
 
-        # 有关键词时：跳过占比阈值——关键词本身就是用户指定的"信号"
         has_keywords = any(kw and kw.strip() for kw in (keywords or []))
         if not has_keywords and diff.change_ratio < self.cfg.min_change_ratio:
             return (
@@ -196,6 +167,7 @@ class RiskController:
         return True, ""
 
     def matched_keywords(self, diff: DiffResult, keywords: list[str]) -> list[str]:
+        """返回 diff 中命中的关键词列表。"""
         if not keywords:
             return []
         kws = [kw for kw in keywords if kw and kw.strip()]
@@ -205,6 +177,7 @@ class RiskController:
         return [kw for kw in kws if kw.lower() in text]
 
     def should_alert_failure(self, consecutive_failures: int) -> bool:
+        """是否应发送失败告警。"""
         return consecutive_failures >= self.cfg.alert_after_consecutive_failures
 
     def can_send_failure_alert(self, task_id: int) -> bool:

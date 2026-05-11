@@ -1,9 +1,4 @@
-"""
-配置加载模块
-
-- .env：敏感凭证（飞书 AppID/Secret 等）
-- config.yaml：业务配置（任务、风控参数）
-"""
+"""配置加载（.env 凭证 + config.yaml 业务参数）。"""
 
 from __future__ import annotations
 
@@ -15,7 +10,6 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
-# 项目路径
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 LOG_DIR = DATA_DIR / "logs"
@@ -97,7 +91,7 @@ def _split_csv(value: str) -> list[str]:
 
 
 def _safe_int(value: str, default: int) -> int:
-    """安全的 int 转换，无效值使用默认值并记录警告。"""
+    """安全的 int 转换。"""
     try:
         return int(value)
     except (ValueError, TypeError):

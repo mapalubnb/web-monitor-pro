@@ -1,14 +1,4 @@
-"""
-多策略抓取引擎
-
-auto 模式优先级：
-  1. curl_cffi（伪装 Chrome TLS，过 Cloudflare）
-  2. httpx（轻量静态页）
-  3. 深度提取（SPA 嵌入数据 + RSC Flight，零网络开销）
-  4. Playwright（headless Chromium 渲染，纯 CSR 兜底）
-
-用户指定 curl_cffi / httpx 时，若抓到空壳会自动逐级升级。
-"""
+"""Multi-strategy fetch engine with auto-escalation."""
 
 from __future__ import annotations
 
@@ -25,7 +15,6 @@ from ..logger import logger
 
 @dataclass
 class FetchResult:
-    """抓取结果。"""
     ok: bool
     url: str
     status_code: int | None = None
@@ -33,20 +22,18 @@ class FetchResult:
     content_type: str = ""
     strategy_used: str = ""
     error: str | None = None
-    inner_text: str = ""  # Playwright 直接提取的 body.innerText
+    inner_text: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
 
 
-# curl_cffi 支持的浏览器指纹
 SUPPORTED_IMPERSONATE = (
     "chrome131", "chrome124", "chrome120",
     "firefox133", "firefox135",
     "safari18_0", "safari17_0",
 )
 
-# httpx 用的 UA 池（随机选一个）
 _UA_POOL = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -71,7 +58,6 @@ _BASE_HEADERS = {
 
 
 def _can_decode(name: str) -> bool:
-    """检测 httpx 是否能解这种压缩编码。"""
     try:
         __import__(name)
         return True
@@ -79,40 +65,29 @@ def _can_decode(name: str) -> bool:
         return False
 
 
-# 只广告我们真正能解压的编码；否则服务端发 br 我们没法解（乱码）
 _ACCEPT_ENCODING = ", ".join(filter(None, [
-    "gzip",
-    "deflate",
+    "gzip", "deflate",
     "br" if _can_decode("brotli") or _can_decode("brotlicffi") else None,
     "zstd" if _can_decode("zstandard") else None,
 ])) or "identity"
 
 
-def _headers(default_headers: dict, user_headers: dict,
-             accept_encoding: str | None = None) -> dict:
-    """合成浏览器级请求头。accept_encoding 允许调用方覆盖（如 httpx 分支）。"""
-    h = {
-        "User-Agent": random.choice(_UA_POOL),
-        **_BASE_HEADERS,
-        "Accept-Encoding": accept_encoding or _ACCEPT_ENCODING,
-    }
+def _build_headers(default_headers: dict, user_headers: dict) -> dict:
+    h = {"User-Agent": random.choice(_UA_POOL), **_BASE_HEADERS,
+         "Accept-Encoding": _ACCEPT_ENCODING}
     h.update(default_headers or {})
     h.update(user_headers or {})
     return h
 
 
-# ============================================================
-# HTML 空壳检测（判定是否需要 fallback）
-# ============================================================
 _EMBEDDED_DATA_MARKERS = (
     "__NEXT_DATA__", "__NUXT_DATA__", "__NUXT__",
     "__APOLLO_STATE__", "__INITIAL_STATE__", "__PRELOADED_STATE__",
     "__REDUX_STATE__", "__INITIAL_DATA__",
-    "self.__next_f",  # Next.js App Router RSC Flight 数据（本质上是嵌入数据）
+    "self.__next_f",
     "data-sveltekit-fetched", "__remixContext",
 )
 
-# JSON-LD 单独判断：它只是 SEO 元数据，不代表页面主要内容已获取
 _JSONLD_MARKER = "application/ld+json"
 
 _CHALLENGE_MARKERS = (
@@ -121,20 +96,19 @@ _CHALLENGE_MARKERS = (
     "/cdn-cgi/challenge-platform",
 )
 
-# 客户端错误页面标记（Next.js Error Boundary / 5xx / 通用错误）
 _ERROR_PAGE_MARKERS = (
     "application error: a client-side exception has occurred",
     "this page isn't working",
-    "500 internal server error",
-    "502 bad gateway",
-    "503 service unavailable",
-    "504 gateway timeout",
-    "an unexpected error has occurred",
-    "something went wrong",
-    "error: chunk load failed",
-    "unhandled runtime error",
-    "hydration failed because",
-    "there was an error while hydrating",
+    "500 internal server error", "502 bad gateway",
+    "503 service unavailable", "504 gateway timeout",
+    "an unexpected error has occurred", "something went wrong",
+    "error: chunk load failed", "unhandled runtime error",
+    "hydration failed because", "there was an error while hydrating",
+)
+
+_SPA_SHELL_MARKERS = (
+    'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"',
+    "data-reactroot", "data-server-rendered", "self.__next_f",
 )
 
 _HEAD_RE = re.compile(r"<head[^>]*>.*?</head>", re.DOTALL | re.IGNORECASE)
@@ -146,117 +120,83 @@ _NAV_RE = re.compile(
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 
+_JS_BODY_LEN = "() => (document.body && document.body.innerText || '').trim().length"
+_JS_BODY_READY = "() => (document.body && document.body.innerText || '').trim().length >= 200"
+_JS_INNER_TEXT = "() => (document.body && document.body.innerText || '').trim()"
+
 
 def _quick_visible_text(html: str) -> str:
-    """粗略估算 body 内真实可见文本（不含 head/meta/script/style）。"""
+    """Rough visible text from HTML (strips head/script/style/nav)."""
     text = _HEAD_RE.sub("", html)
-    text = _SCRIPT_RE.sub("", text)
-    text = _STYLE_RE.sub("", text)
-    text = _NAV_RE.sub("", text)
-    text = _TAG_RE.sub(" ", text)
-    return " ".join(text.split())
+    for pat in (_SCRIPT_RE, _STYLE_RE, _NAV_RE):
+        text = pat.sub("", text)
+    return " ".join(_TAG_RE.sub(" ", text).split())
 
 
 def _looks_like_binary_garbage(text: str) -> bool:
-    """
-    检测响应是否是未解压的二进制字节流（brotli/zstd 等解压失败的征兆）。
-    采样前 2KB，统计不可打印字符占比 > 30% 就判定为乱码。
-    """
+    """Detect undecompressed binary responses (brotli/zstd failures)."""
     if not text:
         return False
     sample = text[:2048]
-    if not sample:
-        return False
-    # 统计 "可疑字符"：不是 ASCII 可打印也不是 CJK 等常见范围
     bad = sum(1 for ch in sample
-              if ord(ch) < 0x20 and ch not in "\r\n\t"
-              or 0x7F <= ord(ch) < 0xA0)  # C1 控制字符
+              if (ord(ch) < 0x20 and ch not in "\r\n\t")
+              or (0x7F <= ord(ch) < 0xA0))
     return bad / len(sample) > 0.30
 
 
-_SPA_SHELL_MARKERS = (
-    'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"',
-    "data-reactroot", "data-server-rendered",
-    "self.__next_f",
-)
-
-
-def _is_content_usable(result: FetchResult, task: Task) -> bool:
-    """判断抓取内容是否足够（避免把 SPA 空壳或乱码当成正常结果）。"""
-    if not result.ok or not (result.content or "").strip():
-        return False
-
-    text = result.content
-
-    # 乱码检测（未解压的压缩字节）
-    if _looks_like_binary_garbage(text):
-        return False
-
-    if task.type == "json":
-        return True
-
-    if len(text) < 200:
-        return False
-    lower = text.lower()
-    if any(m in lower for m in _CHALLENGE_MARKERS):
-        return False
-
-    # 错误页面检测（Error Boundary / 5xx / hydration 失败）
-    if result.inner_text and _is_error_page(result.inner_text):
-        return False
-    visible = _quick_visible_text(text)
-    if _is_error_page(visible):
-        return False
-
-    # 嵌入数据检测：分为"真实嵌入数据"和"仅 JSON-LD SEO 元数据"
-    has_embedded = any(m in text for m in _EMBEDDED_DATA_MARKERS)
-    has_jsonld_only = (not has_embedded) and (_JSONLD_MARKER in lower)
-    has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
-
-    if has_embedded:
-        # 有真实嵌入数据（__NEXT_DATA__ / __NUXT__ / RSC Flight 等）
-        # → 即使可见文本少，deep extract 也能从中提取内容
-        # 只有当可见文本极端少（<50字）且同时有 SPA 壳时才拒绝
-        if has_spa_shell and len(visible) < 50:
-            return False
-        return True
-
-    if has_jsonld_only:
-        # 仅有 JSON-LD（SEO 元数据）→ 不视为真正的嵌入数据
-        # 需要足够的可见文本才认为页面内容完整
-        if has_spa_shell:
-            return False
-        return len(visible) >= 200
-
-    # 有 SPA 壳特征但无任何嵌入数据 → 不可信，让 auto 链走 deep extract → Playwright
-    if has_spa_shell:
-        return False
-
-    # 无 SPA 壳特征 → 普通页面（可能很小如 Coming Soon），有内容就行
-    return True
-
-
 def _is_error_page(text: str) -> bool:
-    """检测页面是否为错误页面（Error Boundary / 5xx / hydration 失败等）。"""
+    """Detect error pages (Error Boundary / 5xx / hydration failures)."""
     if not text:
         return False
     lower = text.lower().strip()
-    # 内容很长的页面不太可能是错误页面
     if len(lower) > 2000:
         return False
     return any(m in lower for m in _ERROR_PAGE_MARKERS)
 
 
-# ============================================================
-# Playwright 浏览器池（懒加载 + 定期回收 + 资源屏蔽）
-# ============================================================
-_BLOCK_RESOURCE_TYPES = {"image", "font", "media"}  # 不拦截 stylesheet，避免破坏 CSR 应用 hydration
+def _is_content_usable(result: FetchResult, task: Task) -> bool:
+    """Check if fetched content is substantial enough (not an SPA shell or garbage)."""
+    if not result.ok or not result.content or not result.content.strip():
+        return False
+
+    text = result.content
+    if _looks_like_binary_garbage(text):
+        return False
+    if task.type == "json":
+        return True
+    if len(text) < 200:
+        return False
+
+    lower = text.lower()
+    if any(m in lower for m in _CHALLENGE_MARKERS):
+        return False
+    if result.inner_text and _is_error_page(result.inner_text):
+        return False
+
+    visible = _quick_visible_text(text)
+    if _is_error_page(visible):
+        return False
+
+    has_embedded = any(m in text for m in _EMBEDDED_DATA_MARKERS)
+    has_jsonld_only = (not has_embedded) and (_JSONLD_MARKER in lower)
+    has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
+
+    if has_embedded:
+        if has_spa_shell and len(visible) < 50:
+            return False
+        return True
+    if has_jsonld_only:
+        return False if has_spa_shell else len(visible) >= 200
+    if has_spa_shell:
+        return False
+    return True
 
 
 class _BrowserPool:
-    """管理 Playwright Chromium 实例，懒加载、定期回收、stealth 注入。"""
+    """Manages Playwright Chromium: lazy init, periodic recycling, stealth injection."""
 
-    MAX_AGE = 1800  # 30 分钟强制回收
+    MAX_AGE = 1800
+    _BLOCK_TYPES = {"image", "font", "media"}
 
     def __init__(self, cfg: AppConfig):
         self._cfg = cfg
@@ -268,170 +208,108 @@ class _BrowserPool:
     def _should_recycle(self) -> bool:
         if self._browser is None:
             return False
-        age_exceeded = (time.time() - self._created_at) > self.MAX_AGE
-        pages_exceeded = self._page_count >= self._cfg.playwright_max_pages
-        return age_exceeded or pages_exceeded
+        return ((time.time() - self._created_at) > self.MAX_AGE
+                or self._page_count >= self._cfg.playwright_max_pages)
 
     def _ensure_browser(self) -> Any:
-        """确保浏览器实例存在且健康，需要时回收重建。"""
+        """Ensure browser instance is alive; recycle if stale."""
         if self._should_recycle():
-            self._close_browser()
-
+            self.close()
         if self._browser is not None:
             return self._browser
 
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            logger.warning("🎭 playwright 未安装，无法启动浏览器渲染")
+            logger.warning("playwright not installed")
             return None
-
         try:
             self._pw = sync_playwright().start()
             self._browser = self._pw.chromium.launch(
                 headless=True,
-                args=[
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                ],
+                args=["--disable-gpu", "--disable-dev-shm-usage",
+                      "--no-sandbox", "--disable-setuid-sandbox"],
             )
             self._page_count = 0
             self._created_at = time.time()
-            logger.info("🎭 Playwright Chromium 已启动")
+            logger.info("Playwright Chromium started")
             return self._browser
         except Exception as e:
-            logger.warning("🎭 Playwright 启动失败: {}", e)
-            self._pw = None
-            self._browser = None
+            logger.warning("Playwright launch failed: {}", e)
+            self._pw = self._browser = None
             return None
 
     def render(self, url: str, headers: dict, timeout: int) -> FetchResult:
-        """渲染页面并返回完整 HTML；检测到错误页面时自动关闭资源拦截重试。"""
+        """Render page; auto-retry without resource blocking on error pages."""
         if not self._cfg.enable_playwright:
-            return FetchResult(
-                ok=False, url=url, strategy_used="playwright",
-                error="Playwright 未启用（ENABLE_PLAYWRIGHT=false）",
-            )
-
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error="Playwright disabled (ENABLE_PLAYWRIGHT=false)")
         browser = self._ensure_browser()
         if browser is None:
-            return FetchResult(
-                ok=False, url=url, strategy_used="playwright",
-                error="Playwright 未安装或启动失败",
-            )
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error="Playwright not installed or launch failed")
 
-        # 首次尝试（带资源拦截）
-        result = self._render_once(url, headers, timeout, browser,
-                                   block_resources=True)
-
-        # 检测到错误页面 → 关闭资源拦截重试一次
+        result = self._render_once(url, headers, timeout, browser, block_resources=True)
         if result.ok and _is_error_page(result.inner_text):
-            logger.info(
-                "🎭 [{}] 检测到错误页面（{}），关闭资源拦截重试",
-                url, result.inner_text[:80],
-            )
-            result = self._render_once(url, headers, timeout, browser,
-                                       block_resources=False)
-
+            logger.info("[{}] error page detected, retrying without resource blocking", url)
+            result = self._render_once(url, headers, timeout, browser, block_resources=False)
         return result
 
     def _render_once(self, url: str, headers: dict, timeout: int,
                      browser: Any, *, block_resources: bool) -> FetchResult:
-        """单次渲染尝试。"""
-        context = None
-        page = None
+        context = page = None
         try:
             context = browser.new_context(
                 user_agent=headers.get("User-Agent", _UA_POOL[0]),
                 viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="America/New_York",
+                locale="en-US", timezone_id="America/New_York",
             )
-
-            # 注入 stealth 脚本
             try:
                 from playwright_stealth import stealth_sync
                 stealth_sync(context)
             except ImportError:
-                pass  # stealth 未安装也能用，只是可能被检测
+                pass
 
             page = context.new_page()
-
-            # 条件性资源拦截（不拦截 stylesheet，避免破坏 CSR 应用）
             if block_resources:
-                page.route(
-                    "**/*",
-                    lambda route: (
-                        route.abort()
-                        if route.request.resource_type in _BLOCK_RESOURCE_TYPES
-                        else route.continue_()
-                    ),
-                )
+                page.route("**/*", lambda route: (
+                    route.abort() if route.request.resource_type in self._BLOCK_TYPES
+                    else route.continue_()))
 
             page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
 
-            # CSR 站点（如链上数据页面）需要额外等待异步数据加载
-            # 循环检查：每轮等 5s + networkidle，最多 3 轮（共 ~15s 额外）
-            _JS_GET_LEN = (
-                "() => (document.body && document.body.innerText || '').trim().length"
-            )
-            _JS_WAIT_LEN = (
-                "() => (document.body && document.body.innerText || '')"
-                ".trim().length >= 200"
-            )
-            for _wait_round in range(3):
-                body_len = page.evaluate(_JS_GET_LEN)
-                if body_len >= 200:
+            for _ in range(3):
+                if page.evaluate(_JS_BODY_LEN) >= 200:
                     break
-                logger.debug(
-                    "🎭 [{}] 渲染等待第{}轮（body={}字）",
-                    url, _wait_round + 1, body_len,
-                )
                 try:
-                    page.wait_for_function(_JS_WAIT_LEN, timeout=5000)
+                    page.wait_for_function(_JS_BODY_READY, timeout=5000)
                     break
                 except Exception:
                     pass
-                # 再等一轮 networkidle（捕获晚到的异步请求）
                 try:
                     page.wait_for_load_state("networkidle", timeout=5000)
                 except Exception:
                     pass
 
-            # 捕获浏览器直接可见文本（比 HTML 重解析更可靠）
-            inner_text = page.evaluate(
-                "() => (document.body && document.body.innerText || '').trim()"
-            )
+            inner_text = page.evaluate(_JS_INNER_TEXT)
             content = page.content()
             self._page_count += 1
-
-            return FetchResult(
-                ok=True, url=url, status_code=200,
-                content=content,
-                content_type="text/html",
-                strategy_used="playwright",
-                inner_text=inner_text,
-            )
+            return FetchResult(ok=True, url=url, status_code=200, content=content,
+                               content_type="text/html", strategy_used="playwright",
+                               inner_text=inner_text)
         except Exception as e:
-            return FetchResult(
-                ok=False, url=url, strategy_used="playwright",
-                error=f"{type(e).__name__}: {e}",
-            )
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error=f"{type(e).__name__}: {e}")
         finally:
-            if page:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-            if context:
-                try:
-                    context.close()
-                except Exception:
-                    pass
+            for obj in (page, context):
+                if obj:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
 
-    def _close_browser(self) -> None:
+    def close(self) -> None:
+        """Shutdown browser and playwright process."""
         if self._browser:
             try:
                 self._browser.close()
@@ -446,96 +324,68 @@ class _BrowserPool:
             self._pw = None
         self._page_count = 0
 
-    def close(self) -> None:
-        """服务停止时调用。"""
-        self._close_browser()
 
-
-# ============================================================
-# 抓取引擎
-# ============================================================
 class FetchEngine:
-    """多策略抓取引擎（线程安全，复用连接池）。"""
+    """Multi-strategy fetch engine (thread-safe, connection-pooled)."""
 
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.timeout = cfg.request_timeout
         proxy = cfg.https_proxy or cfg.http_proxy or None
-        self._proxies = (
-            {"http": cfg.http_proxy or cfg.https_proxy,
-             "https": cfg.https_proxy or cfg.http_proxy}
-            if proxy else None
-        )
-        self._httpx_client: Any = None  # 懒加载，首次使用时创建
+        self._proxies = ({"http": cfg.http_proxy or cfg.https_proxy,
+                          "https": cfg.https_proxy or cfg.http_proxy} if proxy else None)
+        self._httpx_client: Any = None
         self._browser_pool = _BrowserPool(cfg)
 
-    # ----- 对外入口 -----
     def fetch(self, task: Task) -> FetchResult:
+        """Main entry: route to strategy and return result."""
         strategy = (task.strategy or "auto").lower()
-        headers = _headers(self.cfg.default_headers, task.headers or {})
+        headers = _build_headers(self.cfg.default_headers, task.headers or {})
 
         if strategy == "playwright":
             return self._fetch_playwright(task, headers)
+        if strategy in ("curl_cffi", "httpx"):
+            fetcher = self._fetch_curl_cffi if strategy == "curl_cffi" else self._fetch_httpx
+            return self._upgrade_if_empty(task, headers, fetcher(task, headers))
 
-        if strategy == "curl_cffi":
-            result = self._fetch_curl_cffi(task, headers)
-            return self._upgrade_if_empty(task, headers, result)
-        if strategy == "httpx":
-            result = self._fetch_httpx(task, headers)
-            return self._upgrade_if_empty(task, headers, result)
-
-        # auto 模式：优先尝试上次成功的策略（策略锁定）
         last = getattr(task, "last_strategy_used", None) or ""
         if last:
             preferred = self._fetch_with_last_strategy(task, headers, last)
             if preferred is not None:
                 return preferred
-            logger.info(
-                "🔄 [{}] 上次策略 {} 本次失效，回退 auto 全链",
-                task.name, last,
-            )
+            logger.info("[{}] last strategy {} failed, falling back to auto chain", task.name, last)
 
-        # auto 全链：curl_cffi → httpx → 深度提取 → Playwright
         return self._auto_chain(task, headers)
 
-    def _fetch_with_last_strategy(
-        self, task: Task, headers: dict, last: str,
-    ) -> FetchResult | None:
-        """尝试用上次成功的策略，成功返回 FetchResult，失效返回 None。"""
+    def _fetch_with_last_strategy(self, task: Task, headers: dict,
+                                  last: str) -> FetchResult | None:
+        """Try the previously successful strategy; return None if it fails."""
         if last == "playwright":
-            result = self._fetch_playwright(task, headers)
-            return result if result.ok else None
+            r = self._fetch_playwright(task, headers)
+            return r if r.ok else None
 
-        if last.endswith("→deep"):
-            # 上次是 deep extract 成功的：先抓 HTML，再 deep extract
-            base_strategy = last.split("→")[0]
-            html_result = self._fetch_by_name(task, headers, base_strategy)
-            if html_result.ok and html_result.content:
-                deep = self._try_deep_extract(task, html_result)
+        if last.endswith("\u2192deep"):
+            base = last.split("\u2192")[0]
+            html = self._fetch_by_name(task, headers, base)
+            if html.ok and html.content:
+                deep = self._try_deep_extract(task, html)
                 if deep is not None:
                     return deep
             return None
 
         if last.startswith("curl_cffi") or last == "httpx":
-            result = self._fetch_by_name(task, headers, last)
-            if result.ok and _is_content_usable(result, task):
-                return result
-            # HTML 拿到了但不 usable → 尝试 deep extract
-            if result.ok and result.content:
-                deep = self._try_deep_extract(task, result)
+            r = self._fetch_by_name(task, headers, last)
+            if r.ok and _is_content_usable(r, task):
+                return r
+            if r.ok and r.content:
+                deep = self._try_deep_extract(task, r)
                 if deep is not None:
                     return deep
             return None
 
-        # 未知策略，跳过
         return None
 
-    def _fetch_by_name(
-        self, task: Task, headers: dict, name: str,
-    ) -> FetchResult:
-        """按策略名调用对应的抓取方法。"""
-        if name.startswith("curl_cffi"):
-            return self._fetch_curl_cffi(task, headers)
+    def _fetch_by_name(self, task: Task, headers: dict, name: str) -> FetchResult:
         if name == "httpx":
             return self._fetch_httpx(task, headers)
         if name == "playwright":
@@ -543,7 +393,7 @@ class FetchEngine:
         return self._fetch_curl_cffi(task, headers)
 
     def _auto_chain(self, task: Task, headers: dict) -> FetchResult:
-        """auto 全链：curl_cffi → httpx → 深度提取 → Playwright。"""
+        """Full auto chain: curl_cffi -> httpx -> deep extract -> Playwright."""
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
             return result
@@ -552,162 +402,114 @@ class FetchEngine:
         if result2.ok and _is_content_usable(result2, task):
             return result2
 
-        # ★ 深度提取：从已拿到的 HTML 中挖掘 SSR 嵌入数据 / RSC Flight
         best_html = result if result.ok else result2
         if best_html.ok and best_html.content:
             deep = self._try_deep_extract(task, best_html)
             if deep is not None:
                 return deep
 
-        # ★ Playwright（最终兜底）
-        pw_result = self._fetch_playwright(task, headers)
-        if pw_result.ok:
-            logger.info("🎭 [{}] auto 升级到 Playwright（前置策略均未获得有效内容）", task.name)
-            return pw_result
+        pw = self._fetch_playwright(task, headers)
+        if pw.ok:
+            logger.info("[{}] auto escalated to Playwright", task.name)
+            return pw
 
-        # 全部失败：返回最有信息的
-        if result.ok:
-            return result
-        result.error = result.error or "所有策略均失败"
-        return result
+        return result if result.ok else FetchResult(
+            ok=False, url=task.url, error=result.error or "all strategies failed",
+            strategy_used=result.strategy_used)
 
-    def _try_deep_extract(
-        self, task: Task, html_result: FetchResult,
-    ) -> FetchResult | None:
-        """对已拿到的 HTML 做深度 SSR 数据提取，成功返回 FetchResult，失败返回 None。"""
+    def _try_deep_extract(self, task: Task, html_result: FetchResult) -> FetchResult | None:
+        """Extract embedded SSR/RSC data from raw HTML."""
         try:
             from .extractor import try_deep_extract
             text = try_deep_extract(html_result.content)
             if text and len(text) >= 120:
-                logger.info(
-                    "🔍 [{}] 深度提取成功（{} 字，策略={}→deep）",
-                    task.name, len(text), html_result.strategy_used,
-                )
-                return FetchResult(
-                    ok=True, url=task.url,
-                    status_code=html_result.status_code,
-                    content=text,
-                    content_type="text/plain",
-                    strategy_used=f"{html_result.strategy_used}→deep",
-                )
-        except Exception as e:
-            logger.debug("深度提取异常: {}", e)
+                strategy = f"{html_result.strategy_used}\u2192deep"
+                logger.info("[{}] deep extract ok ({} chars, strategy={})",
+                            task.name, len(text), strategy)
+                return FetchResult(ok=True, url=task.url, status_code=html_result.status_code,
+                                   content=text, content_type="text/plain",
+                                   strategy_used=strategy)
+        except Exception:
+            pass
         return None
 
-    def _upgrade_if_empty(
-        self, task: Task, headers: dict, result: FetchResult,
-    ) -> FetchResult:
-        """明确指定 curl_cffi/httpx 但拿到空壳时，逐级升级。"""
+    def _upgrade_if_empty(self, task: Task, headers: dict, result: FetchResult) -> FetchResult:
+        """For explicitly specified curl_cffi/httpx: escalate if content is unusable."""
         if not result.ok or _is_content_usable(result, task):
             return result
 
-        # ★ 先尝试深度提取
         if result.content:
             deep = self._try_deep_extract(task, result)
             if deep is not None:
                 return deep
 
-        # 区分原因便于排查
-        content = result.content or ""
-        if _looks_like_binary_garbage(content):
-            reason = f"响应疑似未解压（乱码字节 len={len(content)}）"
-        else:
-            reason = f"空壳/内容不足（len={len(content)}）"
+        reason = ("binary garbage" if _looks_like_binary_garbage(result.content or "")
+                  else f"shell/insufficient (len={len(result.content or '')})")
+        logger.info("[{}] strategy={} {}, upgrading to Playwright",
+                    task.name, result.strategy_used, reason)
 
-        # Playwright
-        logger.info(
-            "🎭 [{}] 策略={} {}，自动升级 Playwright",
-            task.name, result.strategy_used, reason,
-        )
         pw = self._fetch_playwright(task, headers)
         if pw.ok:
-            pw.strategy_used = f"{result.strategy_used}→playwright"
+            pw.strategy_used = f"{result.strategy_used}\u2192playwright"
             return pw
-
         return result
 
-    # ----- 策略：curl_cffi -----
     def _fetch_curl_cffi(self, task: Task, headers: dict) -> FetchResult:
         try:
             from curl_cffi import requests as cc
         except ImportError:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="curl_cffi",
-                error="curl_cffi 未安装",
-            )
+            return FetchResult(ok=False, url=task.url, strategy_used="curl_cffi",
+                               error="curl_cffi not installed")
 
         impersonate = task.impersonate or "chrome131"
         if impersonate not in SUPPORTED_IMPERSONATE:
             impersonate = "chrome131"
+        tag = f"curl_cffi/{impersonate}"
 
         try:
-            resp = cc.get(
-                task.url, headers=headers, impersonate=impersonate,
-                timeout=self.timeout, proxies=self._proxies,
-                allow_redirects=True,
-            )
-            return FetchResult(
-                ok=200 <= resp.status_code < 300,
-                url=task.url, status_code=resp.status_code,
-                content=resp.text,
-                content_type=resp.headers.get("content-type", ""),
-                strategy_used=f"curl_cffi/{impersonate}",
-            )
+            resp = cc.get(task.url, headers=headers, impersonate=impersonate,
+                          timeout=self.timeout, proxies=self._proxies, allow_redirects=True)
+            return FetchResult(ok=200 <= resp.status_code < 300, url=task.url,
+                               status_code=resp.status_code, content=resp.text,
+                               content_type=resp.headers.get("content-type", ""),
+                               strategy_used=tag)
         except Exception as e:
-            return FetchResult(
-                ok=False, url=task.url,
-                strategy_used=f"curl_cffi/{impersonate}",
-                error=f"{type(e).__name__}: {e}",
-            )
+            return FetchResult(ok=False, url=task.url, strategy_used=tag,
+                               error=f"{type(e).__name__}: {e}")
 
-    # ----- 策略：httpx（复用 Client 连接池）-----
+    def _fetch_httpx(self, task: Task, headers: dict) -> FetchResult:
+        client = self._get_httpx_client()
+        if client is None:
+            return FetchResult(ok=False, url=task.url, strategy_used="httpx",
+                               error="httpx not installed")
+        try:
+            resp = client.get(task.url, headers=headers)
+            return FetchResult(ok=200 <= resp.status_code < 300, url=task.url,
+                               status_code=resp.status_code, content=resp.text,
+                               content_type=resp.headers.get("content-type", ""),
+                               strategy_used="httpx")
+        except Exception as e:
+            return FetchResult(ok=False, url=task.url, strategy_used="httpx",
+                               error=f"{type(e).__name__}: {e}")
+
     def _get_httpx_client(self):
-        """懒加载共享 httpx Client（连接池复用，省 TLS 握手）。"""
         if self._httpx_client is None:
             try:
                 import httpx
             except ImportError:
                 return None
             self._httpx_client = httpx.Client(
-                http2=True,
-                timeout=self.timeout,
-                follow_redirects=True,
+                http2=True, timeout=self.timeout, follow_redirects=True,
                 proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
-                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
-            )
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
         return self._httpx_client
 
-    def _fetch_httpx(self, task: Task, headers: dict) -> FetchResult:
-        client = self._get_httpx_client()
-        if client is None:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="httpx",
-                error="httpx 未安装",
-            )
-        try:
-            resp = client.get(task.url, headers=headers)
-            return FetchResult(
-                ok=200 <= resp.status_code < 300,
-                url=task.url, status_code=resp.status_code,
-                content=resp.text,
-                content_type=resp.headers.get("content-type", ""),
-                strategy_used="httpx",
-            )
-        except Exception as e:
-            return FetchResult(
-                ok=False, url=task.url, strategy_used="httpx",
-                error=f"{type(e).__name__}: {e}",
-            )
-
-    # ----- 策略：Playwright（headless Chromium 渲染）-----
     def _fetch_playwright(self, task: Task, headers: dict) -> FetchResult:
-        return self._browser_pool.render(
-            task.url, headers, self.cfg.playwright_timeout,
-        )
+        return self._browser_pool.render(task.url, headers, self.cfg.playwright_timeout)
 
     def close(self) -> None:
-        """关闭连接池和浏览器。服务停止时调用。"""
-        if self._httpx_client is not None:
+        """Shutdown connections and browser."""
+        if self._httpx_client:
             try:
                 self._httpx_client.close()
             except Exception:

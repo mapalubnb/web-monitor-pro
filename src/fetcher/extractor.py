@@ -1,16 +1,4 @@
-"""
-内容提取和归一化
-
-HTML 提取顺序：
-1. 用户指定 CSS 选择器
-2. SPA 嵌入数据（Next.js / Nuxt.js / Apollo / window.__X__ / JSON-LD）
-3. RSC Flight 数据（Next.js App Router）
-4. trafilatura 正文
-5. meta 结构化数据兜底
-6. 整页纯文本
-
-归一化：去空白、去噪音（时间戳、nonce、hash）。
-"""
+"""内容提取和归一化。"""
 
 from __future__ import annotations
 
@@ -38,9 +26,6 @@ _BLANK_RE = re.compile(r"\n{3,}")
 MIN_USEFUL_LENGTH = 120
 
 
-# ============================================================
-# 入口
-# ============================================================
 def extract(task: Task, result: FetchResult) -> str:
     """从 FetchResult 提取用于比对的文本（已归一化）。"""
     content = result.content or ""
@@ -51,47 +36,27 @@ def extract(task: Task, result: FetchResult) -> str:
     task_type = (task.type or "html").lower()
     strategy = result.strategy_used or ""
 
-    # JSON
     if task_type == "json" or "json" in content_type:
         return _extract_json(content, task.json_path)
 
-    # deep 提取结果已是纯文本，直接归一化
     if strategy.endswith("→deep"):
         return _normalize(content)
 
-    # Playwright 渲染后的 HTML 已是完整 DOM，跳过 SPA/RSC 解析
-    # 直接提取可见文本（selector → trafilatura → innerText → 全文 → meta）
     if "playwright" in strategy:
         return _extract_rendered_html(content, task, result.inner_text)
 
-    # 原始 HTML（curl_cffi / httpx）
     return _extract_html(content, task)
 
 
-# ============================================================
-# Playwright 渲染后 HTML（已是完整 DOM，无需 SPA/RSC 解析）
-# ============================================================
 def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
-    """从 Playwright 渲染后的 HTML 提取文本。跳过 SPA/RSC 解析。
-
-    提取优先级：
-    1. CSS 选择器（用户指定，最精准）
-    2. body.innerText（浏览器实际可见文本，包含导航栏等完整页面内容）
-    3. 整页可见文本（从 HTML 重新解析，去掉 script/style）
-    4. trafilatura（正文提取，会过滤导航/页脚等"模板"内容，适合文章类页面）
-    5. meta 兜底
-
-    注意：trafilatura 放在 innerText 之后，因为它会主动剥离导航栏、
-    页头页脚等"样板"内容。对于需要监控全页面变化的场景，innerText
-    更忠实地反映浏览器中用户看到的完整内容。
-    """
+    """从 Playwright 渲染后的 HTML 提取文本，跳过 SPA/RSC 解析。"""
     # 1) CSS 选择器（用户指定）
     if task.selector:
         text = _by_selector(html, task.selector)
         if text and len(text) >= MIN_USEFUL_LENGTH:
             return _normalize(text)
 
-    # 2) Playwright 直接提供的 body.innerText（完整的浏览器可见文本）
+    # 2) Playwright 直接提供的 body.innerText
     if inner_text and len(inner_text) >= MIN_USEFUL_LENGTH:
         return _normalize(inner_text)
 
@@ -100,7 +65,7 @@ def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
-    # 4) trafilatura 正文提取（会过滤导航等模板内容，作为补充）
+    # 4) trafilatura 正文提取
     text = _main_content(html)
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
@@ -110,10 +75,8 @@ def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
     return _normalize(meta) if meta else ""
 
 
-# ============================================================
-# HTML
-# ============================================================
 def _extract_html(html: str, task: Task) -> str:
+    """从原始 HTML 按优先级提取文本。"""
     # 1) CSS 选择器
     if task.selector:
         text = _by_selector(html, task.selector)
@@ -146,8 +109,9 @@ def _extract_html(html: str, task: Task) -> str:
 
 
 def _looks_like_spa_shell(html: str) -> bool:
-    """body 文本少 + 有 SPA 特征 = 空壳，应尝试提取嵌入数据。"""
+    """检测 SPA 空壳：有 SPA 标记且可见文本少。"""
     lower = html.lower()
+
     spa_markers = (
         'id="root"', 'id="app"', 'id="__next"',
         "__next_data__", "__nuxt__", "__nuxt_data__",
@@ -155,11 +119,11 @@ def _looks_like_spa_shell(html: str) -> bool:
         "__redux_state__", "__gatsby_initial_state__", "__remixcontext",
         "__sveltekit_data__", "__app_data__", "__store__",
         "data-reactroot", "data-server-rendered",
-        "self.__next_f",
+        "self.__next_f", "application/ld+json",
     )
     has_spa_markers = any(m in lower for m in spa_markers)
 
-    # 有嵌入数据标记 → 直接走 SPA 提取（不管可见文本多少）
+    # 有嵌入数据标记 → 直接走 SPA 提取
     embed_markers = (
         "__next_data__", "__nuxt_data__", "__nuxt__",
         "__initial_state__", "__apollo_state__", "__redux_state__",
@@ -222,7 +186,6 @@ def _extract_spa_data(html: str) -> str | None:
     """提取 SPA 各种嵌入数据点，合并成 JSON 文本。"""
     collected: dict[str, Any] = {}
 
-    # script id=xxx 的 JSON
     for name, pat in _SPA_PATTERNS:
         m = pat.search(html)
         if m:
@@ -230,7 +193,6 @@ def _extract_spa_data(html: str) -> str | None:
             if parsed is not None:
                 collected[name] = parsed
 
-    # window.__X__ = {...}
     for var in _INLINE_ASSIGNMENTS:
         parsed = _extract_js_assignment(html, var)
         if parsed is not None:
@@ -257,9 +219,6 @@ def _extract_spa_data(html: str) -> str | None:
         return None
 
 
-# ============================================================
-# RSC Flight 数据解析（Next.js App Router）
-# ============================================================
 _RSC_PUSH_RE = re.compile(
     r'self\.__next_f\.push\(\[\d+,(".*?")\]\)', re.DOTALL,
 )
@@ -267,14 +226,11 @@ _RSC_PUSH_RE = re.compile(
 
 def _extract_rsc_flight(html: str) -> str | None:
     """解析 Next.js App Router RSC Flight 数据流，提取文本内容。"""
-    # 检测是否有 RSC Flight 标记
     if "self.__next_f" not in html:
         return None
-    # CSR bailout → 无服务端数据，不可能提取出有意义的内容
     if "BAILOUT_TO_CLIENT_SIDE_RENDERING" in html:
         return None
 
-    # 收集所有 flight chunks
     stream = ""
     for m in _RSC_PUSH_RE.finditer(html):
         try:
@@ -284,21 +240,18 @@ def _extract_rsc_flight(html: str) -> str | None:
     if not stream:
         return None
 
-    # 从 Flight 行协议中提取文本内容
     texts: list[str] = []
     for line in stream.split("\n"):
         colon = line.find(":")
         if colon == -1:
             continue
         payload = line[colon + 1:]
-        # 跳过 import refs、symbols、null、hints
         if not payload or payload == "null":
             continue
         if payload.startswith("I[") or payload.startswith('"$S'):
             continue
         if payload.startswith("HL["):
             continue
-        # 尝试解析 JSON 数组/对象，递归提取 children 文本
         try:
             obj = json.loads(payload)
             _collect_rsc_text(obj, texts)
@@ -314,7 +267,6 @@ def _collect_rsc_text(node: Any, texts: list[str]) -> None:
     """递归遍历 RSC Flight 节点树，收集文本内容。"""
     if isinstance(node, str):
         s = node.strip()
-        # 过滤掉 React 内部标记（$L、$S 等）和短噪音
         if s and not s.startswith("$") and len(s) > 1:
             texts.append(s)
     elif isinstance(node, list):
@@ -393,8 +345,7 @@ def _by_selector(html: str, selector: str) -> str:
         return "\n\n".join(
             t for t in (n.text(separator="\n", strip=True) for n in nodes) if t
         )
-    except Exception as e:
-        logger.debug("selectolax 解析失败: {}", e)
+    except Exception:
         return ""
 
 
@@ -453,10 +404,8 @@ def _html_to_text(html: str) -> str:
         return re.sub(r"<[^>]+>", "", t)
 
 
-# ============================================================
-# JSON 提取
-# ============================================================
 def _extract_json(content: str, json_path: str | None) -> str:
+    """提取 JSON 内容，支持 json_path 过滤。"""
     try:
         obj = json.loads(content)
     except json.JSONDecodeError:
@@ -471,8 +420,8 @@ def _extract_json(content: str, json_path: str | None) -> str:
         if path:
             try:
                 collected.append({path: _eval_path(obj, path)})
-            except Exception as e:
-                logger.debug("json_path '{}' 提取失败: {}", path, e)
+            except Exception:
+                pass
     if not collected:
         return ""
     return json.dumps(collected, ensure_ascii=False, sort_keys=True, indent=2)
@@ -513,9 +462,6 @@ def _eval_path(obj: Any, path: str) -> Any:
     return walk(obj, tokens)
 
 
-# ============================================================
-# 归一化
-# ============================================================
 def _normalize(text: str) -> str:
     """压缩空白 + 移除动态噪音。"""
     if not text:
@@ -530,23 +476,16 @@ def _normalize(text: str) -> str:
 
 
 def try_deep_extract(html: str) -> str:
-    """
-    对已拿到的 HTML 做深度提取尝试（供 engine 在判定空壳后调用）。
-    与 extract() 不同：这里不依赖 Task/FetchResult，直接从原始 HTML 中
-    尝试提取 SPA 嵌入数据、RSC Flight 数据、trafilatura 正文。
-
-    注意：不兜底 meta / 纯文本 — 那些太低质量，会短路后续更好的策略
-    （如 Playwright）。返回空字符串表示提取失败。
-    """
+    """对已拿到的 HTML 做深度提取（SPA 嵌入 / RSC / trafilatura），不兜底低质量文本。"""
     if not html or not html.strip():
         return ""
 
-    # 1. SPA 嵌入数据（优先级最高 — 结构化数据最完整）
+    # 1. SPA 嵌入数据
     spa = _extract_spa_data(html)
     if spa and len(spa) >= MIN_USEFUL_LENGTH:
         return _normalize(spa)
 
-    # 2. RSC Flight 数据（Next.js App Router SSR 页面）
+    # 2. RSC Flight 数据
     rsc = _extract_rsc_flight(html)
     if rsc and len(rsc) >= MIN_USEFUL_LENGTH:
         return _normalize(rsc)
@@ -556,7 +495,6 @@ def try_deep_extract(html: str) -> str:
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
-    # 不兜底 meta / 纯文本 → 返回空，让 auto 链继续升级到 Playwright
     return ""
 
 
@@ -565,9 +503,6 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-# ============================================================
-# 诊断（给 /debug 命令用）
-# ============================================================
 def diagnose_html(html: str) -> dict[str, Any]:
     """分析 HTML：识别框架 / 嵌入数据 / 给建议。"""
     lower = html.lower()
@@ -602,7 +537,6 @@ def diagnose_html(html: str) -> dict[str, Any]:
 
     visible_len = len(_html_to_text(html))
 
-    # 建议
     suggestions: list[str] = []
     if data_points:
         suggestions.append("页面内嵌结构化数据，当前提取策略应能拿到")

@@ -1,12 +1,4 @@
-"""
-主程序入口
-
-1. 加载 .env + config.yaml
-2. 初始化日志 + 数据库
-3. 构造 Engine / Risk / Feishu / Runner / Scheduler / Dispatcher
-4. 注册飞书 WebSocket 事件
-5. 启动调度器 + 发送启动卡片 + 阻塞运行
-"""
+"""主程序入口：加载配置、初始化组件、启动调度与飞书长连接。"""
 
 from __future__ import annotations
 
@@ -49,10 +41,8 @@ class App:
 
         self._ws_client: Any = None
 
-    # ============================================================
-    # 启动
-    # ============================================================
     def start(self) -> None:
+        """启动服务。"""
         logger.info("═" * 60)
         logger.info("🚀 Web Monitor Pro v{} 正在启动", __version__)
         logger.info("═" * 60)
@@ -63,6 +53,7 @@ class App:
         self._start_ws()  # 阻塞
 
     def shutdown(self) -> None:
+        """优雅关闭。"""
         logger.info("🛑 正在关闭服务...")
         try:
             self.scheduler.stop()
@@ -74,10 +65,8 @@ class App:
             pass
         logger.info("👋 再见")
 
-    # ============================================================
-    # 种子任务同步
-    # ============================================================
     def _seed_tasks_from_config(self) -> None:
+        """从 YAML 种子配置同步任务到 DB。"""
         if not self.cfg.tasks:
             return
         added = 0
@@ -99,10 +88,8 @@ class App:
         if added:
             logger.info("🌱 同步 {} 个 YAML 任务到 DB", added)
 
-    # ============================================================
-    # 启动卡片
-    # ============================================================
     def _send_startup_card(self) -> None:
+        """发送启动通知卡片。"""
         with session_scope() as s:
             count = s.query(Task).filter(Task.enabled.is_(True)).count()
 
@@ -117,29 +104,19 @@ class App:
             version=__version__,
         ))
 
-    # ============================================================
-    # 飞书长连接
-    # ============================================================
     def _start_ws(self) -> None:
+        """建立飞书 WebSocket 长连接。"""
         try:
             import lark_oapi as lark
         except ImportError as e:
             logger.error("lark-oapi 未安装：{}", e)
             return
 
-        # 打印 SDK 版本，排障有用
-        try:
-            from lark_oapi.core.const import VERSION as _lark_version
-            logger.info("📦 lark-oapi 版本: {}", _lark_version)
-        except ImportError:
-            logger.warning("无法确定 lark-oapi 版本（可能过老，建议升级到 >=1.4）")
-
         builder = (
             lark.EventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._on_message)
         )
 
-        # 卡片回调注册（lark-oapi >= 1.4 标准方法）
         try:
             builder = builder.register_p2_card_action_trigger(self._on_card_action)
             logger.info("🖱️  卡片按钮回调已注册")
@@ -158,9 +135,6 @@ class App:
         logger.info("🔌 正在建立飞书 WebSocket 长连接...")
         self._ws_client.start()  # 阻塞，内部自动重连
 
-    # ============================================================
-    # 事件处理（全部异步，保证 3 秒内返回避免 200340）
-    # ============================================================
     def _on_message(self, data: Any) -> None:
         """IM 消息。"""
         try:
@@ -185,7 +159,7 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_card_action(self, data: Any) -> Any:
-        """卡片按钮回调（必须 3s 内返回）。"""
+        """卡片按钮回调。"""
         try:
             event = getattr(data, "event", None)
             if event is None:
@@ -221,13 +195,10 @@ class App:
                 logger.exception("卡片回调异步异常: {}", e)
 
         threading.Thread(target=worker, daemon=True).start()
-        # 立刻给飞书一个 toast 作为"已收到"确认，主响应由后台异步推送
         return self._card_response(toast="info", content="处理中…")
 
-    # ============================================================
-    # 发送响应
-    # ============================================================
     def _send_response(self, resp: CommandResponse, chat_id: str) -> None:
+        """发送命令响应到飞书。"""
         if not chat_id:
             return
 
@@ -258,18 +229,9 @@ class App:
             self.scheduler.sync_task(resp.trigger_check_task_id)
             self.scheduler.trigger_now(resp.trigger_check_task_id)
 
-    # ============================================================
-    # SDK 辅助
-    # ============================================================
     @staticmethod
     def _card_response(toast: str = "", content: str = "") -> Any:
-        """
-        返回 SDK 期望的 P2CardActionTriggerResponse。
-        可选 toast 参数会让用户在点按钮后立即看到一个气泡提示，体验更好。
-
-        lark-oapi v1.4+ 的正确路径（从 SDK 源码验证）：
-        lark_oapi.event.callback.model.p2_card_action_trigger
-        """
+        """返回 SDK 期望的 P2CardActionTriggerResponse。"""
         payload: dict[str, Any] = {}
         if toast:
             payload["toast"] = {"type": toast, "content": content or "已收到"}
@@ -280,7 +242,6 @@ class App:
             return P2CardActionTriggerResponse(payload)
         except ImportError:
             pass
-        # 极老版本兼容
         try:
             from lark_oapi.card.model.p2_card_action_trigger import (
                 P2CardActionTriggerResponse,
@@ -292,6 +253,7 @@ class App:
 
     @staticmethod
     def _extract_sender_id(sender: Any) -> str | None:
+        """从事件中提取发送者 ID。"""
         try:
             sid = getattr(sender, "sender_id", None) if sender else None
             if sid is None:
@@ -327,10 +289,8 @@ class App:
             return ""
 
 
-# ============================================================
-# main()
-# ============================================================
 def main() -> int:
+    """入口函数。"""
     cfg = load_config()
     setup_logger(cfg.log_level)
 

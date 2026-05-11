@@ -1,14 +1,4 @@
-"""
-数据库模型和会话（SQLAlchemy + SQLite）
-
-表：
-- tasks            监控任务
-- change_history   变更历史
-- push_log         推送日志（风控冷却）
-- service_state    服务级 KV 状态
-
-快照/diff 文件直接存文件系统，DB 只记元数据路径。
-"""
+"""数据库模型和会话（SQLAlchemy + SQLite）。"""
 
 from __future__ import annotations
 
@@ -112,9 +102,6 @@ class ServiceState(Base):
     )
 
 
-# ============================================================
-# 引擎 & 会话
-# ============================================================
 _ENGINE = create_engine(
     f"sqlite:///{DB_PATH}",
     echo=False,
