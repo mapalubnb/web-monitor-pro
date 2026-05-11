@@ -6,6 +6,7 @@ import random
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -202,18 +203,21 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
 
 
 class _BrowserPool:
-    """Manages Playwright Chromium rendering.
+    """Manages Playwright Chromium rendering on a dedicated single thread.
 
     Playwright sync API is thread-bound — a browser created in thread A cannot
-    be used from thread B.  APScheduler dispatches tasks to a threadpool, so
+    be used from thread B. APScheduler dispatches tasks to a threadpool, so
     different tasks (or the same task on successive runs) may land on different
-    threads.
+    threads, which used to force the browser to be closed and relaunched on
+    every thread switch.
 
-    To avoid cross-thread errors and deadlocks we use a serialisation lock that
-    covers the entire render lifecycle (launch → navigate → extract → close).
-    The browser is reused across calls that happen on the same thread and
-    recycled (closed + re-launched) when the calling thread changes, or when
-    the browser exceeds its age/page limits.
+    To avoid that churn, we pin Playwright to a single dedicated thread via a
+    ``ThreadPoolExecutor(max_workers=1)``. Every render call is submitted to
+    this executor and blocks for its result; the browser is therefore created
+    and reused on exactly one thread across the entire process.
+
+    The executor naturally serialises render calls (only one in flight at any
+    time), so we no longer need a separate lock for the browser lifecycle.
     """
 
     MAX_AGE = 1800
@@ -225,21 +229,36 @@ class _BrowserPool:
         self._browser: Any = None
         self._page_count = 0
         self._created_at = 0.0
-        self._owner_thread: int | None = None
-        # Serialises all Playwright operations so that only one thread
-        # touches the browser at a time.
-        self._lock = threading.Lock()
+        self._executor: ThreadPoolExecutor | None = None
+        self._exec_lock = threading.Lock()
+
+    def _get_executor(self) -> ThreadPoolExecutor:
+        """Return the dedicated single-thread executor (lazy init)."""
+        if self._executor is None:
+            with self._exec_lock:
+                if self._executor is None:
+                    self._executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="playwright",
+                    )
+        return self._executor
 
     def _should_recycle(self) -> bool:
+        """Must be called from the executor thread."""
         if self._browser is None:
             return False
-        if self._owner_thread != threading.get_ident():
-            return True
         return ((time.time() - self._created_at) > self.MAX_AGE
                 or self._page_count >= self._cfg.playwright_max_pages)
 
+    def _proxy_config(self) -> dict | None:
+        """Build Playwright proxy config from AppConfig (HTTP/HTTPS proxy)."""
+        proxy_url = self._cfg.https_proxy or self._cfg.http_proxy
+        if not proxy_url:
+            return None
+        return {"server": proxy_url}
+
     def _ensure_browser(self) -> Any:
-        """Ensure browser instance is alive on the current thread."""
+        """Ensure browser instance is alive on the executor thread."""
         if self._should_recycle():
             self._close_internal()
         if self._browser is not None:
@@ -252,49 +271,71 @@ class _BrowserPool:
             return None
         try:
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
+            launch_kwargs: dict[str, Any] = dict(
                 headless=True,
                 args=["--disable-gpu", "--disable-dev-shm-usage",
                       "--no-sandbox", "--disable-setuid-sandbox"],
             )
+            proxy_cfg = self._proxy_config()
+            if proxy_cfg:
+                launch_kwargs["proxy"] = proxy_cfg
+            self._browser = self._pw.chromium.launch(**launch_kwargs)
             self._page_count = 0
             self._created_at = time.time()
-            self._owner_thread = threading.get_ident()
-            logger.info("Playwright Chromium started (thread={})", self._owner_thread)
+            proxy_note = f" via proxy {proxy_cfg['server']}" if proxy_cfg else ""
+            logger.info("Playwright Chromium started (thread={}){}",
+                        threading.get_ident(), proxy_note)
             return self._browser
         except Exception as e:
             logger.warning("Playwright launch failed: {}", e)
             self._pw = self._browser = None
-            self._owner_thread = None
             return None
 
     def render(self, url: str, headers: dict, timeout: int) -> FetchResult:
-        """Render page under the serialisation lock (thread-safe)."""
+        """Submit the render job to the dedicated Playwright thread."""
         if not self._cfg.enable_playwright:
             return FetchResult(ok=False, url=url, strategy_used="playwright",
                                error="Playwright disabled (ENABLE_PLAYWRIGHT=false)")
 
-        with self._lock:
-            browser = self._ensure_browser()
-            if browser is None:
-                return FetchResult(ok=False, url=url, strategy_used="playwright",
-                                   error="Playwright not installed or launch failed")
+        executor = self._get_executor()
+        future = executor.submit(self._render_on_thread, url, headers, timeout)
+        try:
+            # Allow generous headroom above the configured timeout to cover
+            # browser launch + retry without blocking forever.
+            return future.result(timeout=timeout * 2 + 30)
+        except Exception as e:
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error=f"executor error: {type(e).__name__}: {e}")
 
-            result = self._render_once(url, headers, timeout, browser, block_resources=True)
-            if result.ok and _is_error_page(result.inner_text):
-                logger.info("[{}] error page detected, retrying without resource blocking", url)
-                result = self._render_once(url, headers, timeout, browser, block_resources=False)
-            return result
+    def _render_on_thread(self, url: str, headers: dict, timeout: int) -> FetchResult:
+        """Runs on the dedicated Playwright thread."""
+        browser = self._ensure_browser()
+        if browser is None:
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error="Playwright not installed or launch failed")
+
+        result = self._render_once(url, headers, timeout, browser, block_resources=True)
+        if result.ok and _is_error_page(result.inner_text):
+            logger.info("[{}] error page detected, retrying without resource blocking", url)
+            result = self._render_once(url, headers, timeout, browser, block_resources=False)
+        return result
 
     def _render_once(self, url: str, headers: dict, timeout: int,
                      browser: Any, *, block_resources: bool) -> FetchResult:
         context = page = None
         try:
-            context = browser.new_context(
-                user_agent=headers.get("User-Agent", _UA_POOL[0]),
+            # Only override UA if the caller explicitly provided a User-Agent
+            # via task.headers. Otherwise we let Chromium pick its native UA so
+            # that navigator.userAgent and the Sec-CH-UA client hints stay
+            # consistent — high-end fingerprinting trips on mismatches.
+            user_agent = headers.get("__override_user_agent__")
+            ctx_kwargs: dict[str, Any] = dict(
                 viewport={"width": 1920, "height": 1080},
                 locale="en-US", timezone_id="America/New_York",
             )
+            if user_agent:
+                ctx_kwargs["user_agent"] = user_agent
+            context = browser.new_context(**ctx_kwargs)
             try:
                 from playwright_stealth import stealth_sync
                 stealth_sync(context)
@@ -340,7 +381,7 @@ class _BrowserPool:
                         pass
 
     def _close_internal(self) -> None:
-        """Shutdown browser — caller must hold self._lock."""
+        """Shutdown browser — must run on the executor thread."""
         if self._browser:
             try:
                 self._browser.close()
@@ -354,12 +395,18 @@ class _BrowserPool:
                 pass
             self._pw = None
         self._page_count = 0
-        self._owner_thread = None
 
     def close(self) -> None:
         """Public shutdown (e.g. on application exit)."""
-        with self._lock:
-            self._close_internal()
+        if self._executor is None:
+            return
+        try:
+            self._executor.submit(self._close_internal).result(timeout=10)
+        except Exception as e:
+            logger.warning("Playwright shutdown error: {}", e)
+        finally:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
 
 
 class FetchEngine:
@@ -554,7 +601,19 @@ class FetchEngine:
         return self._httpx_client
 
     def _fetch_playwright(self, task: Task, headers: dict) -> FetchResult:
-        return self._browser_pool.render(task.url, headers, self.cfg.playwright_timeout)
+        # Pass through the user-supplied UA only if it was explicitly set on
+        # the task, to keep Chromium's native UA consistent with Sec-CH-UA
+        # client hints. We re-key it to avoid collision with the random UA
+        # that `_build_headers` injects for the HTTP-based strategies.
+        pw_headers = dict(headers)
+        user_headers = task.headers or {}
+        explicit_ua = next(
+            (v for k, v in user_headers.items() if k.lower() == "user-agent"),
+            None,
+        )
+        if explicit_ua:
+            pw_headers["__override_user_agent__"] = explicit_ua
+        return self._browser_pool.render(task.url, pw_headers, self.cfg.playwright_timeout)
 
     def close(self) -> None:
         """Shutdown connections and browser."""

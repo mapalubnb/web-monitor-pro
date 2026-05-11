@@ -137,11 +137,14 @@ class RiskController:
 
     def mark_pushed(self, task_id: int, kind: str = "change",
                     message_id: str | None = None) -> None:
-        """记录推送（冷却 + DB 日志）。"""
+        """记录推送（冷却 + DB 日志）。DB 失败不抛出，只告警。"""
         with self._lock:
             self._cooldown_mem[task_id] = time.time()
-        with session_scope() as s:
-            s.add(PushLog(task_id=task_id, kind=kind, message_id=message_id))
+        try:
+            with session_scope() as s:
+                s.add(PushLog(task_id=task_id, kind=kind, message_id=message_id))
+        except Exception as e:
+            logger.warning("写 PushLog 失败（冷却内存已记录，不影响推送）: {}", e)
 
     def should_push_change(
         self, task_id: int, diff: DiffResult, keywords: list[str]

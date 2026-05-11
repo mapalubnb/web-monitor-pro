@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta
+import uuid
+from datetime import timedelta
 from typing import Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -11,7 +12,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import select
 
 from .config import AppConfig
-from .db import Task, session_scope
+from .db import Task, now_utc, session_scope
 from .logger import logger
 from .risk_control import RiskController
 
@@ -62,7 +63,12 @@ class MonitorScheduler:
         self._add_or_update(t)
 
     def trigger_now(self, task_id: int) -> None:
-        """立即触发一次检查（异步执行）。"""
+        """立即触发一次检查（异步执行）。
+
+        - interval job 的下次执行推迟到完整周期之后，避免紧接着又跑一次；
+        - 用 uuid 做后缀保证 job_id 唯一，不会和快速连点 /check 的 job 冲突；
+        - MonitorRunner 内有任务锁，所以即便 job 入队也不会并发执行。
+        """
         logger.info("⚡ 立即触发任务 #{}", task_id)
 
         interval_job_id = f"task_{task_id}"
@@ -70,7 +76,7 @@ class MonitorScheduler:
         if interval_job is not None:
             try:
                 interval_sec = interval_job.trigger.interval.total_seconds()
-                new_next = datetime.utcnow() + timedelta(seconds=interval_sec)
+                new_next = now_utc() + timedelta(seconds=interval_sec)
                 self._sched.modify_job(interval_job_id, next_run_time=new_next)
             except Exception as e:
                 logger.warning("推迟 interval 作业失败: {}", e)
@@ -79,8 +85,8 @@ class MonitorScheduler:
             func=self._run_fn,
             args=[task_id],
             trigger="date",
-            run_date=datetime.utcnow(),
-            id=f"task_{task_id}_now_{datetime.utcnow().timestamp()}",
+            run_date=now_utc(),
+            id=f"task_{task_id}_now_{uuid.uuid4().hex}",
             misfire_grace_time=30,
         )
 
@@ -97,7 +103,7 @@ class MonitorScheduler:
             trigger=IntervalTrigger(seconds=interval),
             id=f"task_{task.id}",
             replace_existing=True,
-            next_run_time=datetime.utcnow() + timedelta(seconds=jitter),
+            next_run_time=now_utc() + timedelta(seconds=jitter),
             name=f"[{task.id}] {task.name}",
         )
 

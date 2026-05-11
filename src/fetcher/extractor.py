@@ -12,13 +12,21 @@ from ..logger import logger
 from .engine import FetchResult
 
 # 归一化时移除的噪音（时间戳 / csrf / nonce / 长 hash）
+# 注意：过于激进的 hex 匹配会误杀用户真正关心的哈希（如链上交易 hash），
+# 因此仅在紧邻 token/nonce/hash/signature/session 这类关键字的上下文里替换。
 _NOISE_PATTERNS = [
     re.compile(r"csrf[_-]?token[\"']?\s*[:=]\s*[\"']?[a-zA-Z0-9_-]+", re.IGNORECASE),
     re.compile(r"nonce[\"']?\s*[:=]\s*[\"']?[a-zA-Z0-9_-]+", re.IGNORECASE),
     re.compile(r"build[Ii]d[\"']?\s*[:=]\s*[\"']?[a-zA-Z0-9_-]+", re.IGNORECASE),
-    re.compile(r"\b[a-f0-9]{40,}\b"),                       # 长 hex hash
-    re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\S*"),  # ISO 时间戳
+    # 仅在明确的 token/hash/sig/session 上下文内替换长 hex，避免误杀链上 txhash
+    re.compile(
+        r"(?i)(?:token|hash|signature|session|sid|auth|secret|api[_-]?key)"
+        r"[\"']?\s*[:=]\s*[\"']?[a-f0-9]{32,}",
+    ),
+    re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+               r"(?:Z|[+-]\d{2}:?\d{2})?"),  # ISO 时间戳（含时区）
     re.compile(r"\b1[5-9]\d{11}\b|\b2[0-1]\d{11}\b"),       # Unix ms 时间戳
+    re.compile(r"\b1[5-9]\d{8}\b|\b2[0-1]\d{8}\b"),         # Unix 秒级时间戳
 ]
 _WS_RE = re.compile(r"[ \t]+")
 _BLANK_RE = re.compile(r"\n{3,}")
@@ -226,6 +234,13 @@ _RSC_PUSH_RE = re.compile(
     r'self\.__next_f\.push\(\[\d+,(".*?")\]\)', re.DOTALL,
 )
 
+# RSC Flight payload 前缀白名单：这些内部标记不是可读内容，跳过以避免
+# 把模块 id / hydration marker 当作文本误收。
+# - I[...]  / J[...]       hydration 信息
+# - HL[...] / M[...]       模块声明
+# - $L... / $S...          lazy / symbol 引用（含 "$S... 双引号变体）
+_RSC_SKIP_PREFIXES = ("I[", "J[", "HL[", "M[", '"$L', '"$S', "$L", "$S")
+
 
 def _extract_rsc_flight(html: str) -> str | None:
     """解析 Next.js App Router RSC Flight 数据流，提取文本内容。"""
@@ -234,14 +249,16 @@ def _extract_rsc_flight(html: str) -> str | None:
     if "BAILOUT_TO_CLIENT_SIDE_RENDERING" in html:
         return None
 
-    stream = ""
+    # 用 list + join 避免 O(n²) 的字符串累加，RSC 大页面下差距明显。
+    chunks: list[str] = []
     for m in _RSC_PUSH_RE.finditer(html):
         try:
-            stream += json.loads(m.group(1))
+            chunks.append(json.loads(m.group(1)))
         except (json.JSONDecodeError, Exception):
             continue
-    if not stream:
+    if not chunks:
         return None
+    stream = "".join(chunks)
 
     texts: list[str] = []
     for line in stream.split("\n"):
@@ -251,9 +268,7 @@ def _extract_rsc_flight(html: str) -> str | None:
         payload = line[colon + 1:]
         if not payload or payload == "null":
             continue
-        if payload.startswith("I[") or payload.startswith('"$S'):
-            continue
-        if payload.startswith("HL["):
+        if any(payload.startswith(p) for p in _RSC_SKIP_PREFIXES):
             continue
         try:
             obj = json.loads(payload)

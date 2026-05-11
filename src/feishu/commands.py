@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 
 from ..config import AppConfig
 from ..db import ChangeHistory, PushLog, Task, session_scope
+from ..fetcher.engine import SUPPORTED_IMPERSONATE
 from ..logger import get_today_log_path, logger, tail_log
 from ..risk_control import RiskController
 from . import cards
@@ -200,7 +201,8 @@ class CommandDispatcher:
         parser.add_argument("--type", default="html", choices=["html", "json"])
         parser.add_argument("--strategy", default="auto",
                             choices=["auto", "httpx", "curl_cffi", "playwright"])
-        parser.add_argument("--impersonate", default="chrome131")
+        parser.add_argument("--impersonate", default="chrome131",
+                            choices=SUPPORTED_IMPERSONATE)
         parser.add_argument("--selector", default=None)
         parser.add_argument("--json-path", dest="json_path", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
@@ -616,7 +618,10 @@ class CommandDispatcher:
 
         logger.info("🔍 诊断任务 #{} [{}]", task_id, t.name)
         try:
-            result = self.engine.fetch(t)
+            # /debug 也必须走域名限流 + 并发信号量，
+            # 避免用户快速连点诊断绕过风控导致目标站点反向封禁。
+            with self.risk.acquire_fetch(t.url):
+                result = self.engine.fetch(t)
         except Exception as e:
             return CommandResponse.err(f"抓取失败：{e}")
 
@@ -693,7 +698,8 @@ class CommandDispatcher:
         parser.add_argument("task_id", type=int)
         parser.add_argument("--strategy", default=None,
                             choices=["auto", "httpx", "curl_cffi", "playwright"])
-        parser.add_argument("--impersonate", default=None)
+        parser.add_argument("--impersonate", default=None,
+                            choices=(None, *SUPPORTED_IMPERSONATE))
         parser.add_argument("--selector", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
                             action="store_true", default=None)

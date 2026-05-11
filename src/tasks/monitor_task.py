@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import threading
+from collections import defaultdict
 from pathlib import Path
 
 from ..config import SNAPSHOT_DIR, AppConfig
-from ..db import ChangeHistory, Task, session_scope
+from ..db import ChangeHistory, Task, now_utc, session_scope
 from ..differ import compute_diff, filter_by_keywords
 from ..feishu import FeishuClient, cards
 from ..feishu.client import ensure_upload_size
 from ..fetcher import FetchEngine, FetchResult, content_hash, extract
 from ..logger import logger
 from ..risk_control import RiskController
-
-CIRCUIT_BREAKER_THRESHOLD = 20
 
 
 class MonitorRunner:
@@ -26,9 +25,34 @@ class MonitorRunner:
         self.engine = engine
         self.risk = risk
         self.feishu = feishu
+        # 每任务一把锁，避免同任务在 interval tick 与 /check 之间并发执行
+        # 破坏 pending 两阶段确认。defaultdict 自动懒初始化。
+        self._task_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
+        self._locks_guard = threading.Lock()
+
+    def _get_task_lock(self, task_id: int) -> threading.Lock:
+        """Thread-safe lock acquisition for a task id."""
+        with self._locks_guard:
+            return self._task_locks[task_id]
 
     def run_once(self, task_id: int) -> None:
-        """Run one check cycle; all exceptions caught internally."""
+        """Run one check cycle; all exceptions caught internally.
+
+        串行化同一任务的并发执行：interval tick 与 /check 手动触发、
+        快速连点 /check 等场景都会在此处排队，保证 pending/baseline 一致性。
+        若锁已被持有，表示已有一次执行在进行中，直接跳过（而非排队），
+        避免按钮抖动时产生意义不大的排队检查。
+        """
+        lock = self._get_task_lock(task_id)
+        if not lock.acquire(blocking=False):
+            logger.info("#{} already running, skip duplicate trigger", task_id)
+            return
+        try:
+            self._run_locked(task_id)
+        finally:
+            lock.release()
+
+    def _run_locked(self, task_id: int) -> None:
         task = self._load_task(task_id)
         if task is None:
             return
@@ -89,7 +113,7 @@ class MonitorRunner:
             t = s.get(Task, task_id)
             if t is None:
                 return
-            t.last_checked_at = datetime.utcnow()
+            t.last_checked_at = now_utc()
             t.total_checks += 1
             t.consecutive_failures = 0
 
@@ -103,7 +127,7 @@ class MonitorRunner:
             t.last_content_hash = new_hash
             t.last_snapshot_path = str(snap_path)
             t.last_strategy_used = strategy
-            t.last_checked_at = datetime.utcnow()
+            t.last_checked_at = now_utc()
             t.total_checks += 1
             t.consecutive_failures = 0
 
@@ -277,8 +301,8 @@ class MonitorRunner:
             t.last_content_hash = new_hash
             t.last_snapshot_path = str(snap_path)
             t.last_strategy_used = strategy
-            t.last_checked_at = datetime.utcnow()
-            t.last_changed_at = datetime.utcnow()
+            t.last_checked_at = now_utc()
+            t.last_changed_at = now_utc()
             t.total_checks += 1
             t.total_changes += 1
             t.consecutive_failures = 0
@@ -319,10 +343,10 @@ class MonitorRunner:
             if t is None:
                 return
             t.consecutive_failures += 1
-            t.last_checked_at = datetime.utcnow()
+            t.last_checked_at = now_utc()
             t.total_checks += 1
             fails, name, url = t.consecutive_failures, t.name, t.url
-            tripped = fails >= CIRCUIT_BREAKER_THRESHOLD
+            tripped = fails >= self.cfg.circuit_breaker_threshold
             if tripped:
                 t.enabled = False
 

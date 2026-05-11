@@ -10,7 +10,7 @@ import time
 from typing import Any
 
 from . import __version__
-from .config import AppConfig, load_config, validate_config
+from .config import SNAPSHOT_DIR, AppConfig, load_config, validate_config
 from .db import Task, init_db, session_scope
 from .feishu import CommandDispatcher, CommandResponse, FeishuClient, cards
 from .feishu.client import ensure_upload_size
@@ -48,6 +48,7 @@ class App:
         logger.info("═" * 60)
 
         self._seed_tasks_from_config()
+        self._cleanup_snapshots()
         self.scheduler.start()
         self._send_startup_card()
         self._start_ws()  # 阻塞
@@ -88,21 +89,90 @@ class App:
         if added:
             logger.info("🌱 同步 {} 个 YAML 任务到 DB", added)
 
-    def _send_startup_card(self) -> None:
-        """发送启动通知卡片。"""
-        with session_scope() as s:
-            count = s.query(Task).filter(Task.enabled.is_(True)).count()
+    def _cleanup_snapshots(self) -> None:
+        """清理旧快照/诊断文件，防止磁盘无限增长。
 
+        规则：
+        - ``task_<id>_latest.txt`` / ``task_<id>_latest.diff``：这些是基准快照，
+          和 ``Task.last_snapshot_path`` 强相关，不主动清理；
+        - ``task_<id>_pending.hash``：两阶段确认中间态，若对应任务不存在则清理；
+        - ``task_<id>_debug.html``：``/debug`` 命令产物，大于 ``debug_html_retention_days``
+          天的自动删除，避免累积占用磁盘；
+        - 其它孤儿文件（超出 ``snapshot_retention_days`` 天且不在任何已知 Task
+          的引用里）也一并清理。
+        """
+        try:
+            cutoff_debug = time.time() - self.cfg.debug_html_retention_days * 86400
+            cutoff_any = time.time() - self.cfg.snapshot_retention_days * 86400
+
+            # 收集当前仍在使用的快照路径，避免误删
+            with session_scope() as s:
+                rows = s.query(Task).all()
+                live_snapshots = {
+                    t.last_snapshot_path for t in rows
+                    if t.last_snapshot_path
+                }
+                live_task_ids = {t.id for t in rows}
+
+            removed = 0
+            for path in SNAPSHOT_DIR.glob("*"):
+                if not path.is_file():
+                    continue
+                name = path.name
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+
+                # debug html 单独用更短的保留期
+                if name.endswith("_debug.html"):
+                    if mtime < cutoff_debug:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    continue
+
+                # pending 哈希：对应任务不存在时直接清
+                if name.endswith("_pending.hash"):
+                    try:
+                        tid = int(name.split("_")[1])
+                    except (ValueError, IndexError):
+                        tid = None
+                    if tid is not None and tid not in live_task_ids:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    continue
+
+                # latest.txt / latest.diff 这类"基准文件"：仍在引用就保留
+                if str(path) in live_snapshots:
+                    continue
+
+                # 其余孤儿文件按通用保留期清理
+                if mtime < cutoff_any:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+
+            if removed:
+                logger.info("🧹 快照清理：删除 {} 个过期文件", removed)
+        except Exception as e:
+            logger.warning("快照清理异常（不影响启动）: {}", e)
+
+    def _send_startup_card(self) -> None:
+        """发送启动通知卡片。网络抖动/飞书 API 故障不应阻塞服务启动。"""
         chat_id = self.cfg.feishu.target_chat_id
         if not chat_id:
             logger.warning("未配置 FEISHU_TARGET_CHAT_ID，跳过启动卡片")
             return
+        try:
+            with session_scope() as s:
+                count = s.query(Task).filter(Task.enabled.is_(True)).count()
 
-        self.feishu.send_card(chat_id, cards.startup_card(
-            task_count=count,
-            default_interval=self.cfg.default_check_interval,
-            version=__version__,
-        ))
+            self.feishu.send_card(chat_id, cards.startup_card(
+                task_count=count,
+                default_interval=self.cfg.default_check_interval,
+                version=__version__,
+            ))
+        except Exception as e:
+            logger.warning("启动卡片发送失败（不影响服务运行）: {}", e)
 
     def _start_ws(self) -> None:
         """建立飞书 WebSocket 长连接。"""

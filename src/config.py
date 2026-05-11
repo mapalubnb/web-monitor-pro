@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,13 @@ class AppConfig:
     http_proxy: str = ""
     https_proxy: str = ""
 
+    # 连续失败多少次触发熔断（自动禁用任务并告警）
+    circuit_breaker_threshold: int = 20
+
+    # 快照/诊断文件保留期（天）。启动时会一次性清理超期文件。
+    snapshot_retention_days: int = 30
+    debug_html_retention_days: int = 7
+
     risk_control: RiskControlConfig = field(default_factory=RiskControlConfig)
     tasks: list[TaskConfig] = field(default_factory=list)
     default_headers: dict[str, str] = field(default_factory=dict)
@@ -84,6 +91,24 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         return {}
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _dc_from_dict(cls, data: dict[str, Any]) -> Any:
+    """Build a dataclass from a dict, silently dropping unknown keys.
+
+    YAML 里手抖写了不认识的字段（比如把 ``timeout`` 误拼成 ``time_out``）时，
+    直接传给 dataclass 会抛 ``TypeError: unexpected keyword``，让整个服务起不来。
+    这里改成静默丢弃未知字段并打一个 warning，保证可用性优先。
+    """
+    if not data:
+        return cls()
+    known = {f.name for f in fields(cls)}
+    unknown = set(data.keys()) - known
+    if unknown:
+        # 延迟导入 logger 避免循环依赖
+        from .logger import logger
+        logger.warning("{} 忽略未知字段: {}", cls.__name__, sorted(unknown))
+    return cls(**{k: v for k, v in data.items() if k in known})
 
 
 def _split_csv(value: str) -> list[str]:
@@ -119,8 +144,8 @@ def load_config(
     )
 
     yaml_data = _load_yaml(yaml_path)
-    risk_control = RiskControlConfig(**(yaml_data.get("risk_control") or {}))
-    tasks = [TaskConfig(**t) for t in (yaml_data.get("tasks") or [])]
+    risk_control = _dc_from_dict(RiskControlConfig, yaml_data.get("risk_control") or {})
+    tasks = [_dc_from_dict(TaskConfig, t) for t in (yaml_data.get("tasks") or [])]
     default_headers = yaml_data.get("default_headers") or {}
 
     return AppConfig(
@@ -134,6 +159,15 @@ def load_config(
         playwright_max_pages=_safe_int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20"), 20),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
+        circuit_breaker_threshold=_safe_int(
+            os.getenv("CIRCUIT_BREAKER_THRESHOLD", "20"), 20,
+        ),
+        snapshot_retention_days=_safe_int(
+            os.getenv("SNAPSHOT_RETENTION_DAYS", "30"), 30,
+        ),
+        debug_html_retention_days=_safe_int(
+            os.getenv("DEBUG_HTML_RETENTION_DAYS", "7"), 7,
+        ),
         risk_control=risk_control,
         tasks=tasks,
         default_headers=default_headers,

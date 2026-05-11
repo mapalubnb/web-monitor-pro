@@ -105,21 +105,23 @@ sudo journalctl -u web-monitor-pro -f
 
 | 命令 | 说明 |
 |------|------|
-| `/add <url> [options]` | 新增监控（支持 `--name` `--strategy` `--interval` `--type json` 等） |
-| `/list` | 列出所有任务 |
+| `/help` | 查看命令手册 |
+| `/add <url> [options]` | 新增监控（支持 `--name` `--strategy` `--interval` `--type json` `--selector` `--json-path` `--impersonate` `--extract-next-data` `--keyword` 等） |
+| `/list` | 列出所有任务（带管理按钮） |
 | `/check <id>` | 立即触发检查 |
 | `/pause <id>` / `/resume <id>` | 暂停 / 恢复 |
 | `/remove <id>` | 删除任务 |
-| `/history <id>` | 变更历史 |
-| `/keyword <id> add/remove <kw>` | 关键字过滤 |
-| `/interval <id> <seconds>` | 修改检查间隔 |
-| `/debug <id>` | 诊断（识别框架、嵌入数据、建议） |
+| `/history <id>` | 变更历史（最近 10 条） |
+| `/snapshot <id>` | 下载当前基准快照 |
+| `/keyword <id> add/remove/list/clear <kw>` | 关键字过滤管理（支持逗号/顿号批量） |
+| `/interval <id> <seconds>` | 修改检查间隔（≥10 秒） |
+| `/debug <id>` | 诊断（识别框架、嵌入数据、给出建议，附 HTML 下载） |
 | `/sniff <url>` | 抓包辅助（引导找 API） |
-| `/reset <id>` | 重置快照基准 |
+| `/reset <id> [--strategy --impersonate --selector --extract-next-data]` | 重置基准快照（可同时调整抓取参数） |
 | `/mute <30m/2h/1d>` / `/unmute` | 免打扰 |
-| `/log [--tail N]` | 查看日志（附文件下载） |
+| `/log [--tail N]` | 查看日志（附完整日志下载） |
 | `/status` | 服务健康状态 |
-| `/config` | 全局配置 |
+| `/config` | 全局配置概览 |
 
 完整说明：[docs/commands.md](docs/commands.md)
 
@@ -152,7 +154,7 @@ sudo journalctl -u web-monitor-pro -f
 - **单域名限流**：默认 10s 间隔（±30% 抖动，避免固定周期）
 - **并发控制**：信号量限制最大并发抓取数（默认 5）
 - **失败退避**：60s → 5min → 15min → 1h 阶梯退避
-- **熔断**：连续失败 20 次自动禁用任务
+- **熔断**：连续失败达到阈值（默认 20，可通过 `CIRCUIT_BREAKER_THRESHOLD` 配置）后自动禁用任务并告警
 - **推送冷却**：同任务 30s 内最多推一次
 - **噪音过滤**：变化占比 < 0.5% 视为噪音不推送
 - **Playwright stealth**：隐藏无头浏览器特征
