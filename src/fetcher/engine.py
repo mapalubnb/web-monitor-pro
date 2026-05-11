@@ -156,7 +156,7 @@ def _looks_like_binary_garbage(text: str) -> bool:
 
 _SPA_SHELL_MARKERS = (
     'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"',
-    'id="__nuxt"', "data-reactroot", "data-server-rendered",
+    "data-reactroot", "data-server-rendered",
     "self.__next_f",
 )
 
@@ -180,19 +180,28 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     lower = text.lower()
     if any(m in lower for m in _CHALLENGE_MARKERS):
         return False
-    # 有内嵌数据 → 可用（deep extract 能处理）
+
+    # CSR bailout（如 Next.js BAILOUT_TO_CLIENT_SIDE_RENDERING）
+    # → HTML 只是空壳，必须用浏览器渲染
+    if "bailout_to_client_side_rendering" in lower:
+        return False
+
+    # 有内嵌数据（__NEXT_DATA__ / __NUXT__ / JSON-LD 等）→ 可用
     if any(m in text for m in _EMBEDDED_DATA_MARKERS):
         return True
 
-    visible = _quick_visible_text(text)
-    visible_len = len(visible)
+    # RSC Flight 数据（self.__next_f 且非 bailout）→ deep extract 能处理
+    if "self.__next_f" in text:
+        return True
 
-    # 有 SPA 壳特征 + 可见文本少 → 空壳，需要升级
-    if any(m in lower for m in _SPA_SHELL_MARKERS) and visible_len < 400:
-        return False
+    # 检查是否是 SPA 空壳
+    has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
+    if has_spa_shell:
+        # 有 SPA 壳特征 → 需要较多可见文本才算可用
+        return len(_quick_visible_text(text)) >= 400
 
-    # 无 SPA 壳特征 → 可能就是小页面（如 Coming Soon），接受较短内容
-    return visible_len >= 50
+    # 无 SPA 壳特征 → 普通页面（可能很小如 Coming Soon），有内容就行
+    return True
 
 
 # ============================================================
