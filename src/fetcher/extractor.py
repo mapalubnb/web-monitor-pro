@@ -72,24 +72,36 @@ def extract(task: Task, result: FetchResult) -> str:
 # Playwright 渲染后 HTML（已是完整 DOM，无需 SPA/RSC 解析）
 # ============================================================
 def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
-    """从 Playwright 渲染后的 HTML 提取文本。跳过 SPA/RSC 解析。"""
+    """从 Playwright 渲染后的 HTML 提取文本。跳过 SPA/RSC 解析。
+
+    提取优先级：
+    1. CSS 选择器（用户指定，最精准）
+    2. body.innerText（浏览器实际可见文本，包含导航栏等完整页面内容）
+    3. 整页可见文本（从 HTML 重新解析，去掉 script/style）
+    4. trafilatura（正文提取，会过滤导航/页脚等"模板"内容，适合文章类页面）
+    5. meta 兜底
+
+    注意：trafilatura 放在 innerText 之后，因为它会主动剥离导航栏、
+    页头页脚等"样板"内容。对于需要监控全页面变化的场景，innerText
+    更忠实地反映浏览器中用户看到的完整内容。
+    """
     # 1) CSS 选择器（用户指定）
     if task.selector:
         text = _by_selector(html, task.selector)
         if text and len(text) >= MIN_USEFUL_LENGTH:
             return _normalize(text)
 
-    # 2) trafilatura 正文提取
-    text = _main_content(html)
-    if text and len(text) >= MIN_USEFUL_LENGTH:
-        return _normalize(text)
-
-    # 3) Playwright 直接提供的 body.innerText（浏览器可见文本，比 HTML 重解析更可靠）
+    # 2) Playwright 直接提供的 body.innerText（完整的浏览器可见文本）
     if inner_text and len(inner_text) >= MIN_USEFUL_LENGTH:
         return _normalize(inner_text)
 
-    # 4) 整页可见文本（body innerText 去掉 script/style）
+    # 3) 整页可见文本（从 HTML 重新解析）
     text = _html_to_text(html)
+    if text and len(text) >= MIN_USEFUL_LENGTH:
+        return _normalize(text)
+
+    # 4) trafilatura 正文提取（会过滤导航等模板内容，作为补充）
+    text = _main_content(html)
     if text and len(text) >= MIN_USEFUL_LENGTH:
         return _normalize(text)
 
