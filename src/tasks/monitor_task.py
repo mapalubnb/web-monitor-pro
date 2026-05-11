@@ -116,8 +116,8 @@ class MonitorRunner:
     def _handle_first(self, task: Task, result: FetchResult,
                       extracted: str, new_hash: str) -> None:
         logger.info(
-            "📸 #{} [{}] 建立首次快照（{} 字）",
-            task.id, task.name, len(extracted),
+            "📸 #{} [{}] 建立首次快照（{} 字，策略={}）",
+            task.id, task.name, len(extracted), result.strategy_used,
         )
         snap_path = self._save_snapshot(task.id, extracted)
 
@@ -127,6 +127,7 @@ class MonitorRunner:
                 return
             t.last_content_hash = new_hash
             t.last_snapshot_path = str(snap_path)
+            t.last_strategy_used = result.strategy_used
             t.last_checked_at = datetime.utcnow()
             t.total_checks += 1
             t.consecutive_failures = 0
@@ -174,31 +175,42 @@ class MonitorRunner:
     def _handle_change(self, task: Task, result: FetchResult,
                        extracted: str, new_hash: str) -> None:
         """
-        变化处理流程（二次确认机制）：
+        变化处理流程（二次确认机制 + 策略一致性检查）：
 
-        为了防止页面内容闪烁（如 SPA 渲染不稳定、CDN 缓存切换）导致
-        "一行被删了又马上加回来"的假阳性推送，采用二次确认：
+        为了防止页面内容闪烁（如 SPA 渲染不稳定、CDN 缓存切换）或策略
+        跳变（auto 模式不同策略产出不同内容）导致假阳性推送，采用：
 
-        1. 首次发现变化 → 写 pending 标记（不推送、不更新基准）
+        1. 首次发现变化 → 写 pending 标记（含 hash + 策略名）→ 不推送
         2. 下次检查时：
+           - 若策略与 pending 不一致 → 视为策略跳变导致的假变化 → 重置 pending
            - 若内容 hash 仍与 pending 一致 → 确认为真变化 → 推送
            - 若内容恢复为基准 hash → 闪烁 → 清除 pending、不推送
            - 若内容变成第三种 hash → 更新 pending、等待再次确认
         """
         keywords = list(task.keywords or [])
         has_keywords = any(kw and kw.strip() for kw in keywords)
+        current_strategy = result.strategy_used or ""
 
         pending_path = self._pending_path(task.id)
-        pending_hash = self._read_pending(pending_path)
+        pending_data = self._read_pending(pending_path)
+
+        # pending 格式升级：hash|strategy（兼容旧格式纯 hash）
+        pending_hash: str | None = None
+        pending_strategy: str = ""
+        if pending_data is not None:
+            if "|" in pending_data:
+                pending_hash, pending_strategy = pending_data.split("|", 1)
+            else:
+                pending_hash = pending_data
+                pending_strategy = ""
 
         if pending_hash is None:
-            # === 首次发现变化：标记 pending，不推送 ===
-            self._write_pending(pending_path, new_hash)
+            # === 首次发现变化：标记 pending（含策略），不推送 ===
+            self._write_pending(pending_path, f"{new_hash}|{current_strategy}")
             logger.info(
-                "⏳ #{} [{}] 发现变化，等待下次确认（防闪烁）",
-                task.id, task.name,
+                "⏳ #{} [{}] 发现变化（策略={}），等待下次确认（防闪烁）",
+                task.id, task.name, current_strategy,
             )
-            # 只更新检查时间，不动基准
             with session_scope() as s:
                 t = s.get(Task, task.id)
                 if t is None:
@@ -208,7 +220,25 @@ class MonitorRunner:
                 t.consecutive_failures = 0
             return
 
-        # === 有 pending 标记 ===
+        # === 策略一致性检查 ===
+        # 如果本次策略和写入 pending 时的策略不同，说明 auto 链选了不同路径
+        # 不同策略的提取结果结构不同，hash 对比无意义 → 重置 pending
+        if pending_strategy and current_strategy != pending_strategy:
+            self._write_pending(pending_path, f"{new_hash}|{current_strategy}")
+            logger.info(
+                "🔀 #{} [{}] 策略跳变（{}→{}），重置 pending 等待同策略确认",
+                task.id, task.name, pending_strategy, current_strategy,
+            )
+            with session_scope() as s:
+                t = s.get(Task, task.id)
+                if t is None:
+                    return
+                t.last_checked_at = datetime.utcnow()
+                t.total_checks += 1
+                t.consecutive_failures = 0
+            return
+
+        # === 有 pending 标记且策略一致 ===
         if new_hash == task.last_content_hash:
             # 恢复到基准 → 页面闪烁，清除 pending
             self._clear_pending(pending_path)
@@ -227,7 +257,7 @@ class MonitorRunner:
 
         if new_hash != pending_hash:
             # 变成了第三种内容 → 更新 pending，继续等
-            self._write_pending(pending_path, new_hash)
+            self._write_pending(pending_path, f"{new_hash}|{current_strategy}")
             logger.info(
                 "⏳ #{} [{}] 内容再次变化（不同于上次 pending），重新等待确认",
                 task.id, task.name,
@@ -241,12 +271,34 @@ class MonitorRunner:
                 t.consecutive_failures = 0
             return
 
-        # === new_hash == pending_hash：二次确认通过 → 确认变化 ===
+        # === new_hash == pending_hash 且策略一致：二次确认通过 → 确认变化 ===
         self._clear_pending(pending_path)
         logger.info(
-            "✅ #{} [{}] 二次确认通过，确认为真实变化",
-            task.id, task.name,
+            "✅ #{} [{}] 二次确认通过（策略={}），确认为真实变化",
+            task.id, task.name, current_strategy,
         )
+
+        # 策略一致性保护：如果基准快照是旧策略产出的，不同策略的提取结果
+        # 结构不同（如 curl_cffi 提取 SPA JSON vs playwright 提取 innerText），
+        # 直接 diff 会产出大量无意义差异。此时将当前内容作为新基准，跳过推送。
+        baseline_strategy = getattr(task, "last_strategy_used", None) or ""
+        if baseline_strategy and current_strategy != baseline_strategy:
+            logger.info(
+                "🔀 #{} [{}] 策略从 {} 切换到 {}，基准与当前不可比 → 静默更新基准",
+                task.id, task.name, baseline_strategy, current_strategy,
+            )
+            snap_path = self._save_snapshot(task.id, extracted)
+            with session_scope() as s:
+                t = s.get(Task, task.id)
+                if t is None:
+                    return
+                t.last_content_hash = new_hash
+                t.last_snapshot_path = str(snap_path)
+                t.last_strategy_used = current_strategy
+                t.last_checked_at = datetime.utcnow()
+                t.total_checks += 1
+                t.consecutive_failures = 0
+            return
 
         # 读取基准快照做 diff
         before = ""
@@ -274,6 +326,7 @@ class MonitorRunner:
                     return
                 t.last_content_hash = new_hash
                 t.last_snapshot_path = str(snap_path)
+                t.last_strategy_used = current_strategy
                 t.last_checked_at = datetime.utcnow()
                 t.total_checks += 1
                 t.consecutive_failures = 0
@@ -300,6 +353,7 @@ class MonitorRunner:
 
             t.last_content_hash = new_hash
             t.last_snapshot_path = str(snap_path)
+            t.last_strategy_used = current_strategy
             t.last_checked_at = datetime.utcnow()
             t.last_changed_at = datetime.utcnow()
             t.total_checks += 1

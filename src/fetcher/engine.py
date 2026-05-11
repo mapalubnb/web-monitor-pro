@@ -108,9 +108,12 @@ _EMBEDDED_DATA_MARKERS = (
     "__NEXT_DATA__", "__NUXT_DATA__", "__NUXT__",
     "__APOLLO_STATE__", "__INITIAL_STATE__", "__PRELOADED_STATE__",
     "__REDUX_STATE__", "__INITIAL_DATA__",
-    "application/ld+json",
+    "self.__next_f",  # Next.js App Router RSC Flight 数据（本质上是嵌入数据）
     "data-sveltekit-fetched", "__remixContext",
 )
+
+# JSON-LD 单独判断：它只是 SEO 元数据，不代表页面主要内容已获取
+_JSONLD_MARKER = "application/ld+json"
 
 _CHALLENGE_MARKERS = (
     "checking your browser", "cf-challenge", "cf_chl_opt",
@@ -205,20 +208,27 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     if _is_error_page(visible):
         return False
 
-    # 有内嵌结构化数据（__NEXT_DATA__ / __NUXT__ / JSON-LD 等）→ extract() 能处理
-    # 但如果同时存在 SPA 壳特征且可见文本极少，说明页面主要靠 CSR 渲染
-    # （例如 Next.js 站点的 JSON-LD 只有 SEO 元数据，真实内容靠 JS 渲染）
+    # 嵌入数据检测：分为"真实嵌入数据"和"仅 JSON-LD SEO 元数据"
     has_embedded = any(m in text for m in _EMBEDDED_DATA_MARKERS)
+    has_jsonld_only = (not has_embedded) and (_JSONLD_MARKER in lower)
     has_spa_shell = any(m in lower for m in _SPA_SHELL_MARKERS)
 
     if has_embedded:
-        if has_spa_shell and len(visible) < 200:
-            # SPA 壳 + 嵌入数据但可见文本极少 → 不可信，需要 Playwright
+        # 有真实嵌入数据（__NEXT_DATA__ / __NUXT__ / RSC Flight 等）
+        # → 即使可见文本少，deep extract 也能从中提取内容
+        # 只有当可见文本极端少（<50字）且同时有 SPA 壳时才拒绝
+        if has_spa_shell and len(visible) < 50:
             return False
         return True
 
-    # 有 SPA 壳特征但无内嵌数据 → 不可信，让 auto 链走 deep extract → Playwright
-    # 包括: id="__next"/id="root"/self.__next_f/data-reactroot 等
+    if has_jsonld_only:
+        # 仅有 JSON-LD（SEO 元数据）→ 不视为真正的嵌入数据
+        # 需要足够的可见文本才认为页面内容完整
+        if has_spa_shell:
+            return False
+        return len(visible) >= 200
+
+    # 有 SPA 壳特征但无任何嵌入数据 → 不可信，让 auto 链走 deep extract → Playwright
     if has_spa_shell:
         return False
 
@@ -474,7 +484,66 @@ class FetchEngine:
             result = self._fetch_httpx(task, headers)
             return self._upgrade_if_empty(task, headers, result)
 
-        # auto：curl_cffi → httpx → 深度提取 → Playwright
+        # auto 模式：优先尝试上次成功的策略（策略锁定）
+        last = getattr(task, "last_strategy_used", None) or ""
+        if last:
+            preferred = self._fetch_with_last_strategy(task, headers, last)
+            if preferred is not None:
+                return preferred
+            logger.info(
+                "🔄 [{}] 上次策略 {} 本次失效，回退 auto 全链",
+                task.name, last,
+            )
+
+        # auto 全链：curl_cffi → httpx → 深度提取 → Playwright
+        return self._auto_chain(task, headers)
+
+    def _fetch_with_last_strategy(
+        self, task: Task, headers: dict, last: str,
+    ) -> FetchResult | None:
+        """尝试用上次成功的策略，成功返回 FetchResult，失效返回 None。"""
+        if last == "playwright":
+            result = self._fetch_playwright(task, headers)
+            return result if result.ok else None
+
+        if last.endswith("→deep"):
+            # 上次是 deep extract 成功的：先抓 HTML，再 deep extract
+            base_strategy = last.split("→")[0]
+            html_result = self._fetch_by_name(task, headers, base_strategy)
+            if html_result.ok and html_result.content:
+                deep = self._try_deep_extract(task, html_result)
+                if deep is not None:
+                    return deep
+            return None
+
+        if last.startswith("curl_cffi") or last == "httpx":
+            result = self._fetch_by_name(task, headers, last)
+            if result.ok and _is_content_usable(result, task):
+                return result
+            # HTML 拿到了但不 usable → 尝试 deep extract
+            if result.ok and result.content:
+                deep = self._try_deep_extract(task, result)
+                if deep is not None:
+                    return deep
+            return None
+
+        # 未知策略，跳过
+        return None
+
+    def _fetch_by_name(
+        self, task: Task, headers: dict, name: str,
+    ) -> FetchResult:
+        """按策略名调用对应的抓取方法。"""
+        if name.startswith("curl_cffi"):
+            return self._fetch_curl_cffi(task, headers)
+        if name == "httpx":
+            return self._fetch_httpx(task, headers)
+        if name == "playwright":
+            return self._fetch_playwright(task, headers)
+        return self._fetch_curl_cffi(task, headers)
+
+    def _auto_chain(self, task: Task, headers: dict) -> FetchResult:
+        """auto 全链：curl_cffi → httpx → 深度提取 → Playwright。"""
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
             return result

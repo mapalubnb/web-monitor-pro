@@ -59,6 +59,7 @@ class Task(Base):
     last_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_snapshot_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_strategy_used: Mapped[str | None] = mapped_column(String(64), nullable=True)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
     total_checks: Mapped[int] = mapped_column(Integer, default=0)
     total_changes: Mapped[int] = mapped_column(Integer, default=0)
