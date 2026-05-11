@@ -297,23 +297,35 @@ class _BrowserPool:
 
             page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
 
-            # 等待 DOM 内有实质内容（CSR 站点异步加载数据需要额外时间）
-            content = page.content()
-            body_text = page.evaluate(
-                "() => (document.body && document.body.innerText || '').trim()"
+            # CSR 站点（如链上数据页面）需要额外等待异步数据加载
+            # 循环检查：每轮等 5s + networkidle，最多 3 轮（共 ~15s 额外）
+            _JS_GET_LEN = (
+                "() => (document.body && document.body.innerText || '').trim().length"
             )
-            if len(body_text) < 200:
-                # 内容太少，可能异步数据还没加载完，等待 DOM 变化
+            _JS_WAIT_LEN = (
+                "() => (document.body && document.body.innerText || '')"
+                ".trim().length >= 200"
+            )
+            for _wait_round in range(3):
+                body_len = page.evaluate(_JS_GET_LEN)
+                if body_len >= 200:
+                    break
+                logger.debug(
+                    "🎭 [{}] 渲染等待第{}轮（body={}字）",
+                    url, _wait_round + 1, body_len,
+                )
                 try:
-                    page.wait_for_function(
-                        "() => (document.body && document.body.innerText || '').trim().length >= 200",
-                        timeout=8000,
-                    )
-                    content = page.content()
+                    page.wait_for_function(_JS_WAIT_LEN, timeout=5000)
+                    break
                 except Exception:
-                    # 超时也没关系，用已有内容
+                    pass
+                # 再等一轮 networkidle（捕获晚到的异步请求）
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
                     pass
 
+            content = page.content()
             self._page_count += 1
 
             return FetchResult(

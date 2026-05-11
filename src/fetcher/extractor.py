@@ -59,8 +59,39 @@ def extract(task: Task, result: FetchResult) -> str:
     if strategy.endswith("→deep"):
         return _normalize(content)
 
-    # HTML（包括 Playwright 返回的渲染后 HTML）
+    # Playwright 渲染后的 HTML 已是完整 DOM，跳过 SPA/RSC 解析
+    # 直接提取可见文本（selector → trafilatura → 全文 → meta）
+    if "playwright" in strategy:
+        return _extract_rendered_html(content, task)
+
+    # 原始 HTML（curl_cffi / httpx）
     return _extract_html(content, task)
+
+
+# ============================================================
+# Playwright 渲染后 HTML（已是完整 DOM，无需 SPA/RSC 解析）
+# ============================================================
+def _extract_rendered_html(html: str, task: Task) -> str:
+    """从 Playwright 渲染后的 HTML 提取文本。跳过 SPA/RSC 解析。"""
+    # 1) CSS 选择器（用户指定）
+    if task.selector:
+        text = _by_selector(html, task.selector)
+        if text and len(text) >= MIN_USEFUL_LENGTH:
+            return _normalize(text)
+
+    # 2) trafilatura 正文提取
+    text = _main_content(html)
+    if text and len(text) >= MIN_USEFUL_LENGTH:
+        return _normalize(text)
+
+    # 3) 整页可见文本（body innerText 去掉 script/style）
+    text = _html_to_text(html)
+    if text and len(text) >= MIN_USEFUL_LENGTH:
+        return _normalize(text)
+
+    # 4) meta 兜底
+    meta = _extract_meta(html)
+    return _normalize(meta) if meta else ""
 
 
 # ============================================================
