@@ -154,6 +154,13 @@ def _looks_like_binary_garbage(text: str) -> bool:
     return bad / len(sample) > 0.30
 
 
+_SPA_SHELL_MARKERS = (
+    'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"',
+    'id="__nuxt"', "data-reactroot", "data-server-rendered",
+    "self.__next_f",
+)
+
+
 def _is_content_usable(result: FetchResult, task: Task) -> bool:
     """判断抓取内容是否足够（避免把 SPA 空壳或乱码当成正常结果）。"""
     if not result.ok or not (result.content or "").strip():
@@ -168,15 +175,24 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     if task.type == "json":
         return True
 
-    if len(text) < 500:
+    if len(text) < 200:
         return False
     lower = text.lower()
     if any(m in lower for m in _CHALLENGE_MARKERS):
         return False
-    # 有内嵌数据或足够可见文本 → 可用
+    # 有内嵌数据 → 可用（deep extract 能处理）
     if any(m in text for m in _EMBEDDED_DATA_MARKERS):
         return True
-    return len(_quick_visible_text(text)) >= 400
+
+    visible = _quick_visible_text(text)
+    visible_len = len(visible)
+
+    # 有 SPA 壳特征 + 可见文本少 → 空壳，需要升级
+    if any(m in lower for m in _SPA_SHELL_MARKERS) and visible_len < 400:
+        return False
+
+    # 无 SPA 壳特征 → 可能就是小页面（如 Coming Soon），接受较短内容
+    return visible_len >= 50
 
 
 # ============================================================
@@ -281,7 +297,24 @@ class _BrowserPool:
             )
 
             page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+
+            # 等待 DOM 内有实质内容（CSR 站点异步加载数据需要额外时间）
             content = page.content()
+            body_text = page.evaluate(
+                "() => (document.body && document.body.innerText || '').trim()"
+            )
+            if len(body_text) < 200:
+                # 内容太少，可能异步数据还没加载完，等待 DOM 变化
+                try:
+                    page.wait_for_function(
+                        "() => (document.body && document.body.innerText || '').trim().length >= 200",
+                        timeout=8000,
+                    )
+                    content = page.content()
+                except Exception:
+                    # 超时也没关系，用已有内容
+                    pass
+
             self._page_count += 1
 
             return FetchResult(
