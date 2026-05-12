@@ -208,14 +208,131 @@ class MonitorRunner:
                          task.id, task.name)
         self._touch_task(task.id)
 
-    # --- Case 3: Change detected (with two-phase confirmation) ---
+    # --- Case 3a: Keyword-mode change (skip two-phase for dynamic pages) ---
+
+    def _handle_change_keyword_mode(self, task: Task, result: FetchResult,
+                                     extracted: str, new_hash: str,
+                                     keywords: list[str], strategy: str) -> None:
+        """Keyword-mode fast path: skip hash-stability two-phase confirmation.
+
+        On dynamic pages, content hash changes every check, making the standard
+        two-phase confirmation impossible to pass ("content changed again" loop).
+
+        For keyword-mode tasks, the keyword filter itself provides sufficient
+        noise rejection — only changes containing the specified keywords will
+        trigger a push. So we directly diff against baseline each time.
+
+        Uses a cooldown-based push deduplication instead of hash confirmation:
+        RiskController.should_push_change already enforces push_cooldown_seconds.
+        """
+        # Strategy drift protection: baseline from different strategy -> silent rebase
+        baseline_strategy = getattr(task, "last_strategy_used", None) or ""
+        if baseline_strategy and strategy != baseline_strategy:
+            logger.info("#{} [{}] keyword-mode: strategy switched ({}->{}), silent rebase",
+                        task.id, task.name, baseline_strategy, strategy)
+            snap_path = self._save_snapshot(task.id, extracted)
+            self._update_baseline(task.id, new_hash, snap_path, strategy)
+            self._clear_pending(self._pending_path(task.id))
+            return
+
+        # Compute diff against baseline
+        before = ""
+        if task.last_snapshot_path and Path(task.last_snapshot_path).exists():
+            try:
+                before = Path(task.last_snapshot_path).read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("failed to read baseline snapshot: {}", e)
+
+        full_diff = compute_diff(before, extracted, is_json=(task.type == "json"))
+        diff = filter_by_keywords(full_diff, keywords)
+
+        # Keyword filter: no relevant change -> silent baseline advance
+        if not diff.changed:
+            logger.debug("#{} [{}] keyword-mode: change doesn't match keywords, silent advance",
+                         task.id, task.name)
+            snap_path = self._save_snapshot(task.id, extracted)
+            self._update_baseline(task.id, new_hash, snap_path, strategy)
+            self._clear_pending(self._pending_path(task.id))
+            return
+
+        # Keywords matched! Persist change and push.
+        self._clear_pending(self._pending_path(task.id))
+        logger.info("#{} [{}] keyword-mode: keywords matched in diff, processing push",
+                    task.id, task.name)
+
+        snap_path = self._save_snapshot(task.id, extracted)
+        diff_path = self._save_diff(task.id, diff.unified_diff)
+
+        with session_scope() as s:
+            t = s.get(Task, task.id)
+            if t is None:
+                return
+            matched = self.risk.matched_keywords(diff, keywords)
+            s.add(ChangeHistory(
+                task_id=task.id, added_lines=len(diff.added_lines),
+                removed_lines=len(diff.removed_lines),
+                change_ratio=diff.change_ratio,
+                matched_keywords=matched, diff_path=str(diff_path)))
+
+            t.last_content_hash = new_hash
+            t.last_snapshot_path = str(snap_path)
+            t.last_strategy_used = strategy
+            t.last_checked_at = now_utc()
+            t.last_changed_at = now_utc()
+            t.total_checks += 1
+            t.total_changes += 1
+            t.consecutive_failures = 0
+            task_name, task_url = t.name, t.url
+
+        # Push decision (respects mute, cooldown, etc.)
+        should_push, reason = self.risk.should_push_change(task.id, diff, keywords)
+        if not should_push:
+            logger.info("#{} keyword-mode change suppressed: {}", task.id, reason)
+            return
+
+        logger.info("#{} [{}] keyword-mode pushing change: +{} -{} ratio={:.2%}",
+                    task.id, task_name, len(diff.added_lines),
+                    len(diff.removed_lines), diff.change_ratio)
+
+        chat_id = self.cfg.feishu.target_chat_id
+        if not chat_id:
+            return
+
+        card = cards.change_card(
+            task_id=task.id, task_name=task_name, url=task_url,
+            added_count=len(diff.added_lines), removed_count=len(diff.removed_lines),
+            change_ratio=diff.change_ratio, diff_summary=diff.summary,
+            strategy=result.strategy_used, matched_keywords=matched,
+            has_diff_file=bool(diff.unified_diff), keyword_filtered=True)
+
+        file_path = ensure_upload_size(diff_path) if diff_path and diff_path.exists() else None
+        card_msg_id, _ = self.feishu.send_card_and_file(
+            chat_id, card, file_path,
+            f"[{task_name}] diff.txt" if file_path else "")
+        self.risk.mark_pushed(task.id, kind="change", message_id=card_msg_id)
+
+    # --- Case 3b: Non-keyword change (with two-phase confirmation) ---
 
     def _handle_change(self, task: Task, result: FetchResult,
                        extracted: str, new_hash: str) -> None:
-        """Two-phase confirmation with strategy consistency checks."""
+        """Two-phase confirmation with strategy consistency checks.
+
+        For keyword-mode tasks on dynamic pages, skip strict hash-based
+        two-phase confirmation and directly evaluate keyword matches against
+        the baseline diff. This prevents the "content changed again" loop
+        where every check produces a new hash and confirmation never passes.
+        """
         keywords = list(task.keywords or [])
         has_keywords = any(kw and kw.strip() for kw in keywords)
         strategy = result.strategy_used or ""
+
+        # --- Keyword-mode fast path for dynamic pages ---
+        # When keywords are configured, the keyword filter itself acts as
+        # the "confirmation" — only genuine keyword-relevant changes push.
+        # No need for hash-stability confirmation on noisy dynamic pages.
+        if has_keywords:
+            self._handle_change_keyword_mode(task, result, extracted, new_hash, keywords, strategy)
+            return
 
         pending_path = self._pending_path(task.id)
         pending_hash, pending_strategy = self._read_pending(pending_path)
@@ -273,15 +390,7 @@ class MonitorRunner:
                 logger.warning("failed to read baseline snapshot: {}", e)
 
         full_diff = compute_diff(before, extracted, is_json=(task.type == "json"))
-        diff = filter_by_keywords(full_diff, keywords) if has_keywords else full_diff
-
-        # Keyword mode: filtered diff empty -> silent baseline advance
-        if has_keywords and not diff.changed:
-            logger.info("#{} [{}] change doesn't match keywords, silent advance",
-                        task.id, task.name)
-            snap_path = self._save_snapshot(task.id, extracted)
-            self._update_baseline(task.id, new_hash, snap_path, strategy)
-            return
+        diff = full_diff
 
         # Persist change
         snap_path = self._save_snapshot(task.id, extracted)
