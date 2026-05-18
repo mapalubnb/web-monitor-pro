@@ -326,6 +326,14 @@ class _BrowserPool:
         if result.ok and _is_error_page(result.inner_text):
             logger.info("[{}] error page detected, retrying without resource blocking", url)
             result = self._render_once(url, headers, timeout, browser, block_resources=False)
+
+        # If stealth + route-handler mode timed out, retry in bare mode
+        # (no stealth, no route interception).  page.route("**/*") can
+        # interfere with navigation events on some sites, causing goto to
+        # hang until timeout even though the site is reachable.
+        if not result.ok and "Timeout" in (result.error or ""):
+            logger.info("[{}] stealth mode timed out, retrying in bare mode", url)
+            result = self._render_bare(url, headers, timeout, browser)
         return result
 
     def _render_once(self, url: str, headers: dict, timeout: int,
@@ -422,6 +430,62 @@ class _BrowserPool:
         except Exception as e:
             return FetchResult(ok=False, url=url, strategy_used="playwright",
                                error=f"{type(e).__name__}: {e}")
+        finally:
+            for obj in (page, context):
+                if obj:
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
+
+    def _render_bare(self, url: str, headers: dict, timeout: int,
+                     browser: Any) -> FetchResult:
+        """Bare-bones render: no stealth, no route interception.
+
+        Some sites hang when page.route("**/*") intercepts the main
+        document request, or when stealth scripts conflict with the page's
+        own JS.  This fallback uses a clean context identical to running
+        Playwright directly from the command line.
+        """
+        context = page = None
+        try:
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US", timezone_id="America/New_York",
+            )
+            page = context.new_page()
+            ms = timeout * 1000
+
+            page.goto(url, wait_until="commit", timeout=ms)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=ms)
+            except Exception:
+                pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+            # Poll for body content
+            for _ in range(5):
+                if page.evaluate(_JS_BODY_LEN) >= 200:
+                    break
+                try:
+                    page.wait_for_function(_JS_BODY_READY, timeout=5000)
+                    break
+                except Exception:
+                    pass
+
+            inner_text = page.evaluate(_JS_INNER_TEXT)
+            content = page.content()
+            self._page_count += 1
+            logger.info("[{}] bare mode render ok ({} chars)", url, len(inner_text))
+            return FetchResult(ok=True, url=url, status_code=200, content=content,
+                               content_type="text/html", strategy_used="playwright",
+                               inner_text=inner_text)
+        except Exception as e:
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error=f"bare: {type(e).__name__}: {e}")
         finally:
             for obj in (page, context):
                 if obj:
