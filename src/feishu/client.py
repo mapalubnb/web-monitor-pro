@@ -47,7 +47,9 @@ class FeishuClient:
             .log_level(lark.LogLevel.WARNING)  # 降低 SDK 自身日志噪音
             .build()
         )
-        logger.info("🤖 飞书 SDK 客户端已初始化（App ID: {}...）", self.cfg.app_id[:8])
+        # Mask credentials: show at most first 4 chars + "***"
+        masked_id = self.cfg.app_id[:4] + "***" if len(self.cfg.app_id) > 4 else "***"
+        logger.info("🤖 飞书 SDK 客户端已初始化（App ID: {}）", masked_id)
         return client
 
     # --------------------------------------------------------
@@ -269,15 +271,20 @@ def ensure_upload_size(path: Path, max_mb: int = 28) -> Path:
     if path.stat().st_size <= max_bytes:
         return path
 
-    truncated = path.with_suffix(path.suffix + ".truncated")
-    with path.open("rb") as src, truncated.open("wb") as dst:
-        dst.write(src.read(max_bytes))
-        dst.write(b"\n\n[... file truncated due to size limit ...]\n")
-    logger.warning(
-        "📎 文件 {} 超过 {}MB，已截断为 {}",
-        path.name, max_mb, truncated.name,
-    )
-    return truncated
+    import tempfile
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".truncated" + path.suffix, dir=path.parent)
+        with path.open("rb") as src, os.fdopen(fd, "wb") as dst:
+            dst.write(src.read(max_bytes))
+            dst.write(b"\n\n[... file truncated due to size limit ...]\n")
+        logger.warning(
+            "📎 文件 {} 超过 {}MB，已截断", path.name, max_mb,
+        )
+        return Path(tmp_path)
+    except Exception as e:
+        logger.warning("截断文件失败，使用原文件: {}", e)
+        return path
 
 
 __all__.append("ensure_upload_size")

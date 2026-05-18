@@ -133,8 +133,9 @@ def _sqlite_pragmas(dbapi_conn, _conn_record):
         cur.execute("PRAGMA foreign_keys=ON")
         cur.execute("PRAGMA busy_timeout=5000")
         cur.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        from .logger import logger
+        logger.error("SQLite pragma 设置失败（数据库可能在非 WAL 模式下运行）: {}", exc)
 
 
 _SessionFactory = sessionmaker(bind=_ENGINE, expire_on_commit=False, autoflush=False)

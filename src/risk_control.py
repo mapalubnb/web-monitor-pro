@@ -81,18 +81,14 @@ class RiskController:
             if (now - self._last_cleanup) < _CLEANUP_INTERVAL:
                 return
             self._last_cleanup = now
-            expired_domains = [
-                d for d, ts in self._domain_last_hit.items()
-                if (now - ts) > _DOMAIN_EXPIRE
-            ]
-            for d in expired_domains:
-                del self._domain_last_hit[d]
-            expired_tasks = [
-                tid for tid, ts in self._cooldown_mem.items()
-                if (now - ts) > _COOLDOWN_EXPIRE
-            ]
-            for tid in expired_tasks:
-                del self._cooldown_mem[tid]
+            self._domain_last_hit = {
+                d: ts for d, ts in self._domain_last_hit.items()
+                if (now - ts) <= _DOMAIN_EXPIRE
+            }
+            self._cooldown_mem = {
+                tid: ts for tid, ts in self._cooldown_mem.items()
+                if (now - ts) <= _COOLDOWN_EXPIRE
+            }
 
     def next_interval_after_failure(self, consecutive_failures: int, base: int) -> int:
         """失败后的退避间隔（秒）。"""
@@ -137,14 +133,15 @@ class RiskController:
 
     def mark_pushed(self, task_id: int, kind: str = "change",
                     message_id: str | None = None) -> None:
-        """记录推送（冷却 + DB 日志）。DB 失败不抛出，只告警。"""
-        with self._lock:
-            self._cooldown_mem[task_id] = time.time()
+        """记录推送（冷却 + DB 日志）。DB 先写，成功后再记内存冷却。"""
         try:
             with session_scope() as s:
                 s.add(PushLog(task_id=task_id, kind=kind, message_id=message_id))
         except Exception as e:
-            logger.warning("写 PushLog 失败（冷却内存已记录，不影响推送）: {}", e)
+            logger.error("写 PushLog 失败，跳过内存冷却以保持一致性: {}", e)
+            return
+        with self._lock:
+            self._cooldown_mem[task_id] = time.time()
 
     def should_push_change(
         self, task_id: int, diff: DiffResult, keywords: list[str]

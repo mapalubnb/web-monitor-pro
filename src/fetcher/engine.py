@@ -338,12 +338,34 @@ class _BrowserPool:
 
     def _render_once(self, url: str, headers: dict, timeout: int,
                      browser: Any, *, block_resources: bool) -> FetchResult:
+        """Full render with stealth + route interception."""
+        return self._render_core(
+            url, headers, timeout, browser,
+            use_stealth=True, block_resources=block_resources,
+            error_prefix="",
+        )
+
+    def _render_bare(self, url: str, headers: dict, timeout: int,
+                     browser: Any) -> FetchResult:
+        """Bare-bones render: no stealth, no route interception.
+
+        Fallback when stealth + routing causes navigation timeouts.
+        """
+        result = self._render_core(
+            url, headers, timeout, browser,
+            use_stealth=False, block_resources=False,
+            error_prefix="bare: ",
+        )
+        if result.ok:
+            logger.info("[{}] bare mode render ok ({} chars)", url, len(result.inner_text))
+        return result
+
+    def _render_core(self, url: str, headers: dict, timeout: int,
+                     browser: Any, *, use_stealth: bool,
+                     block_resources: bool, error_prefix: str) -> FetchResult:
+        """Shared render logic for both stealth and bare modes."""
         context = page = None
         try:
-            # Only override UA if the caller explicitly provided a User-Agent
-            # via task.headers. Otherwise we let Chromium pick its native UA so
-            # that navigator.userAgent and the Sec-CH-UA client hints stay
-            # consistent — high-end fingerprinting trips on mismatches.
             user_agent = headers.get("__override_user_agent__")
             ctx_kwargs: dict[str, Any] = dict(
                 viewport={"width": 1920, "height": 1080},
@@ -352,62 +374,56 @@ class _BrowserPool:
             if user_agent:
                 ctx_kwargs["user_agent"] = user_agent
             context = browser.new_context(**ctx_kwargs)
-            try:
-                from playwright_stealth import stealth_sync
-                stealth_sync(context)
-            except ImportError:
-                pass
+
+            if use_stealth:
+                try:
+                    from playwright_stealth import stealth_sync
+                    stealth_sync(context)
+                except ImportError:
+                    pass
 
             page = context.new_page()
 
-            def _route_handler(route):
-                req = route.request
-                # Always block heavy resource types when requested
-                if block_resources and req.resource_type in self._BLOCK_TYPES:
-                    return route.abort()
-                # Always block external domains that commonly hang in
-                # restricted networks (Google Fonts, analytics, etc.)
-                try:
-                    from urllib.parse import urlparse
-                    host = urlparse(req.url).hostname or ""
-                    if host in self._BLOCK_DOMAINS:
+            if use_stealth or block_resources:
+                _blocked_types = self._BLOCK_TYPES if block_resources else set()
+                _blocked_domains = self._BLOCK_DOMAINS
+
+                def _route_handler(route):
+                    req = route.request
+                    if _blocked_types and req.resource_type in _blocked_types:
                         return route.abort()
-                except Exception:
-                    pass
-                return route.continue_()
+                    try:
+                        from urllib.parse import urlparse
+                        host = urlparse(req.url).hostname or ""
+                        if host in _blocked_domains:
+                            return route.abort()
+                    except Exception:
+                        pass
+                    return route.continue_()
 
-            page.route("**/*", _route_handler)
+                page.route("**/*", _route_handler)
 
-            # Graduated wait strategy to handle diverse site types:
-            #   1. Try domcontentloaded (covers most sites)
-            #   2. On timeout, fall back to "commit" (fires on first
-            #      server response — handles slow Cloudflare challenges)
-            #   3. Best-effort networkidle + body-length polling
+            # Graduated wait strategy
             ms = timeout * 1000
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=ms)
             except Exception as goto_err:
                 if "Timeout" not in type(goto_err).__name__:
                     raise
-                # domcontentloaded timed out — the server is very slow
-                # (Cloudflare challenge, geo-blocking, etc.).  Retry with
-                # the most lenient wait: "commit" fires as soon as the
-                # server starts sending *any* response bytes.
                 logger.info("[{}] domcontentloaded timeout, retrying with commit", url)
                 page.goto(url, wait_until="commit", timeout=ms)
-                # Give the page extra time to finish parsing after commit
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=ms)
                 except Exception:
                     pass
 
-            # Best-effort: wait for network to settle, but don't fail if
-            # the site keeps long-lived connections open.
+            # Best-effort networkidle
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
 
+            # Poll for body content
             for _ in range(5):
                 if page.evaluate(_JS_BODY_LEN) >= 200:
                     break
@@ -429,63 +445,7 @@ class _BrowserPool:
                                inner_text=inner_text)
         except Exception as e:
             return FetchResult(ok=False, url=url, strategy_used="playwright",
-                               error=f"{type(e).__name__}: {e}")
-        finally:
-            for obj in (page, context):
-                if obj:
-                    try:
-                        obj.close()
-                    except Exception:
-                        pass
-
-    def _render_bare(self, url: str, headers: dict, timeout: int,
-                     browser: Any) -> FetchResult:
-        """Bare-bones render: no stealth, no route interception.
-
-        Some sites hang when page.route("**/*") intercepts the main
-        document request, or when stealth scripts conflict with the page's
-        own JS.  This fallback uses a clean context identical to running
-        Playwright directly from the command line.
-        """
-        context = page = None
-        try:
-            context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US", timezone_id="America/New_York",
-            )
-            page = context.new_page()
-            ms = timeout * 1000
-
-            page.goto(url, wait_until="commit", timeout=ms)
-            try:
-                page.wait_for_load_state("domcontentloaded", timeout=ms)
-            except Exception:
-                pass
-            try:
-                page.wait_for_load_state("networkidle", timeout=8000)
-            except Exception:
-                pass
-
-            # Poll for body content
-            for _ in range(5):
-                if page.evaluate(_JS_BODY_LEN) >= 200:
-                    break
-                try:
-                    page.wait_for_function(_JS_BODY_READY, timeout=5000)
-                    break
-                except Exception:
-                    pass
-
-            inner_text = page.evaluate(_JS_INNER_TEXT)
-            content = page.content()
-            self._page_count += 1
-            logger.info("[{}] bare mode render ok ({} chars)", url, len(inner_text))
-            return FetchResult(ok=True, url=url, status_code=200, content=content,
-                               content_type="text/html", strategy_used="playwright",
-                               inner_text=inner_text)
-        except Exception as e:
-            return FetchResult(ok=False, url=url, strategy_used="playwright",
-                               error=f"bare: {type(e).__name__}: {e}")
+                               error=f"{error_prefix}{type(e).__name__}: {e}")
         finally:
             for obj in (page, context):
                 if obj:
@@ -512,7 +472,10 @@ class _BrowserPool:
 
     def close(self) -> None:
         """Public shutdown (e.g. on application exit)."""
+        # If executor was never created but browser was somehow started
+        # (shouldn't happen, but defensive), clean up directly.
         if self._executor is None:
+            self._close_internal()
             return
         try:
             self._executor.submit(self._close_internal).result(timeout=10)

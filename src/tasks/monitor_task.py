@@ -35,6 +35,11 @@ class MonitorRunner:
         with self._locks_guard:
             return self._task_locks[task_id]
 
+    def cleanup_task_lock(self, task_id: int) -> None:
+        """Remove lock for a deleted task to prevent memory leak."""
+        with self._locks_guard:
+            self._task_locks.pop(task_id, None)
+
     def run_once(self, task_id: int) -> None:
         """Run one check cycle; all exceptions caught internally.
 

@@ -154,7 +154,7 @@ def load_config(
         max_concurrent_fetch=_safe_int(os.getenv("MAX_CONCURRENT_FETCH", "5"), 5),
         request_timeout=_safe_int(os.getenv("REQUEST_TIMEOUT", "30"), 30),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        enable_playwright=os.getenv("ENABLE_PLAYWRIGHT", "true").lower() in ("true", "1", "yes"),
+        enable_playwright=os.getenv("ENABLE_PLAYWRIGHT", "true").strip().lower() in ("true", "1", "yes"),
         playwright_timeout=_safe_int(os.getenv("PLAYWRIGHT_TIMEOUT", "30"), 30),
         playwright_max_pages=_safe_int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20"), 20),
         http_proxy=os.getenv("HTTP_PROXY", ""),

@@ -363,7 +363,8 @@ def _by_selector(html: str, selector: str) -> str:
         return "\n\n".join(
             t for t in (n.text(separator="\n", strip=True) for n in nodes) if t
         )
-    except Exception:
+    except Exception as e:
+        logger.warning("CSS 选择器 '{}' 解析失败: {}", selector, e)
         return ""
 
 

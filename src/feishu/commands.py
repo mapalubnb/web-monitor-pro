@@ -26,7 +26,6 @@ from sqlalchemy import func, select
 
 from ..config import AppConfig
 from ..db import ChangeHistory, PushLog, Task, session_scope
-from ..fetcher.engine import SUPPORTED_IMPERSONATE
 from ..logger import get_today_log_path, logger, tail_log
 from ..risk_control import RiskController
 from . import cards
@@ -193,6 +192,7 @@ class CommandDispatcher:
     # /add
     # ============================================================
     def _cmd_add(self, args: list[str]) -> CommandResponse:
+        from ..fetcher.engine import SUPPORTED_IMPERSONATE
         parser = _make_parser("add")
         parser.add_argument("url")
         parser.add_argument("--name", default="")
@@ -694,6 +694,7 @@ class CommandDispatcher:
     # /reset
     # ============================================================
     def _cmd_reset(self, args: list[str]) -> CommandResponse:
+        from ..fetcher.engine import SUPPORTED_IMPERSONATE
         parser = _make_parser("reset")
         parser.add_argument("task_id", type=int)
         parser.add_argument("--strategy", default=None,

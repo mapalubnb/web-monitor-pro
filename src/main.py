@@ -297,6 +297,8 @@ class App:
                 self.scheduler.sync_task(tid)
             except Exception as e:
                 logger.warning("同步调度 #{} 失败: {}", tid, e)
+            # Clean up task lock for deleted tasks to prevent memory leak
+            self.runner.cleanup_task_lock(tid)
 
         if resp.trigger_check_task_id is not None:
             self.scheduler.sync_task(resp.trigger_check_task_id)
@@ -308,20 +310,16 @@ class App:
         payload: dict[str, Any] = {}
         if toast:
             payload["toast"] = {"type": toast, "content": content or "已收到"}
-        try:
-            from lark_oapi.event.callback.model.p2_card_action_trigger import (
-                P2CardActionTriggerResponse,
-            )
-            return P2CardActionTriggerResponse(payload)
-        except ImportError:
-            pass
-        try:
-            from lark_oapi.card.model.p2_card_action_trigger import (
-                P2CardActionTriggerResponse,
-            )
-            return P2CardActionTriggerResponse(payload)
-        except ImportError:
-            pass
+        # SDK >= 1.4.0 moved this class; try both locations for compat.
+        for mod_path in (
+            "lark_oapi.event.callback.model.p2_card_action_trigger",
+            "lark_oapi.card.model.p2_card_action_trigger",
+        ):
+            try:
+                mod = __import__(mod_path, fromlist=["P2CardActionTriggerResponse"])
+                return mod.P2CardActionTriggerResponse(payload)
+            except (ImportError, AttributeError):
+                continue
         return None
 
     @staticmethod
