@@ -297,8 +297,11 @@ class App:
                 self.scheduler.sync_task(tid)
             except Exception as e:
                 logger.warning("同步调度 #{} 失败: {}", tid, e)
-            # Clean up task lock for deleted tasks to prevent memory leak
-            self.runner.cleanup_task_lock(tid)
+            # Clean up task lock only for deleted tasks to prevent memory leak.
+            # Check if task still exists; if not, it was deleted.
+            with session_scope() as s:
+                if s.get(Task, tid) is None:
+                    self.runner.cleanup_task_lock(tid)
 
         if resp.trigger_check_task_id is not None:
             self.scheduler.sync_task(resp.trigger_check_task_id)
