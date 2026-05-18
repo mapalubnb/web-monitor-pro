@@ -348,7 +348,17 @@ class _BrowserPool:
                     route.abort() if route.request.resource_type in self._BLOCK_TYPES
                     else route.continue_()))
 
-            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            # Use domcontentloaded instead of networkidle to avoid
+            # indefinite hangs on sites with persistent WebSocket / SSE
+            # connections (DeFi dashboards, real-time feeds, etc.).
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+
+            # Best-effort: wait for network to settle, but don't fail if
+            # the site keeps long-lived connections open.
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
 
             for _ in range(3):
                 if page.evaluate(_JS_BODY_LEN) >= 200:
@@ -359,7 +369,7 @@ class _BrowserPool:
                 except Exception:
                     pass
                 try:
-                    page.wait_for_load_state("networkidle", timeout=5000)
+                    page.wait_for_load_state("networkidle", timeout=3000)
                 except Exception:
                     pass
 
