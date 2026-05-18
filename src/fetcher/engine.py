@@ -348,10 +348,28 @@ class _BrowserPool:
                     route.abort() if route.request.resource_type in self._BLOCK_TYPES
                     else route.continue_()))
 
-            # Use domcontentloaded instead of networkidle to avoid
-            # indefinite hangs on sites with persistent WebSocket / SSE
-            # connections (DeFi dashboards, real-time feeds, etc.).
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            # Graduated wait strategy to handle diverse site types:
+            #   1. Try domcontentloaded (covers most sites)
+            #   2. On timeout, fall back to "commit" (fires on first
+            #      server response — handles slow Cloudflare challenges)
+            #   3. Best-effort networkidle + body-length polling
+            ms = timeout * 1000
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=ms)
+            except Exception as goto_err:
+                if "Timeout" not in type(goto_err).__name__:
+                    raise
+                # domcontentloaded timed out — the server is very slow
+                # (Cloudflare challenge, geo-blocking, etc.).  Retry with
+                # the most lenient wait: "commit" fires as soon as the
+                # server starts sending *any* response bytes.
+                logger.info("[{}] domcontentloaded timeout, retrying with commit", url)
+                page.goto(url, wait_until="commit", timeout=ms)
+                # Give the page extra time to finish parsing after commit
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=ms)
+                except Exception:
+                    pass
 
             # Best-effort: wait for network to settle, but don't fail if
             # the site keeps long-lived connections open.
@@ -360,7 +378,7 @@ class _BrowserPool:
             except Exception:
                 pass
 
-            for _ in range(3):
+            for _ in range(5):
                 if page.evaluate(_JS_BODY_LEN) >= 200:
                     break
                 try:
@@ -491,6 +509,9 @@ class FetchEngine:
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
             return result
+        if result.ok and not _is_content_usable(result, task):
+            logger.debug("[{}] curl_cffi got response (status={}, len={}) but content unusable",
+                         task.name, result.status_code, len(result.content or ""))
 
         result2 = self._fetch_httpx(task, headers)
         if result2.ok and _is_content_usable(result2, task):
