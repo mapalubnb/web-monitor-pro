@@ -222,6 +222,14 @@ class _BrowserPool:
 
     MAX_AGE = 1800
     _BLOCK_TYPES = {"image", "font", "media"}
+    # External domains whose resources often hang in restricted networks
+    # (e.g. mainland China) and are non-essential for content extraction.
+    _BLOCK_DOMAINS = (
+        "fonts.googleapis.com", "fonts.gstatic.com",
+        "www.googletagmanager.com", "www.google-analytics.com",
+        "analytics.google.com", "connect.facebook.net",
+        "platform.twitter.com",
+    )
 
     def __init__(self, cfg: AppConfig):
         self._cfg = cfg
@@ -343,10 +351,24 @@ class _BrowserPool:
                 pass
 
             page = context.new_page()
-            if block_resources:
-                page.route("**/*", lambda route: (
-                    route.abort() if route.request.resource_type in self._BLOCK_TYPES
-                    else route.continue_()))
+
+            def _route_handler(route):
+                req = route.request
+                # Always block heavy resource types when requested
+                if block_resources and req.resource_type in self._BLOCK_TYPES:
+                    return route.abort()
+                # Always block external domains that commonly hang in
+                # restricted networks (Google Fonts, analytics, etc.)
+                try:
+                    from urllib.parse import urlparse
+                    host = urlparse(req.url).hostname or ""
+                    if host in self._BLOCK_DOMAINS:
+                        return route.abort()
+                except Exception:
+                    pass
+                return route.continue_()
+
+            page.route("**/*", _route_handler)
 
             # Graduated wait strategy to handle diverse site types:
             #   1. Try domcontentloaded (covers most sites)
@@ -528,11 +550,20 @@ class FetchEngine:
             logger.info("[{}] auto escalated to Playwright", task.name)
             return pw
 
-        # All strategies exhausted. Only return an HTTP-OK result if the content
-        # was actually deemed usable; otherwise treat as failure so the task
-        # records a failure instead of locking onto an unusable strategy.
+        # All strategies exhausted.  Last resort: extract meta tags (title,
+        # description, og:*) from the SPA shell so the task at least has a
+        # baseline to diff against.  This is better than total failure for
+        # pure-CSR sites when Playwright cannot render (e.g. blocked by
+        # network restrictions).
         best = result if result.ok else result2
         if best.ok and not _is_content_usable(best, task):
+            meta = self._try_meta_extract(task, best)
+            if meta is not None:
+                pw_err = pw.error or ""
+                logger.info("[{}] all strategies failed, using meta-tag fallback "
+                            "(playwright: {})", task.name, pw_err)
+                return meta
+
             pw_err = pw.error or ""
             logger.warning("[{}] all strategies failed (content unusable, playwright: {})",
                            task.name, pw_err)
@@ -553,6 +584,26 @@ class FetchEngine:
                 strategy = f"{html_result.strategy_used}\u2192deep"
                 logger.info("[{}] deep extract ok ({} chars, strategy={})",
                             task.name, len(text), strategy)
+                return FetchResult(ok=True, url=task.url, status_code=html_result.status_code,
+                                   content=text, content_type="text/plain",
+                                   strategy_used=strategy)
+        except Exception:
+            pass
+        return None
+
+    def _try_meta_extract(self, task: Task, html_result: FetchResult) -> FetchResult | None:
+        """Last-resort fallback: extract meta tags from an SPA shell.
+
+        When we have HTML but both _is_content_usable and Playwright fail,
+        meta tags (title, og:title, og:description, etc.) still give us a
+        diffable baseline.  Returns None if nothing useful can be extracted.
+        """
+        try:
+            from .extractor import extract_meta_fallback
+            text = extract_meta_fallback(html_result.content)
+            if text and len(text) >= 30:
+                strategy = f"{html_result.strategy_used}→meta"
+                logger.info("[{}] meta-tag fallback ok ({} chars)", task.name, len(text))
                 return FetchResult(ok=True, url=task.url, status_code=html_result.status_code,
                                    content=text, content_type="text/plain",
                                    strategy_used=strategy)

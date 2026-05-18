@@ -516,6 +516,19 @@ def try_deep_extract(html: str) -> str:
     return ""
 
 
+def extract_meta_fallback(html: str) -> str:
+    """Public wrapper: extract meta tags from an SPA shell as last resort.
+
+    Used by FetchEngine when all other strategies (curl_cffi, httpx, deep
+    extract, Playwright) fail. Gives the task at least a diffable baseline
+    from title / og:* / description / h1-h2 tags.
+    """
+    if not html or not html.strip():
+        return ""
+    text = _extract_meta(html)
+    return _normalize(text) if text else ""
+
+
 def content_hash(text: str) -> str:
     """SHA-256，用于快速判断是否变化。"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
