@@ -36,6 +36,16 @@ def test_free_proxy_pool_can_filter_by_scheme(monkeypatch):
     assert pool.get_proxy(allowed_schemes={"http", "https"}) == "http://2.2.2.2:8080"
 
 
+def test_free_proxy_pool_cools_down_failed_proxy(monkeypatch):
+    pool = FreeProxyPool(AppConfig(enable_free_proxy_pool=True))
+    monkeypatch.setattr(pool, "_refresh_if_needed", lambda: None)
+    pool._proxies = ["http://bad-proxy:8080", "http://good-proxy:8080"]
+
+    pool.report_result("http://bad-proxy:8080", success=False)
+
+    assert pool.get_proxy(allowed_schemes={"http", "https"}) == "http://good-proxy:8080"
+
+
 def test_fetch_engine_prefers_explicit_proxy_over_free_pool(monkeypatch):
     cfg = AppConfig(
         https_proxy="http://stable-proxy:8080",

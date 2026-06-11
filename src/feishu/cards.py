@@ -454,19 +454,39 @@ def fetch_failure_card(task_id: int, task_name: str, url: str,
         if first_attempt
         else f"任务 **{task_name}** 已连续 **{consecutive_failures}** 次失败"
     )
+    hint = _failure_hint(error)
+    elements = [
+        _div(summary),
+        _hr(),
+        _div(f"[🔗 {url}]({url})"),
+        _div(f"```\n{error[:500]}\n```"),
+    ]
+    if hint:
+        elements.append(_div(f"**判断**\n{hint}"))
+    elements.extend([
+        _hr(),
+        _note(f"`/debug {task_id}` 诊断 · "
+              f"`/reset {task_id} --strategy scrapling_stealth` 切换策略"),
+    ])
     return _card(
         f"{title}　#{task_id}", THEME["warning"],
-        [
-            _div(summary),
-            _hr(),
-            _div(f"[🔗 {url}]({url})"),
-            _div(f"```\n{error[:500]}\n```"),
-            _hr(),
-            _note(f"`/debug {task_id}` 诊断 · "
-                  f"`/reset {task_id} --strategy scrapling_stealth` 切换策略"),
-        ],
+        elements,
         subtitle=task_name,
     )
+
+
+def _failure_hint(error: str) -> str:
+    text = (error or "").lower()
+    if "javascript verification" in text or "bot challenge" in text:
+        return (
+            "疑似机器人验证 / JS 挑战页，已拒绝作为有效快照。"
+            "可尝试稳定代理、降低频率，或使用 `scrapling_stealth`。"
+        )
+    if "access denied" in text or "unauthorized" in text:
+        return "疑似权限受限页面，已拒绝作为有效快照。请确认页面是否公开可访问。"
+    if "content unusable" in text:
+        return "页面返回内容不足或为空壳，已拒绝作为有效快照。可尝试 `/debug` 查看页面结构。"
+    return ""
 
 
 # ============================================================

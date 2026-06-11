@@ -140,3 +140,65 @@ def test_challenge_page_failure_reason_is_clear(monkeypatch):
 
     assert result.ok is False
     assert "JavaScript verification" in (result.error or "")
+
+
+def test_high_risk_domain_tries_scrapling_stealth_first(monkeypatch):
+    engine = FetchEngine(AppConfig(enable_free_proxy_pool=False))
+    calls = []
+    real_html = "<html><body><main>" + ("Proof of collateral reserves. " * 20) + "</main></body></html>"
+    monkeypatch.setattr(
+        engine,
+        "_fetch_scrapling",
+        lambda _task, _headers, strategy: (
+            calls.append(strategy)
+            or FetchResult(
+                ok=True,
+                url="https://www.binance.com/en/proof-of-collateral",
+                status_code=200,
+                content=real_html,
+                strategy_used=strategy,
+            )
+        ),
+    )
+
+    try:
+        result = engine.fetch(_task())
+    finally:
+        engine.close()
+
+    assert result.ok is True
+    assert calls == ["scrapling_stealth"]
+
+
+def test_high_risk_challenge_fails_without_plain_http_fallback(monkeypatch):
+    engine = FetchEngine(AppConfig(enable_free_proxy_pool=False))
+    calls = []
+    monkeypatch.setattr(
+        engine,
+        "_fetch_scrapling",
+        lambda _task, _headers, strategy: (
+            calls.append(strategy)
+            or FetchResult(
+                ok=True,
+                url="https://www.binance.com/en/proof-of-collateral",
+                status_code=200,
+                content=_challenge_html(),
+                inner_text="JavaScript is disabled. This requires JavaScript.",
+                strategy_used=strategy,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_fetch_curl_cffi",
+        lambda *_: calls.append("curl_cffi") or FetchResult(ok=False, url=_task().url),
+    )
+
+    try:
+        result = engine.fetch(_task())
+    finally:
+        engine.close()
+
+    assert result.ok is False
+    assert "JavaScript verification" in (result.error or "")
+    assert calls == ["scrapling_stealth"]

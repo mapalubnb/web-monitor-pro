@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from html import unescape
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from ..config import AppConfig
 from ..db import Task
@@ -28,6 +28,7 @@ class FetchResult:
     strategy_used: str = ""
     error: str | None = None
     inner_text: str = ""
+    proxy_url: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
@@ -179,6 +180,10 @@ _JS_BODY_LEN = "() => (document.body && document.body.innerText || '').trim().le
 _JS_BODY_READY = "() => (document.body && document.body.innerText || '').trim().length >= 200"
 _JS_INNER_TEXT = "() => (document.body && document.body.innerText || '').trim()"
 
+_HIGH_RISK_DOMAINS = (
+    "binance.com",
+)
+
 
 def _quick_visible_text(html: str) -> str:
     """Rough visible text from HTML (strips head/script/style/nav)."""
@@ -243,6 +248,11 @@ def _is_markdown_not_found(text: str) -> bool:
     return lower.startswith("# page not found") or (
         "## suggested pages" in lower and "does not exist" in lower
     )
+
+
+def _host_matches(url: str, domains: tuple[str, ...]) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in domains)
 
 
 def _is_content_usable(result: FetchResult, task: Task) -> bool:
@@ -602,6 +612,16 @@ class FetchEngine:
             return None
         return {"http": proxy_url, "https": proxy_url}
 
+    def _report_proxy_result(self, result: FetchResult, *, success: bool) -> None:
+        if self.cfg.https_proxy or self.cfg.http_proxy:
+            return
+        self._free_proxy_pool.report_result(result.proxy_url, success=success)
+
+    def _report_proxy_url(self, proxy_url: str | None, *, success: bool) -> None:
+        if self.cfg.https_proxy or self.cfg.http_proxy:
+            return
+        self._free_proxy_pool.report_result(proxy_url, success=success)
+
     def fetch(self, task: Task) -> FetchResult:
         """Main entry: route to strategy and return result."""
         strategy = (task.strategy or "auto").lower()
@@ -621,6 +641,11 @@ class FetchEngine:
             if preferred is not None:
                 return preferred
             logger.info("[{}] last strategy {} failed, falling back to auto chain", task.name, last)
+
+        if _host_matches(task.url, _HIGH_RISK_DOMAINS):
+            high_risk = self._auto_chain_high_risk(task, headers)
+            if high_risk is not None:
+                return high_risk
 
         return self._auto_chain(task, headers)
 
@@ -668,34 +693,46 @@ class FetchEngine:
         """Full auto chain: curl_cffi -> httpx -> deep extract -> Playwright."""
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
+            self._report_proxy_result(result, success=True)
             return result
         if result.ok and not _is_content_usable(result, task):
+            self._report_proxy_result(result, success=False)
             logger.debug("[{}] curl_cffi got response (status={}, len={}) but content unusable",
                          task.name, result.status_code, len(result.content or ""))
 
         result2 = self._fetch_httpx(task, headers)
         if result2.ok and _is_content_usable(result2, task):
+            self._report_proxy_result(result2, success=True)
             return result2
+        if result2.ok and not _is_content_usable(result2, task):
+            self._report_proxy_result(result2, success=False)
 
         best_html = result if result.ok else result2
         if best_html.ok and best_html.content:
             markdown = self._try_markdown_alternate(task, best_html)
             if markdown is not None:
+                self._report_proxy_result(markdown, success=True)
                 return markdown
             deep = self._try_deep_extract(task, best_html)
             if deep is not None:
+                self._report_proxy_result(best_html, success=True)
                 return deep
 
         scrapling_result = self._fetch_scrapling(task, headers, "scrapling_auto")
         if scrapling_result.ok and _is_content_usable(scrapling_result, task):
             logger.info("[{}] auto escalated to {}", task.name, scrapling_result.strategy_used)
+            self._report_proxy_result(scrapling_result, success=True)
             return scrapling_result
+        if scrapling_result.ok and not _is_content_usable(scrapling_result, task):
+            self._report_proxy_result(scrapling_result, success=False)
         if scrapling_result.ok and scrapling_result.content:
             markdown = self._try_markdown_alternate(task, scrapling_result)
             if markdown is not None:
+                self._report_proxy_result(markdown, success=True)
                 return markdown
             deep = self._try_deep_extract(task, scrapling_result)
             if deep is not None:
+                self._report_proxy_result(scrapling_result, success=True)
                 return deep
 
         pw = self._fetch_playwright(task, headers)
@@ -730,6 +767,30 @@ class FetchEngine:
         return result if result.ok else FetchResult(
             ok=False, url=task.url, error=result.error or "all strategies failed",
             strategy_used=result.strategy_used)
+
+    def _auto_chain_high_risk(self, task: Task, headers: dict) -> FetchResult | None:
+        """Domain profile for high-risk anti-bot sites: try stealth first."""
+        logger.info("[{}] high-risk domain profile: trying Scrapling stealth first", task.name)
+        stealth = self._fetch_scrapling(task, headers, "scrapling_stealth")
+        if stealth.ok and _is_content_usable(stealth, task):
+            self._report_proxy_result(stealth, success=True)
+            return stealth
+        if stealth.proxy_url:
+            self._report_proxy_result(stealth, success=False)
+        stealth_text = f"{stealth.content or ''}\n{stealth.inner_text or ''}"
+        if stealth.ok and (
+            _is_challenge_text(stealth_text)
+            or _is_access_denied_text(stealth_text)
+        ):
+            return FetchResult(
+                ok=False,
+                url=task.url,
+                status_code=stealth.status_code,
+                strategy_used=stealth.strategy_used,
+                error=self._unusable_reason(stealth),
+                proxy_url=stealth.proxy_url,
+            )
+        return None
 
     def _try_deep_extract(self, task: Task, html_result: FetchResult) -> FetchResult | None:
         """Extract embedded SSR/RSC data from raw HTML."""
@@ -776,14 +837,18 @@ class FetchEngine:
             })
             text = resp.text or ""
             if not (200 <= resp.status_code < 300):
+                self._report_proxy_url(proxy_url, success=False)
                 return None
             if len(text.strip()) < 30:
+                self._report_proxy_url(proxy_url, success=False)
                 return None
             if _is_access_denied_text(text) or _is_markdown_not_found(text):
+                self._report_proxy_url(proxy_url, success=False)
                 return None
             strategy = f"{html_result.strategy_used}→markdown"
             logger.info("[{}] markdown alternate ok ({} chars, url={})",
                         task.name, len(text), markdown_url)
+            self._report_proxy_url(proxy_url, success=True)
             return FetchResult(
                 ok=True,
                 url=task.url,
@@ -791,8 +856,10 @@ class FetchEngine:
                 content=text,
                 content_type=resp.headers.get("content-type", "text/markdown"),
                 strategy_used=strategy,
+                proxy_url=proxy_url or "",
             )
         except Exception as e:
+            self._report_proxy_url(locals().get("proxy_url"), success=False)
             logger.debug("[{}] markdown alternate failed: {}", task.name, e)
             return None
 
@@ -826,18 +893,25 @@ class FetchEngine:
 
     def _upgrade_if_empty(self, task: Task, headers: dict, result: FetchResult) -> FetchResult:
         """For explicitly specified curl_cffi/httpx: escalate if content is unusable."""
-        if not result.ok or _is_content_usable(result, task):
+        if not result.ok:
             return result
+        if _is_content_usable(result, task):
+            self._report_proxy_result(result, success=True)
+            return result
+        self._report_proxy_result(result, success=False)
 
         if result.content:
             markdown = self._try_markdown_alternate(task, result)
             if markdown is not None:
+                self._report_proxy_result(markdown, success=True)
                 return markdown
             stealth = self._try_scrapling_stealth_upgrade(task, headers, result)
             if stealth is not None:
+                self._report_proxy_result(stealth, success=True)
                 return stealth
             deep = self._try_deep_extract(task, result)
             if deep is not None:
+                self._report_proxy_result(result, success=True)
                 return deep
 
         reason = ("binary garbage" if _looks_like_binary_garbage(result.content or "")
@@ -855,6 +929,7 @@ class FetchEngine:
             status_code=result.status_code,
             strategy_used=result.strategy_used,
             error=self._unusable_reason(pw if pw.ok else result),
+            proxy_url=result.proxy_url,
         )
 
     def _try_scrapling_stealth_upgrade(
@@ -900,8 +975,10 @@ class FetchEngine:
             return FetchResult(ok=200 <= resp.status_code < 300, url=task.url,
                                status_code=resp.status_code, content=resp.text,
                                content_type=resp.headers.get("content-type", ""),
-                               strategy_used=tag)
+                               strategy_used=tag, proxy_url=proxy_url or "")
         except Exception as e:
+            if not (self.cfg.https_proxy or self.cfg.http_proxy):
+                self._free_proxy_pool.report_result(locals().get("proxy_url"), success=False)
             return FetchResult(ok=False, url=task.url, strategy_used=tag,
                                error=f"{type(e).__name__}: {e}")
 
@@ -916,8 +993,10 @@ class FetchEngine:
             return FetchResult(ok=200 <= resp.status_code < 300, url=task.url,
                                status_code=resp.status_code, content=resp.text,
                                content_type=resp.headers.get("content-type", ""),
-                               strategy_used="httpx")
+                               strategy_used="httpx", proxy_url=proxy_url or "")
         except Exception as e:
+            if not (self.cfg.https_proxy or self.cfg.http_proxy):
+                self._free_proxy_pool.report_result(proxy_url, success=False)
             return FetchResult(ok=False, url=task.url, strategy_used="httpx",
                                error=f"{type(e).__name__}: {e}")
 
@@ -1032,6 +1111,8 @@ class FetchEngine:
             return FetchResult(ok=False, url=task.url, strategy_used=strategy,
                                error="scrapling not installed")
         except Exception as e:
+            if not (self.cfg.https_proxy or self.cfg.http_proxy):
+                self._free_proxy_pool.report_result(locals().get("proxy_url"), success=False)
             return FetchResult(ok=False, url=task.url, strategy_used=strategy,
                                error=f"{type(e).__name__}: {e}")
 
@@ -1051,6 +1132,7 @@ class FetchEngine:
             content_type=content_type,
             strategy_used=strategy,
             inner_text=inner_text,
+            proxy_url=proxy_url or "",
         )
 
     @staticmethod

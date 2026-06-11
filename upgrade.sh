@@ -65,6 +65,11 @@ info "安装 Python 依赖..."
 "${PIP}" install --quiet -r "${PROJECT_DIR}/requirements.txt"
 ok "Python 依赖已更新"
 
+info "刷新 Scrapling 浏览器与指纹（如可用）..."
+"${PY}" -m scrapling install --force 2>&1 || {
+    warn "scrapling install --force 失败，继续升级；Scrapling 隐身抓取可能使用旧指纹"
+}
+
 # ---- 4. 安装 Playwright Chromium ----
 info "安装 Playwright Chromium（约 120MB，首次安装需下载）..."
 "${PY}" -m playwright install chromium 2>&1 || {

@@ -125,6 +125,16 @@ web-monitor-pro 采用**自动递进式抓取**，全自建无外部 API 依赖�
 | `scrapling_stealth` | 隐身 Chromium，适合 Cloudflare/高风控页面 |
 | `scrapling_auto` | 先 static，失败后 stealth |
 
+### 高风控域名自动画像
+
+`auto` 模式会对已知高风控域名优先尝试 `scrapling_stealth`。如果返回的是
+“JavaScript is disabled / verify that you're not a robot” 这类挑战页，或
+“not authorized / access denied” 这类权限页，服务会直接判定为抓取失败，不会把
+挑战页文字建立成基准快照。
+
+这样可以避免 Binance 等页面出现“明明抓到的是机器人验证页，却显示监控成功”的误判。
+失败卡片会给出判断提示，建议排查稳定代理、降低频率，或改监控公开 API/JSON 数据源。
+
 ### 自适应选择器
 
 当目标页面局部改版导致原 CSS 选择器失效时，Scrapling 可以根据首次命中元素的结构特征重定位相似元素。
@@ -216,6 +226,9 @@ Playwright 会启动 headless Chromium 渲染页面并提取完整 DOM。
 - ✅ Cookie 自动持久化
 - ✅ Cloudflare 挑战页自动识别 + fallback
 - ✅ Playwright stealth（隐藏无头浏览器特征）
+- ✅ 高风控域名自动优先 `scrapling_stealth`
+- ✅ 挑战页 / 权限页拒收，不作为有效快照
+- ✅ `upgrade.sh` 会刷新 Scrapling 浏览器与指纹依赖（`scrapling install --force`）
 
 **进阶**：如需代理，在 `.env` 中配置 `HTTPS_PROXY=socks5://host:port` 即可。
 
@@ -243,5 +256,7 @@ FREE_PROXY_MAX_COUNT=200
 2. 未配置显式代理且 `ENABLE_FREE_PROXY_POOL=true` 时，curl_cffi、httpx、Scrapling 抓取会自动轮换免费代理。
    其中 httpx 只使用 HTTP/HTTPS 代理；curl_cffi 和 Scrapling 会按自身支持情况使用 HTTP/HTTPS/SOCKS。
 3. Playwright 复用浏览器池，不动态切换免费代理；需要浏览器代理时建议配置稳定的 `HTTPS_PROXY`，或使用 `scrapling_stealth`。
+
+抓取链会对免费代理做轻量健康记录：成功后清除失败状态；失败或返回不可用内容后临时冷却该代理，避免同一个坏代理被连续选中。
 
 免费公共代理稳定性和安全性不可控；监控敏感内容时建议关闭代理池，或配置稳定的 `HTTPS_PROXY` / `HTTP_PROXY`。

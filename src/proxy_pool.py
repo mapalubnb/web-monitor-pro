@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import threading
 import time
+from collections import defaultdict
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -49,6 +50,8 @@ class FreeProxyPool:
         self._proxies: list[str] = []
         self._idx = 0
         self._last_refresh = 0.0
+        self._failures: dict[str, int] = defaultdict(int)
+        self._cooldown_until: dict[str, float] = {}
 
     def get_proxy(self, allowed_schemes: set[str] | None = None) -> str | None:
         """Return the next proxy URL, or None when disabled/unavailable."""
@@ -58,13 +61,34 @@ class FreeProxyPool:
             self._refresh_if_needed()
             if not self._proxies:
                 return None
+            now = time.time()
             for _ in range(len(self._proxies)):
                 proxy = self._proxies[self._idx % len(self._proxies)]
                 self._idx = (self._idx + 1) % len(self._proxies)
+                if self._cooldown_until.get(proxy, 0) > now:
+                    continue
                 scheme = urlparse(proxy).scheme
                 if not allowed_schemes or scheme in allowed_schemes:
                     return proxy
             return None
+
+    def report_result(self, proxy: str | None, *, success: bool) -> None:
+        """Update lightweight health state for a free proxy."""
+        if not self.enabled or not proxy:
+            return
+        with self._lock:
+            if success:
+                self._failures.pop(proxy, None)
+                self._cooldown_until.pop(proxy, None)
+                return
+
+            failures = self._failures.get(proxy, 0) + 1
+            self._failures[proxy] = failures
+            # Free proxies churn quickly. Cool bad ones down instead of deleting
+            # them, so a refreshed upstream list can recover without restart.
+            cooldown = min(300, 30 * failures)
+            self._cooldown_until[proxy] = time.time() + cooldown
+            logger.debug("free proxy cooled down for {}s: {}", cooldown, proxy)
 
     def _refresh_if_needed(self) -> None:
         now = time.time()
@@ -76,6 +100,12 @@ class FreeProxyPool:
             random.shuffle(proxies)
             self._proxies = proxies
             self._last_refresh = now
+            self._failures = defaultdict(int, {
+                p: n for p, n in self._failures.items() if p in proxies
+            })
+            self._cooldown_until = {
+                p: ts for p, ts in self._cooldown_until.items() if p in proxies
+            }
             self._write_cache(proxies)
             logger.info("free proxy pool refreshed: {} proxies", len(proxies))
             return
