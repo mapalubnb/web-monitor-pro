@@ -446,11 +446,18 @@ def success_card(title: str, detail: str = "") -> dict:
 
 
 def fetch_failure_card(task_id: int, task_name: str, url: str,
-                       consecutive_failures: int, error: str) -> dict:
+                       consecutive_failures: int, error: str,
+                       first_attempt: bool = False) -> dict:
+    title = "🚨 首次抓取失败" if first_attempt else "🚨 抓取失败"
+    summary = (
+        f"任务 **{task_name}** 首次抓取未能建立基准快照"
+        if first_attempt
+        else f"任务 **{task_name}** 已连续 **{consecutive_failures}** 次失败"
+    )
     return _card(
-        f"🚨 抓取失败　#{task_id}", THEME["warning"],
+        f"{title}　#{task_id}", THEME["warning"],
         [
-            _div(f"任务 **{task_name}** 已连续 **{consecutive_failures}** 次失败"),
+            _div(summary),
             _hr(),
             _div(f"[🔗 {url}]({url})"),
             _div(f"```\n{error[:500]}\n```"),

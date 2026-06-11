@@ -456,6 +456,11 @@ class MonitorRunner:
             t = s.get(Task, task.id)
             if t is None:
                 return
+            first_baseline_failure = (
+                t.consecutive_failures == 0
+                and not t.last_content_hash
+                and not t.last_snapshot_path
+            )
             t.consecutive_failures += 1
             t.last_checked_at = now_utc()
             t.total_checks += 1
@@ -475,6 +480,14 @@ class MonitorRunner:
                 f"任务 **{name}** 连续失败 **{fails}** 次，已自动禁用。\n"
                 f"最后错误：{error[:200]}",
                 f"`/resume {task.id}` 恢复任务 · `/debug {task.id}` 诊断问题"))
+            self.risk.mark_pushed(task.id, kind="error")
+        elif first_baseline_failure and self.risk.can_send_failure_alert(task.id):
+            self.feishu.send_card(
+                chat_id,
+                cards.fetch_failure_card(
+                    task.id, name, url, fails, error, first_attempt=True
+                ),
+            )
             self.risk.mark_pushed(task.id, kind="error")
         elif (self.risk.should_alert_failure(fails)
               and self.risk.can_send_failure_alert(task.id)):
