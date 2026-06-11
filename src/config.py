@@ -78,7 +78,7 @@ class AppConfig:
     enable_scrapling: bool = True
     http_proxy: str = ""
     https_proxy: str = ""
-    enable_free_proxy_pool: bool = False
+    enable_free_proxy_pool: bool = True
     free_proxy_source_url: str = (
         "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
     )
@@ -171,7 +171,7 @@ def load_config(
         enable_scrapling=os.getenv("ENABLE_SCRAPLING", "true").strip().lower() in ("true", "1", "yes"),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
-        enable_free_proxy_pool=os.getenv("ENABLE_FREE_PROXY_POOL", "false").strip().lower()
+        enable_free_proxy_pool=os.getenv("ENABLE_FREE_PROXY_POOL", "true").strip().lower()
         in ("true", "1", "yes"),
         free_proxy_source_url=os.getenv(
             "FREE_PROXY_SOURCE_URL",

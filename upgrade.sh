@@ -123,13 +123,23 @@ if [[ -f "${ENV_FILE}" ]]; then
         echo 'ENABLE_SCRAPLING=true' >> "${ENV_FILE}"
         ADDED=1
     fi
-    if ! grep -q 'ENABLE_FREE_PROXY_POOL' "${ENV_FILE}" 2>/dev/null; then
-        {
-            echo 'ENABLE_FREE_PROXY_POOL=false'
-            echo 'FREE_PROXY_SOURCE_URL=https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt'
-            echo 'FREE_PROXY_REFRESH_SECONDS=600'
-            echo 'FREE_PROXY_MAX_COUNT=200'
-        } >> "${ENV_FILE}"
+    if grep -q '^ENABLE_FREE_PROXY_POOL=false' "${ENV_FILE}" 2>/dev/null; then
+        sed -i 's/^ENABLE_FREE_PROXY_POOL=false/ENABLE_FREE_PROXY_POOL=true/' "${ENV_FILE}"
+        ADDED=1
+    elif ! grep -q 'ENABLE_FREE_PROXY_POOL' "${ENV_FILE}" 2>/dev/null; then
+        echo 'ENABLE_FREE_PROXY_POOL=true' >> "${ENV_FILE}"
+        ADDED=1
+    fi
+    if ! grep -q 'FREE_PROXY_SOURCE_URL' "${ENV_FILE}" 2>/dev/null; then
+        echo 'FREE_PROXY_SOURCE_URL=https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt' >> "${ENV_FILE}"
+        ADDED=1
+    fi
+    if ! grep -q 'FREE_PROXY_REFRESH_SECONDS' "${ENV_FILE}" 2>/dev/null; then
+        echo 'FREE_PROXY_REFRESH_SECONDS=600' >> "${ENV_FILE}"
+        ADDED=1
+    fi
+    if ! grep -q 'FREE_PROXY_MAX_COUNT' "${ENV_FILE}" 2>/dev/null; then
+        echo 'FREE_PROXY_MAX_COUNT=200' >> "${ENV_FILE}"
         ADDED=1
     fi
     if [[ ${ADDED} -eq 1 ]]; then

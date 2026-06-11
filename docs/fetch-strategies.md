@@ -228,7 +228,7 @@ Proxifly 的列表约每 5 分钟更新，提供 HTTP、HTTPS、SOCKS4、SOCKS5�
 https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt
 ```
 
-默认关闭，启用方式：
+`.env.example` 和 `upgrade.sh` 默认写入启用配置；不需要免费代理时可把 `ENABLE_FREE_PROXY_POOL` 改为 `false`。
 
 ```ini
 ENABLE_FREE_PROXY_POOL=true
@@ -244,4 +244,4 @@ FREE_PROXY_MAX_COUNT=200
    其中 httpx 只使用 HTTP/HTTPS 代理；curl_cffi 和 Scrapling 会按自身支持情况使用 HTTP/HTTPS/SOCKS。
 3. Playwright 复用浏览器池，不动态切换免费代理；需要浏览器代理时建议配置稳定的 `HTTPS_PROXY`，或使用 `scrapling_stealth`。
 
-免费公共代理稳定性和安全性不可控，建议只用于测试或非敏感监控任务。
+免费公共代理稳定性和安全性不可控；监控敏感内容时建议关闭代理池，或配置稳定的 `HTTPS_PROXY` / `HTTP_PROXY`。
