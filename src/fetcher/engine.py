@@ -124,6 +124,25 @@ _ERROR_PAGE_MARKERS = (
     "hydration failed because", "there was an error while hydrating",
 )
 
+_ACCESS_DENIED_MARKERS = (
+    "you're not authorized to access this page",
+    "you are not authorized to access this page",
+    "not authorized to access this page",
+    "you don't have access to this page",
+    "you do not have access to this page",
+    "you do not have permission to access this page",
+    "you don't have permission to access this page",
+    "you need permission to access this page",
+    "access to this page is restricted",
+    "this page is private",
+    "this page is not public",
+    "private page",
+    "access denied",
+    "403 forbidden",
+    "sign in to access this page",
+    "log in to access this page",
+)
+
 _SPA_SHELL_MARKERS = (
     'id="root"', 'id="app"', 'id="__next"', 'id="__nuxt"',
     "data-reactroot", "data-server-rendered", "self.__next_f",
@@ -172,12 +191,25 @@ def _is_error_page(text: str) -> bool:
     return any(m in lower for m in _ERROR_PAGE_MARKERS)
 
 
+def _is_access_denied_text(text: str) -> bool:
+    """Detect auth/permission placeholder pages served with HTTP 200."""
+    if not text:
+        return False
+    lower = " ".join(text.lower().split())
+    if not any(m in lower for m in _ACCESS_DENIED_MARKERS):
+        return False
+    # Avoid false positives in long articles that merely discuss "access denied".
+    return len(lower) < 5000 or "you're not authorized to access this page" in lower
+
+
 def _is_content_usable(result: FetchResult, task: Task) -> bool:
     """Check if fetched content is substantial enough (not an SPA shell or garbage)."""
     if not result.ok or not result.content or not result.content.strip():
         return False
 
     text = result.content
+    if _is_access_denied_text(text) or _is_access_denied_text(result.inner_text):
+        return False
     if _looks_like_binary_garbage(text):
         return False
     if task.type == "json":
@@ -192,6 +224,8 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
         return False
 
     visible = _quick_visible_text(text)
+    if _is_access_denied_text(visible):
+        return False
     if _is_error_page(visible):
         return False
 
@@ -552,7 +586,7 @@ class FetchEngine:
         """Try the previously successful strategy; return None if it fails."""
         if last == "playwright":
             r = self._fetch_playwright(task, headers)
-            return r if r.ok else None
+            return r if r.ok and _is_content_usable(r, task) else None
         if last in SCRAPLING_STRATEGIES or last.startswith("scrapling_"):
             r = self._fetch_scrapling(task, headers, last.split("→")[0])
             return r if r.ok and _is_content_usable(r, task) else None
@@ -616,7 +650,7 @@ class FetchEngine:
                 return deep
 
         pw = self._fetch_playwright(task, headers)
-        if pw.ok:
+        if pw.ok and _is_content_usable(pw, task):
             logger.info("[{}] auto escalated to Playwright", task.name)
             return pw
 
@@ -635,11 +669,14 @@ class FetchEngine:
                 return meta
 
             pw_err = pw.error or ""
-            logger.warning("[{}] all strategies failed (content unusable, playwright: {})",
-                           task.name, pw_err)
+            reason = self._unusable_reason(best)
+            if pw.ok and not _is_content_usable(pw, task):
+                reason = self._unusable_reason(pw)
+            logger.warning("[{}] all strategies failed ({}, playwright: {})",
+                           task.name, reason, pw_err)
             return FetchResult(
                 ok=False, url=task.url, strategy_used=best.strategy_used,
-                error=f"content unusable and playwright failed ({pw_err})")
+                error=f"{reason}; playwright failed or returned unusable content ({pw_err})")
 
         return result if result.ok else FetchResult(
             ok=False, url=task.url, error=result.error or "all strategies failed",
@@ -649,8 +686,14 @@ class FetchEngine:
         """Extract embedded SSR/RSC data from raw HTML."""
         try:
             from .extractor import try_deep_extract
+            if _is_access_denied_text(html_result.content):
+                logger.info("[{}] deep extract skipped access-denied page", task.name)
+                return None
             text = try_deep_extract(html_result.content)
             if text and len(text) >= 120:
+                if _is_access_denied_text(text):
+                    logger.info("[{}] deep extract rejected access-denied page", task.name)
+                    return None
                 strategy = f"{html_result.strategy_used}\u2192deep"
                 logger.info("[{}] deep extract ok ({} chars, strategy={})",
                             task.name, len(text), strategy)
@@ -670,8 +713,12 @@ class FetchEngine:
         """
         try:
             from .extractor import extract_meta_fallback
+            if _is_access_denied_text(html_result.content):
+                return None
             text = extract_meta_fallback(html_result.content)
             if text and len(text) >= 30:
+                if _is_access_denied_text(text):
+                    return None
                 strategy = f"{html_result.strategy_used}→meta"
                 logger.info("[{}] meta-tag fallback ok ({} chars)", task.name, len(text))
                 return FetchResult(ok=True, url=task.url, status_code=html_result.status_code,
@@ -697,10 +744,25 @@ class FetchEngine:
                     task.name, result.strategy_used, reason)
 
         pw = self._fetch_playwright(task, headers)
-        if pw.ok:
+        if pw.ok and _is_content_usable(pw, task):
             pw.strategy_used = f"{result.strategy_used}\u2192playwright"
             return pw
-        return result
+        return FetchResult(
+            ok=False,
+            url=task.url,
+            status_code=result.status_code,
+            strategy_used=result.strategy_used,
+            error=self._unusable_reason(pw if pw.ok else result),
+        )
+
+    @staticmethod
+    def _unusable_reason(result: FetchResult) -> str:
+        content = result.inner_text or result.content or ""
+        if _is_access_denied_text(content):
+            return "access denied / unauthorized page detected"
+        if _looks_like_binary_garbage(result.content or ""):
+            return "binary garbage response"
+        return f"content unusable (len={len(result.content or '')})"
 
     def _fetch_curl_cffi(self, task: Task, headers: dict) -> FetchResult:
         try:
