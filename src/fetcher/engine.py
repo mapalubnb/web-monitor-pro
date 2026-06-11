@@ -622,6 +622,9 @@ class FetchEngine:
             return
         self._free_proxy_pool.report_result(proxy_url, success=success)
 
+    def _is_free_proxy(self, proxy_url: str | None) -> bool:
+        return bool(proxy_url) and not (self.cfg.https_proxy or self.cfg.http_proxy)
+
     def fetch(self, task: Task) -> FetchResult:
         """Main entry: route to strategy and return result."""
         strategy = (task.strategy or "auto").lower()
@@ -828,27 +831,26 @@ class FetchEngine:
 
         try:
             proxy_url = self._select_proxy(allowed_schemes={"http", "https"})
-            client = self._get_httpx_client(proxy_url)
-            if client is None:
+            response = self._get_markdown_response(markdown_url, proxy_url)
+            if response is None:
                 return None
-            resp = client.get(markdown_url, headers={
-                "Accept": "text/markdown,text/plain;q=0.9,text/html;q=0.5,*/*;q=0.1",
-                "User-Agent": random.choice(_UA_POOL),
-            })
+            resp, used_proxy_url = response
+            if resp is None:
+                return None
             text = resp.text or ""
             if not (200 <= resp.status_code < 300):
-                self._report_proxy_url(proxy_url, success=False)
+                self._report_proxy_url(used_proxy_url, success=False)
                 return None
             if len(text.strip()) < 30:
-                self._report_proxy_url(proxy_url, success=False)
+                self._report_proxy_url(used_proxy_url, success=False)
                 return None
             if _is_access_denied_text(text) or _is_markdown_not_found(text):
-                self._report_proxy_url(proxy_url, success=False)
+                self._report_proxy_url(used_proxy_url, success=False)
                 return None
             strategy = f"{html_result.strategy_used}→markdown"
             logger.info("[{}] markdown alternate ok ({} chars, url={})",
                         task.name, len(text), markdown_url)
-            self._report_proxy_url(proxy_url, success=True)
+            self._report_proxy_url(used_proxy_url, success=True)
             return FetchResult(
                 ok=True,
                 url=task.url,
@@ -856,12 +858,32 @@ class FetchEngine:
                 content=text,
                 content_type=resp.headers.get("content-type", "text/markdown"),
                 strategy_used=strategy,
-                proxy_url=proxy_url or "",
+                proxy_url=used_proxy_url or "",
             )
         except Exception as e:
             self._report_proxy_url(locals().get("proxy_url"), success=False)
             logger.debug("[{}] markdown alternate failed: {}", task.name, e)
             return None
+
+    def _get_markdown_response(self, markdown_url: str, proxy_url: str | None):
+        headers = {
+            "Accept": "text/markdown,text/plain;q=0.9,text/html;q=0.5,*/*;q=0.1",
+            "User-Agent": random.choice(_UA_POOL),
+        }
+        client = self._get_httpx_client(proxy_url)
+        if client is None:
+            return None
+        try:
+            return client.get(markdown_url, headers=headers), proxy_url
+        except Exception as e:
+            self._report_proxy_url(proxy_url, success=False)
+            if not self._is_free_proxy(proxy_url):
+                raise
+            logger.info("markdown alternate via free proxy failed ({}), retrying direct", e)
+            direct_client = self._get_httpx_client(None)
+            if direct_client is None:
+                raise
+            return direct_client.get(markdown_url, headers=headers), None
 
     def _try_meta_extract(self, task: Task, html_result: FetchResult) -> FetchResult | None:
         """Last-resort fallback: extract meta tags from an SPA shell.
@@ -967,8 +989,7 @@ class FetchEngine:
             impersonate = "chrome131"
         tag = f"curl_cffi/{impersonate}"
 
-        try:
-            proxy_url = self._select_proxy()
+        def _request(proxy_url: str | None) -> FetchResult:
             resp = cc.get(task.url, headers=headers, impersonate=impersonate,
                           timeout=self.timeout, proxies=self._proxy_dict(proxy_url),
                           allow_redirects=True)
@@ -976,9 +997,24 @@ class FetchEngine:
                                status_code=resp.status_code, content=resp.text,
                                content_type=resp.headers.get("content-type", ""),
                                strategy_used=tag, proxy_url=proxy_url or "")
+
+        try:
+            proxy_url = self._select_proxy()
+            return _request(proxy_url)
         except Exception as e:
-            if not (self.cfg.https_proxy or self.cfg.http_proxy):
-                self._free_proxy_pool.report_result(locals().get("proxy_url"), success=False)
+            proxy_url = locals().get("proxy_url")
+            self._report_proxy_url(proxy_url, success=False)
+            if self._is_free_proxy(proxy_url):
+                logger.info("[{}] free proxy failed in curl_cffi ({}), retrying direct",
+                            task.name, e)
+                try:
+                    return _request(None)
+                except Exception as direct_e:
+                    return FetchResult(ok=False, url=task.url, strategy_used=tag,
+                                       error=(
+                                           f"free proxy failed ({type(e).__name__}: {e}); "
+                                           f"direct retry failed ({type(direct_e).__name__}: {direct_e})"
+                                       ))
             return FetchResult(ok=False, url=task.url, strategy_used=tag,
                                error=f"{type(e).__name__}: {e}")
 
@@ -995,8 +1031,25 @@ class FetchEngine:
                                content_type=resp.headers.get("content-type", ""),
                                strategy_used="httpx", proxy_url=proxy_url or "")
         except Exception as e:
-            if not (self.cfg.https_proxy or self.cfg.http_proxy):
-                self._free_proxy_pool.report_result(proxy_url, success=False)
+            self._report_proxy_url(proxy_url, success=False)
+            if self._is_free_proxy(proxy_url):
+                logger.info("[{}] free proxy failed in httpx ({}), retrying direct",
+                            task.name, e)
+                try:
+                    direct_client = self._get_httpx_client(None)
+                    if direct_client is None:
+                        raise RuntimeError("httpx not installed")
+                    resp = direct_client.get(task.url, headers=headers)
+                    return FetchResult(ok=200 <= resp.status_code < 300, url=task.url,
+                                       status_code=resp.status_code, content=resp.text,
+                                       content_type=resp.headers.get("content-type", ""),
+                                       strategy_used="httpx", proxy_url="")
+                except Exception as direct_e:
+                    return FetchResult(ok=False, url=task.url, strategy_used="httpx",
+                                       error=(
+                                           f"free proxy failed ({type(e).__name__}: {e}); "
+                                           f"direct retry failed ({type(direct_e).__name__}: {direct_e})"
+                                       ))
             return FetchResult(ok=False, url=task.url, strategy_used="httpx",
                                error=f"{type(e).__name__}: {e}")
 
@@ -1066,55 +1119,33 @@ class FetchEngine:
             return second if second.ok else first
 
         try:
-            if strategy == "scrapling_static":
-                from scrapling.fetchers import Fetcher
-                proxy_url = self._select_proxy()
-                page = Fetcher.get(
-                    task.url,
-                    headers=headers,
-                    impersonate=task.impersonate or "chrome131",
-                    timeout=self.timeout,
-                    proxy=proxy_url,
-                    selector_config=self._scrapling_selector_config(task),
-                )
-            elif strategy == "scrapling_dynamic":
-                from scrapling.fetchers import DynamicFetcher
-                proxy_url = self._select_proxy()
-                page = DynamicFetcher.fetch(
-                    task.url,
-                    headless=True,
-                    network_idle=True,
-                    disable_resources=True,
-                    timeout=self.cfg.playwright_timeout * 1000,
-                    wait_selector=task.wait_selector or None,
-                    extra_headers=headers,
-                    proxy=proxy_url,
-                    selector_config=self._scrapling_selector_config(task),
-                )
-            else:
-                from scrapling.fetchers import StealthyFetcher
-                proxy_url = self._select_proxy()
-                page = StealthyFetcher.fetch(
-                    task.url,
-                    headless=True,
-                    network_idle=True,
-                    disable_resources=True,
-                    solve_cloudflare=True,
-                    block_webrtc=True,
-                    timeout=self.cfg.playwright_timeout * 1000,
-                    wait_selector=task.wait_selector or None,
-                    extra_headers=headers,
-                    proxy=proxy_url,
-                    selector_config=self._scrapling_selector_config(task),
-                )
+            proxy_url = self._select_proxy()
+            page = self._fetch_scrapling_page(task, headers, strategy, proxy_url)
         except ImportError:
             return FetchResult(ok=False, url=task.url, strategy_used=strategy,
                                error="scrapling not installed")
         except Exception as e:
-            if not (self.cfg.https_proxy or self.cfg.http_proxy):
-                self._free_proxy_pool.report_result(locals().get("proxy_url"), success=False)
-            return FetchResult(ok=False, url=task.url, strategy_used=strategy,
-                               error=f"{type(e).__name__}: {e}")
+            proxy_url = locals().get("proxy_url")
+            self._report_proxy_url(proxy_url, success=False)
+            if self._is_free_proxy(proxy_url):
+                logger.info("[{}] free proxy failed in {} ({}), retrying direct",
+                            task.name, strategy, e)
+                try:
+                    page = self._fetch_scrapling_page(task, headers, strategy, None)
+                    proxy_url = None
+                except Exception as direct_e:
+                    return FetchResult(
+                        ok=False,
+                        url=task.url,
+                        strategy_used=strategy,
+                        error=(
+                            f"free proxy failed ({type(e).__name__}: {e}); "
+                            f"direct retry failed ({type(direct_e).__name__}: {direct_e})"
+                        ),
+                    )
+            else:
+                return FetchResult(ok=False, url=task.url, strategy_used=strategy,
+                                   error=f"{type(e).__name__}: {e}")
 
         status = getattr(page, "status", None) or getattr(page, "status_code", None)
         headers_out = getattr(page, "headers", {}) or {}
@@ -1133,6 +1164,48 @@ class FetchEngine:
             strategy_used=strategy,
             inner_text=inner_text,
             proxy_url=proxy_url or "",
+        )
+
+    def _fetch_scrapling_page(
+        self, task: Task, headers: dict, strategy: str, proxy_url: str | None
+    ) -> Any:
+        if strategy == "scrapling_static":
+            from scrapling.fetchers import Fetcher
+            return Fetcher.get(
+                task.url,
+                headers=headers,
+                impersonate=task.impersonate or "chrome131",
+                timeout=self.timeout,
+                proxy=proxy_url,
+                selector_config=self._scrapling_selector_config(task),
+            )
+        if strategy == "scrapling_dynamic":
+            from scrapling.fetchers import DynamicFetcher
+            return DynamicFetcher.fetch(
+                task.url,
+                headless=True,
+                network_idle=True,
+                disable_resources=True,
+                timeout=self.cfg.playwright_timeout * 1000,
+                wait_selector=task.wait_selector or None,
+                extra_headers=headers,
+                proxy=proxy_url,
+                selector_config=self._scrapling_selector_config(task),
+            )
+
+        from scrapling.fetchers import StealthyFetcher
+        return StealthyFetcher.fetch(
+            task.url,
+            headless=True,
+            network_idle=True,
+            disable_resources=True,
+            solve_cloudflare=True,
+            block_webrtc=True,
+            timeout=self.cfg.playwright_timeout * 1000,
+            wait_selector=task.wait_selector or None,
+            extra_headers=headers,
+            proxy=proxy_url,
+            selector_config=self._scrapling_selector_config(task),
         )
 
     @staticmethod

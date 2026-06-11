@@ -477,6 +477,17 @@ def fetch_failure_card(task_id: int, task_name: str, url: str,
 
 def _failure_hint(error: str) -> str:
     text = (error or "").lower()
+    if (
+        "free proxy failed" in text
+        or "failed to connect" in text
+        or "could not connect to server" in text
+        or "curl: (7)" in text
+        or "connectionerror" in text
+    ):
+        return (
+            "疑似免费代理不可用。系统会冷却失败代理并直连重试；"
+            "如仍连续失败，建议关闭免费代理池或配置稳定 `HTTPS_PROXY`。"
+        )
     if "javascript verification" in text or "bot challenge" in text:
         return (
             "疑似机器人验证 / JS 挑战页，已拒绝作为有效快照。"

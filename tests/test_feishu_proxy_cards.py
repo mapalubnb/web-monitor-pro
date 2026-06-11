@@ -52,3 +52,19 @@ def test_fetch_failure_card_shows_bot_challenge_hint():
 
     assert "疑似机器人验证" in text
     assert "scrapling_stealth" in text
+
+
+def test_fetch_failure_card_shows_free_proxy_hint():
+    card = cards.fetch_failure_card(
+        9,
+        "gitbook",
+        "https://four-meme.gitbook.io/four.meme/protocol-integration",
+        5,
+        "ConnectionError: Failed to perform, curl: (7) Failed to connect "
+        "to 206.123.156.229 port 11559: Could not connect to server.",
+        first_attempt=False,
+    )
+    text = json.dumps(card, ensure_ascii=False)
+
+    assert "免费代理不可用" in text
+    assert "HTTPS_PROXY" in text

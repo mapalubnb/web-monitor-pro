@@ -71,6 +71,59 @@ def test_markdown_alternate_is_used_for_unusable_gitbook_shell(monkeypatch):
     assert "Protocol Integration" in result.content
 
 
+def test_markdown_alternate_retries_direct_after_free_proxy_failure(monkeypatch):
+    html = """
+    <html><head>
+      <link rel="alternate" type="text/markdown"
+            href="https://four-meme.gitbook.io/four.meme/brand/protocol-integration.md"/>
+    </head><body>You're not authorized to access this page.</body></html>
+    """
+    markdown = "# Protocol Integration\n\nDirect markdown content\n"
+
+    class BadProxyClient:
+        def get(self, url, headers=None):
+            raise ConnectionError("Failed to connect to proxy")
+
+    class DirectClient:
+        def get(self, url, headers=None):
+            return SimpleNamespace(
+                status_code=200,
+                text=markdown,
+                headers={"content-type": "text/markdown; charset=utf-8"},
+            )
+
+    engine = FetchEngine(AppConfig(enable_free_proxy_pool=True))
+    monkeypatch.setattr(
+        engine,
+        "_select_proxy",
+        lambda allowed_schemes=None: "http://bad-proxy:8080",
+    )
+    monkeypatch.setattr(
+        engine,
+        "_get_httpx_client",
+        lambda proxy_url=None: BadProxyClient() if proxy_url else DirectClient(),
+    )
+
+    try:
+        result = engine._upgrade_if_empty(
+            _task(),
+            {},
+            FetchResult(
+                ok=True,
+                url="https://four-meme.gitbook.io/four.meme/protocol-integration",
+                status_code=200,
+                content=html,
+                strategy_used="httpx",
+            ),
+        )
+    finally:
+        engine.close()
+
+    assert result.ok is True
+    assert result.proxy_url == ""
+    assert "Direct markdown content" in result.content
+
+
 def test_markdown_result_extracts_as_plain_text():
     task = _task()
     result = FetchResult(

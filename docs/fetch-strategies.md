@@ -258,5 +258,6 @@ FREE_PROXY_MAX_COUNT=200
 3. Playwright 复用浏览器池，不动态切换免费代理；需要浏览器代理时建议配置稳定的 `HTTPS_PROXY`，或使用 `scrapling_stealth`。
 
 抓取链会对免费代理做轻量健康记录：成功后清除失败状态；失败或返回不可用内容后临时冷却该代理，避免同一个坏代理被连续选中。
+如果免费代理连接失败，curl_cffi、httpx、Scrapling 和 GitBook markdown alternate 会自动直连重试一次；显式配置的 `HTTPS_PROXY` / `HTTP_PROXY` 不会被绕过。
 
 免费公共代理稳定性和安全性不可控；监控敏感内容时建议关闭代理池，或配置稳定的 `HTTPS_PROXY` / `HTTP_PROXY`。
