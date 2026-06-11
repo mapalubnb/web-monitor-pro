@@ -738,10 +738,16 @@ class FetchEngine:
             if _is_access_denied_text(html_result.content):
                 logger.info("[{}] deep extract skipped access-denied page", task.name)
                 return None
+            if _is_challenge_text(html_result.content):
+                logger.info("[{}] deep extract skipped bot-challenge page", task.name)
+                return None
             text = try_deep_extract(html_result.content)
             if text and len(text) >= 120:
                 if _is_access_denied_text(text):
                     logger.info("[{}] deep extract rejected access-denied page", task.name)
+                    return None
+                if _is_challenge_text(text):
+                    logger.info("[{}] deep extract rejected bot-challenge page", task.name)
                     return None
                 strategy = f"{html_result.strategy_used}\u2192deep"
                 logger.info("[{}] deep extract ok ({} chars, strategy={})",
@@ -801,9 +807,13 @@ class FetchEngine:
             from .extractor import extract_meta_fallback
             if _is_access_denied_text(html_result.content):
                 return None
+            if _is_challenge_text(html_result.content):
+                return None
             text = extract_meta_fallback(html_result.content)
             if text and len(text) >= 30:
                 if _is_access_denied_text(text):
+                    return None
+                if _is_challenge_text(text):
                     return None
                 strategy = f"{html_result.strategy_used}→meta"
                 logger.info("[{}] meta-tag fallback ok ({} chars)", task.name, len(text))
@@ -823,12 +833,12 @@ class FetchEngine:
             markdown = self._try_markdown_alternate(task, result)
             if markdown is not None:
                 return markdown
-            deep = self._try_deep_extract(task, result)
-            if deep is not None:
-                return deep
             stealth = self._try_scrapling_stealth_upgrade(task, headers, result)
             if stealth is not None:
                 return stealth
+            deep = self._try_deep_extract(task, result)
+            if deep is not None:
+                return deep
 
         reason = ("binary garbage" if _looks_like_binary_garbage(result.content or "")
                   else f"shell/insufficient (len={len(result.content or '')})")

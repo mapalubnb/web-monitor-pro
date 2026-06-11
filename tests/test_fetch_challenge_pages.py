@@ -69,6 +69,35 @@ def test_challenge_page_upgrades_to_scrapling_stealth(monkeypatch):
     assert result.strategy_used == "httpx→scrapling_stealth"
 
 
+def test_deep_extract_rejects_javascript_challenge(monkeypatch):
+    engine = FetchEngine(AppConfig(enable_free_proxy_pool=False))
+    challenge_text = (
+        "JavaScript is disabled\n"
+        "In order to continue, we need to verify that you're not a robot. "
+        "This requires JavaScript. Enable JavaScript and then reload the page."
+    )
+    monkeypatch.setattr(
+        "src.fetcher.extractor.try_deep_extract",
+        lambda _html: challenge_text,
+    )
+
+    try:
+        result = engine._try_deep_extract(
+            _task(),
+            FetchResult(
+                ok=True,
+                url="https://www.binance.com/en/proof-of-collateral",
+                status_code=200,
+                content="<html><body>shell</body></html>",
+                strategy_used="httpx",
+            ),
+        )
+    finally:
+        engine.close()
+
+    assert result is None
+
+
 def test_challenge_page_failure_reason_is_clear(monkeypatch):
     engine = FetchEngine(AppConfig(enable_free_proxy_pool=False))
     monkeypatch.setattr(
