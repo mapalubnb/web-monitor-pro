@@ -8,7 +8,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from html import unescape
 from typing import Any
+from urllib.parse import urljoin
 
 from ..config import AppConfig
 from ..db import Task
@@ -156,6 +158,14 @@ _NAV_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _TAG_RE = re.compile(r"<[^>]+>")
+_MARKDOWN_ALTERNATE_RE = re.compile(
+    r"<link\b"
+    r"(?=[^>]*\brel=[\"'][^\"']*\balternate\b[^\"']*[\"'])"
+    r"(?=[^>]*\btype=[\"']text/markdown[\"'])"
+    r"(?=[^>]*\bhref=[\"']([^\"']+)[\"'])"
+    r"[^>]*>",
+    re.IGNORECASE,
+)
 
 _JS_BODY_LEN = "() => (document.body && document.body.innerText || '').trim().length"
 _JS_BODY_READY = "() => (document.body && document.body.innerText || '').trim().length >= 200"
@@ -200,6 +210,23 @@ def _is_access_denied_text(text: str) -> bool:
         return False
     # Avoid false positives in long articles that merely discuss "access denied".
     return len(lower) < 5000 or "you're not authorized to access this page" in lower
+
+
+def _find_markdown_alternate(html: str, base_url: str) -> str | None:
+    """Find a page-declared Markdown alternate URL, used by GitBook-style docs."""
+    if not html:
+        return None
+    match = _MARKDOWN_ALTERNATE_RE.search(html)
+    if not match:
+        return None
+    return urljoin(base_url, unescape(match.group(1)))
+
+
+def _is_markdown_not_found(text: str) -> bool:
+    lower = " ".join((text or "").lower().split())
+    return lower.startswith("# page not found") or (
+        "## suggested pages" in lower and "does not exist" in lower
+    )
 
 
 def _is_content_usable(result: FetchResult, task: Task) -> bool:
@@ -636,6 +663,9 @@ class FetchEngine:
 
         best_html = result if result.ok else result2
         if best_html.ok and best_html.content:
+            markdown = self._try_markdown_alternate(task, best_html)
+            if markdown is not None:
+                return markdown
             deep = self._try_deep_extract(task, best_html)
             if deep is not None:
                 return deep
@@ -645,6 +675,9 @@ class FetchEngine:
             logger.info("[{}] auto escalated to {}", task.name, scrapling_result.strategy_used)
             return scrapling_result
         if scrapling_result.ok and scrapling_result.content:
+            markdown = self._try_markdown_alternate(task, scrapling_result)
+            if markdown is not None:
+                return markdown
             deep = self._try_deep_extract(task, scrapling_result)
             if deep is not None:
                 return deep
@@ -704,6 +737,43 @@ class FetchEngine:
             pass
         return None
 
+    def _try_markdown_alternate(self, task: Task, html_result: FetchResult) -> FetchResult | None:
+        """Fetch a declared Markdown alternate, common on GitBook documentation pages."""
+        markdown_url = _find_markdown_alternate(html_result.content, html_result.url or task.url)
+        if not markdown_url:
+            return None
+
+        try:
+            proxy_url = self._select_proxy(allowed_schemes={"http", "https"})
+            client = self._get_httpx_client(proxy_url)
+            if client is None:
+                return None
+            resp = client.get(markdown_url, headers={
+                "Accept": "text/markdown,text/plain;q=0.9,text/html;q=0.5,*/*;q=0.1",
+                "User-Agent": random.choice(_UA_POOL),
+            })
+            text = resp.text or ""
+            if not (200 <= resp.status_code < 300):
+                return None
+            if len(text.strip()) < 30:
+                return None
+            if _is_access_denied_text(text) or _is_markdown_not_found(text):
+                return None
+            strategy = f"{html_result.strategy_used}→markdown"
+            logger.info("[{}] markdown alternate ok ({} chars, url={})",
+                        task.name, len(text), markdown_url)
+            return FetchResult(
+                ok=True,
+                url=task.url,
+                status_code=resp.status_code,
+                content=text,
+                content_type=resp.headers.get("content-type", "text/markdown"),
+                strategy_used=strategy,
+            )
+        except Exception as e:
+            logger.debug("[{}] markdown alternate failed: {}", task.name, e)
+            return None
+
     def _try_meta_extract(self, task: Task, html_result: FetchResult) -> FetchResult | None:
         """Last-resort fallback: extract meta tags from an SPA shell.
 
@@ -734,6 +804,9 @@ class FetchEngine:
             return result
 
         if result.content:
+            markdown = self._try_markdown_alternate(task, result)
+            if markdown is not None:
+                return markdown
             deep = self._try_deep_extract(task, result)
             if deep is not None:
                 return deep

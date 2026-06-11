@@ -47,6 +47,9 @@ def extract(task: Task, result: FetchResult) -> str:
     if task_type == "json" or "json" in content_type:
         return _extract_json(content, task.json_path)
 
+    if "markdown" in content_type or strategy.endswith("→markdown"):
+        return _normalize(content)
+
     if strategy.endswith("→deep"):
         return _normalize(content)
 
