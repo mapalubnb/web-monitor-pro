@@ -114,6 +114,14 @@ _CHALLENGE_MARKERS = (
     "checking your browser", "cf-challenge", "cf_chl_opt",
     "just a moment", "attention required",
     "/cdn-cgi/challenge-platform",
+    "javascript is disabled",
+    "verify that you're not a robot",
+    "verify that you are not a robot",
+    "this requires javascript",
+    "enable javascript and then reload the page",
+    "please enable js and disable any ad blocker",
+    "robot check",
+    "anti-bot",
 )
 
 _ERROR_PAGE_MARKERS = (
@@ -212,6 +220,14 @@ def _is_access_denied_text(text: str) -> bool:
     return len(lower) < 5000 or "you're not authorized to access this page" in lower
 
 
+def _is_challenge_text(text: str) -> bool:
+    """Detect bot/JS verification pages that may still return HTTP 200."""
+    if not text:
+        return False
+    lower = " ".join(text.lower().split())
+    return any(m in lower for m in _CHALLENGE_MARKERS)
+
+
 def _find_markdown_alternate(html: str, base_url: str) -> str | None:
     """Find a page-declared Markdown alternate URL, used by GitBook-style docs."""
     if not html:
@@ -245,7 +261,7 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
         return False
 
     lower = text.lower()
-    if any(m in lower for m in _CHALLENGE_MARKERS):
+    if _is_challenge_text(lower):
         return False
     if result.inner_text and _is_error_page(result.inner_text):
         return False
@@ -810,6 +826,9 @@ class FetchEngine:
             deep = self._try_deep_extract(task, result)
             if deep is not None:
                 return deep
+            stealth = self._try_scrapling_stealth_upgrade(task, headers, result)
+            if stealth is not None:
+                return stealth
 
         reason = ("binary garbage" if _looks_like_binary_garbage(result.content or "")
                   else f"shell/insufficient (len={len(result.content or '')})")
@@ -828,11 +847,25 @@ class FetchEngine:
             error=self._unusable_reason(pw if pw.ok else result),
         )
 
+    def _try_scrapling_stealth_upgrade(
+        self, task: Task, headers: dict, result: FetchResult
+    ) -> FetchResult | None:
+        """Use Scrapling stealth for bot/JS challenge pages before Playwright fallback."""
+        if not _is_challenge_text(result.content or result.inner_text):
+            return None
+        stealth = self._fetch_scrapling(task, headers, "scrapling_stealth")
+        if stealth.ok and _is_content_usable(stealth, task):
+            stealth.strategy_used = f"{result.strategy_used}→scrapling_stealth"
+            return stealth
+        return None
+
     @staticmethod
     def _unusable_reason(result: FetchResult) -> str:
         content = result.inner_text or result.content or ""
         if _is_access_denied_text(content):
             return "access denied / unauthorized page detected"
+        if _is_challenge_text(content):
+            return "bot challenge / JavaScript verification page detected"
         if _looks_like_binary_garbage(result.content or ""):
             return "binary garbage response"
         return f"content unusable (len={len(result.content or '')})"
