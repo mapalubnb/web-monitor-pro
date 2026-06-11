@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import random
 import uuid
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger

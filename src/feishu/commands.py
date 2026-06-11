@@ -11,25 +11,25 @@
 from __future__ import annotations
 
 import argparse
-import json
 import platform
 import re
 import shlex
 import socket
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy import func, select
 
+from .. import __version__
 from ..config import AppConfig
 from ..db import ChangeHistory, PushLog, Task, session_scope
 from ..logger import get_today_log_path, logger, tail_log
 from ..risk_control import RiskController
 from . import cards
-from .. import __version__
 
 
 # ============================================================
@@ -46,11 +46,11 @@ class CommandResponse:
     sync_scheduler_task_ids: list[int] = field(default_factory=list)
 
     @classmethod
-    def err(cls, reason: str, suggestion: str = "") -> "CommandResponse":
+    def err(cls, reason: str, suggestion: str = "") -> CommandResponse:
         return cls(card=cards.error_card("操作失败", reason, suggestion))
 
     @classmethod
-    def ok(cls, title: str, detail: str = "") -> "CommandResponse":
+    def ok(cls, title: str, detail: str = "") -> CommandResponse:
         return cls(card=cards.success_card(title, detail))
 
 

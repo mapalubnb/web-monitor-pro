@@ -1,6 +1,6 @@
 [project]
 name = "web-monitor-pro"
-version = "0.1.0"
+version = "0.4.0"
 description = "高风控友好的网页变化监控服务，集成飞书交互机器人"
 readme = "README.md"
 requires-python = ">=3.11"

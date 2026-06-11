@@ -119,10 +119,14 @@ if [[ -f "${ENV_FILE}" ]]; then
         echo 'PLAYWRIGHT_MAX_PAGES=20' >> "${ENV_FILE}"
         ADDED=1
     fi
+    if ! grep -q 'ENABLE_SCRAPLING' "${ENV_FILE}" 2>/dev/null; then
+        echo 'ENABLE_SCRAPLING=true' >> "${ENV_FILE}"
+        ADDED=1
+    fi
     if [[ ${ADDED} -eq 1 ]]; then
-        ok "已添加 Playwright 配置项"
+        ok "已添加新增配置项"
     else
-        info "Playwright 配置项已存在，跳过"
+        info "新增配置项已存在，跳过"
     fi
 else
     warn ".env 文件不存在，从模板创建..."
@@ -157,8 +161,7 @@ echo -e "  查看状态:  ${YELLOW}sudo systemctl status ${SERVICE_NAME}${NC}"
 echo -e "  查看日志:  ${YELLOW}sudo journalctl -u ${SERVICE_NAME} -f${NC}"
 echo ""
 echo -e "  本次升级内容:"
-echo -e "    - 移除 Jina Reader / Firecrawl 外部 API 依赖"
-echo -e "    - 新增深度提取（SSR 嵌入数据 + RSC Flight 解析）"
-echo -e "    - 新增 Playwright 渲染（纯 CSR 站点兜底）"
-echo -e "    - 四级自动策略链: curl_cffi → httpx → deep extract → Playwright"
+echo -e "    - 自建抓取链路: curl_cffi → httpx → deep extract → Scrapling → Playwright"
+echo -e "    - Scrapling 自适应选择器与隐身抓取增强"
+echo -e "    - 简化飞书卡片输出，默认自动启用选择器自适应"
 echo ""

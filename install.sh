@@ -110,9 +110,16 @@ info "安装 Python 依赖（可能需要几分钟）..."
 ok "Python 依赖已安装"
 
 info "安装 Playwright Chromium（约 120MB，纯 CSR 站点渲染用）..."
-"${VENV_DIR}/bin/python" -m playwright install chromium 2>/dev/null || true
-"${VENV_DIR}/bin/python" -m playwright install-deps chromium 2>/dev/null || true
-ok "Playwright Chromium 已就绪"
+PW_READY=1
+"${VENV_DIR}/bin/python" -m playwright install chromium 2>/dev/null || PW_READY=0
+"${VENV_DIR}/bin/python" -m playwright install-deps chromium 2>/dev/null || PW_READY=0
+if [[ ${PW_READY} -eq 1 ]]; then
+    ok "Playwright Chromium 已就绪"
+else
+    warn "Playwright Chromium 或系统依赖安装失败，HTTP/JSON 监控仍可用，浏览器渲染可能不可用"
+    warn "可稍后手动运行：${VENV_DIR}/bin/python -m playwright install chromium"
+    warn "以及：${VENV_DIR}/bin/python -m playwright install-deps chromium"
+fi
 
 # ---- 4. 初始化配置 ----
 cd "${PROJECT_DIR}"

@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import (
-    JSON, Boolean, DateTime, ForeignKey, Integer, String, Text,
-    create_engine, event,
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    event,
 )
 from sqlalchemy.orm import (
-    DeclarativeBase, Mapped, Session, mapped_column, sessionmaker,
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    sessionmaker,
 )
 
 from .config import DB_PATH
@@ -25,7 +37,7 @@ def now_utc() -> datetime:
     当前时间，既消除 DeprecationWarning，也避免 naive/aware 混用带来的
     微妙 bug。返回值会被 SQLAlchemy DateTime 列直接存为 UTC。
     """
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):
@@ -195,7 +207,9 @@ def _auto_migrate() -> None:
     不支持删除列、不支持改类型。此处仅做"加列 + 设默认值"的向前兼容；
     如需重命名/删除列，请手动迁移或使用 Alembic。
     """
-    from sqlalchemy import inspect as sa_inspect, text
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy import text
+
     from .logger import logger
 
     inspector = sa_inspect(_ENGINE)

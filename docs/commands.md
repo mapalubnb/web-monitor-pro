@@ -82,6 +82,27 @@
 
 ---
 
+### `/snapshot <id>`
+
+下载该任务当前基准快照。
+
+---
+
+### `/reset <id> [选项]`
+
+清空基准快照，下次检查会重新建立首次快照。可同时调整高级参数：
+
+| 选项 | 说明 |
+| --- | --- |
+| `--strategy scrapling_stealth` | 切换抓取策略 |
+| `--impersonate chrome131` | 切换 curl_cffi 浏览器指纹 |
+| `--selector "main"` | 更新 CSS 选择器，并默认启用自适应 |
+| `--no-adaptive-selector` | 关闭 selector 自适应 |
+| `--wait-selector "main"` | 浏览器策略等待指定元素 |
+| `--extract-next-data` | 启用 SPA 嵌入数据提取 |
+
+---
+
 ### `/keyword <id> add <关键字>` / `/keyword <id> remove <关键字>`
 
 为任务添加或移除关键字。设置关键字后，**只有 diff 命中关键字才会推送**。
@@ -138,6 +159,12 @@
 ```
 /sniff https://four.meme/en/create-token
 ```
+
+---
+
+### `/debug <id>`
+
+立即抓取一次并诊断页面：识别框架、嵌入数据、当前策略和修复建议，同时附上 HTML 文件。
 
 ---
 

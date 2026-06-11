@@ -75,8 +75,8 @@ def _fields(pairs: list[tuple[str, str, bool]]) -> dict:
         "tag": "div",
         "fields": [
             {"is_short": s, "text": {"tag": "lark_md",
-                                     "content": f"**{l}**\n{v}"}}
-            for l, v, s in pairs
+                                     "content": f"**{label}**\n{value}"}}
+            for label, value, s in pairs
         ],
     }
 
@@ -340,7 +340,7 @@ def history_card(task_name: str, task_id: int, items: list[dict]) -> dict:
         _div(f"**{task_name}** 最近 {len(items)} 条变更"),
         _hr(),
     ]
-    for i, it in enumerate(items, 1):
+    for it in items:
         matched = ", ".join(it.get("matched_keywords") or [])
         kw_part = f"　🎯 {matched}" if matched else ""
         elements.append(_div(
@@ -453,7 +453,7 @@ def fetch_failure_card(task_id: int, task_name: str, url: str,
             _div(f"```\n{error[:500]}\n```"),
             _hr(),
             _note(f"`/debug {task_id}` 诊断 · "
-                  f"`/reset {task_id} --strategy playwright` 切换策略"),
+                  f"`/reset {task_id} --strategy scrapling_stealth` 切换策略"),
         ],
         subtitle=task_name,
     )

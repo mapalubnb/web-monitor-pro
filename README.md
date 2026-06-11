@@ -25,6 +25,7 @@ FetchEngine  Extractor             DiffEngine        FeishuClient
  ├ curl_cffi   ├ CSS selector       ├ text diff       ├ WebSocket
  ├ httpx       ├ SPA/RSC data       └ JSON diff       ├ cards
  ├ deep SSR    ├ trafilatura                          └ file upload
+ ├ Scrapling   ├ adaptive selector
  └ Playwright  └ innerText
        │
        ▼
@@ -35,16 +36,18 @@ FetchEngine  Extractor             DiffEngine        FeishuClient
    └ noise filter
 ```
 
-### 抓取策略（四级递进）
+### 抓取策略（自动递进）
 
 | 级别 | 策略 | 适用场景 | 耗时 |
 |------|------|---------|------|
 | L1 | `httpx` | 静态页面（政府、新闻、博客） | <1s |
 | L2 | `curl_cffi` | Cloudflare 防护站点（TLS/JA3 指纹伪装） | 1-3s |
 | L3 | Deep Extract | SPA 嵌入数据（Next.js `__NEXT_DATA__` / RSC Flight / Nuxt / Apollo） | <0.1s |
-| L4 | `Playwright` | 纯 CSR / DeFi 前端（headless Chromium 渲染） | 10-20s |
+| L4 | `Scrapling` | 自适应选择器、动态页面、隐身抓取增强 | 1-20s |
+| L5 | `Playwright` | 纯 CSR / DeFi 前端（headless Chromium 渲染） | 10-20s |
 
 `auto` 模式下自动从 L1 逐级尝试，首次成功后锁定策略（后续复用，失效再降级）。
+配置 `--selector` 时会自动启用 Scrapling 自适应重定位，页面小改版时更不容易空提取。
 
 ### 变化检测
 
@@ -106,7 +109,7 @@ sudo journalctl -u web-monitor-pro -f
 | 命令 | 说明 |
 |------|------|
 | `/help` | 查看命令手册 |
-| `/add <url> [options]` | 新增监控（支持 `--name` `--strategy` `--interval` `--type json` `--selector` `--json-path` `--impersonate` `--extract-next-data` `--keyword` 等） |
+| `/add <url> [options]` | 新增监控（常用：`--name` `--interval` `--type json` `--selector` `--json-path` `--keyword`；高级：`--strategy` `--impersonate` 等） |
 | `/list` | 列出所有任务（带管理按钮） |
 | `/check <id>` | 立即触发检查 |
 | `/pause <id>` / `/resume <id>` | 暂停 / 恢复 |
@@ -117,7 +120,7 @@ sudo journalctl -u web-monitor-pro -f
 | `/interval <id> <seconds>` | 修改检查间隔（≥10 秒） |
 | `/debug <id>` | 诊断（识别框架、嵌入数据、给出建议，附 HTML 下载） |
 | `/sniff <url>` | 抓包辅助（引导找 API） |
-| `/reset <id> [--strategy --impersonate --selector --extract-next-data]` | 重置基准快照（可同时调整抓取参数） |
+| `/reset <id> [options]` | 重置基准快照（可同时调整抓取参数） |
 | `/mute <30m/2h/1d>` / `/unmute` | 免打扰 |
 | `/log [--tail N]` | 查看日志（附完整日志下载） |
 | `/status` | 服务健康状态 |
@@ -135,15 +138,15 @@ sudo journalctl -u web-monitor-pro -f
 | HTTP | `httpx[http2]` | 轻量 HTTP/2 客户端 |
 | 解压 | `brotli` `zstandard` | br/zstd 响应解压 |
 | 解析 | `selectolax` | 高性能 HTML 解析 |
-| 提取 | `trafilatura` `readability-lxml` | 正文提取 |
+| 提取 | `trafilatura` | 正文提取 |
 | Diff | `deepdiff` | JSON 结构化 diff |
 | 飞书 | `lark-oapi` | 官方 SDK（WebSocket + 消息 API） |
 | 调度 | `APScheduler` | 后台任务调度 |
-| 存储 | `SQLAlchemy` `aiosqlite` | ORM + SQLite |
+| 存储 | `SQLAlchemy` | ORM + SQLite |
 | 配置 | `PyYAML` `python-dotenv` | YAML / .env 解析 |
 | 日志 | `loguru` | 中文日志，按天轮转 |
 | 渲染 | `playwright` `playwright-stealth` | 无头浏览器（纯 CSR 兜底） |
-| 重试 | `tenacity` | 指数退避重试 |
+| 增强 | `scrapling[fetchers]` | 自适应选择器 + 隐身抓取 |
 
 ---
 
@@ -158,6 +161,7 @@ sudo journalctl -u web-monitor-pro -f
 - **推送冷却**：同任务 30s 内最多推一次
 - **噪音过滤**：变化占比 < 0.5% 视为噪音不推送
 - **Playwright stealth**：隐藏无头浏览器特征
+- **Scrapling 自适应选择器**：配置 `--selector` 后自动保存元素特征，选择器失效时尝试重定位
 
 ---
 

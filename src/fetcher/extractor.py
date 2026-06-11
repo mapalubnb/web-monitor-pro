@@ -377,6 +377,7 @@ def _by_scrapling_selector(html: str, selector: str, task: Task) -> str:
     """Use Scrapling adaptive selector when enabled for a task."""
     try:
         from scrapling import Selector
+
         from ..config import DATA_DIR
     except ImportError:
         logger.warning("Scrapling 未安装，无法使用自适应选择器，回退 selectolax")

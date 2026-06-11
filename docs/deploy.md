@@ -34,6 +34,8 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip wheel
 pip install -r requirements.txt
+python -m playwright install chromium
+python -m playwright install-deps chromium
 
 # 配置
 cp .env.example .env
@@ -66,9 +68,6 @@ tail -f data/logs/monitor_$(date +%F).log
 # 查看中文日志（项目自身的）
 tail -100 data/logs/monitor_$(date +%F).log
 
-# 查看最近错误
-tail -50 data/logs/error_$(date +%F).log
-
 # 开机自启（install.sh 已自动启用）
 sudo systemctl enable web-monitor-pro
 sudo systemctl disable web-monitor-pro
@@ -80,10 +79,7 @@ sudo systemctl disable web-monitor-pro
 
 ```bash
 cd web-monitor-pro
-git pull
-source venv/bin/activate
-pip install -r requirements.txt
-sudo systemctl restart web-monitor-pro
+sudo bash upgrade.sh
 ```
 
 ---
@@ -96,15 +92,15 @@ web-monitor-pro/
 ├── venv/                   # Python 虚拟环境（install.sh 生成）
 ├── data/
 │   ├── monitor.db          # SQLite 数据库
-│   ├── logs/               # 日志（按天轮转，保留 30 天）
+│   ├── logs/               # 日志（按天轮转，保留 14 天）
 │   │   ├── monitor_YYYY-MM-DD.log
-│   │   ├── error_YYYY-MM-DD.log
 │   │   ├── systemd-stdout.log
 │   │   └── systemd-stderr.log
 │   └── snapshots/          # 快照 / diff 文件
 │       ├── task_1_latest.txt
-│       ├── task_1_20260510_143022.txt
-│       └── task_1_diff_20260510_143022.diff
+│       ├── task_1_latest.diff
+│       ├── task_1_pending.hash
+│       └── task_1_debug.html
 ├── .env                    # 敏感配置（install.sh 生成，需手动填）
 ├── config.yaml             # 业务配置（install.sh 生成）
 ├── install.sh
@@ -118,8 +114,8 @@ web-monitor-pro/
 
 ```bash
 sudo bash uninstall.sh       # 仅卸载 systemd 服务，保留代码和数据
-# 如需彻底清理：
-rm -rf /path/to/web-monitor-pro
+# 如需彻底清理运行数据：
+sudo bash uninstall.sh --purge
 ```
 
 ---

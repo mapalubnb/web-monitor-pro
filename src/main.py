@@ -189,8 +189,7 @@ class App:
         try:
             import lark_oapi as lark
         except ImportError as e:
-            logger.error("lark-oapi 未安装：{}", e)
-            return
+            raise RuntimeError("lark-oapi 未安装，请执行 pip install -r requirements.txt") from e
 
         builder = (
             lark.EventDispatcherHandler.builder("", "")
