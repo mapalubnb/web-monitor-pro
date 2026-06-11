@@ -132,21 +132,21 @@ def startup_card(task_count: int, default_interval: int,
 def help_card() -> dict:
     sections = [
         ("任务管理",
-         "`/add <url> [选项]` — 新增监控\n"
+         "`/add <url>` — 新增监控，自动选择抓取方式\n"
+         "`/add <url> --selector \"main\"` — 只监控页面指定区域\n"
+         "`/add <api_url> --type json --json-path data.items` — 监控 API 字段\n"
          "`/list` — 列出所有任务\n"
          "`/pause <id>` · `/resume <id>` · `/remove <id>`\n"
          "`/check <id>` — 立即检查\n"
          "`/history <id>` — 变更历史\n"
          "`/snapshot <id>` — 下载快照\n"
-         "`/interval <id> <秒>` — 修改间隔\n"
-         "`/reset <id> [--strategy playwright]` — 重置基准"),
+         "`/interval <id> <秒>` — 修改间隔"),
         ("精细配置",
          "`/keyword <id> add <词1>[, 词2]` — 添加关键字\n"
          "`/keyword <id> remove / list / clear`\n"
-         "`--strategy scrapling_stealth` — 使用 Scrapling 隐身浏览器\n"
-         "`--adaptive-selector --selector <css>` — 启用自适应选择器\n"
          "`/sniff <url>` — 抓包助手\n"
-         "`/debug <id>` — 诊断页面"),
+         "`/debug <id>` — 自动诊断并给出修复建议\n"
+         "`/reset <id> [选项]` — 重置基准或高级调参"),
         ("服务管理",
          "`/status` — 健康状态\n"
          "`/config` — 全局配置\n"
@@ -161,7 +161,7 @@ def help_card() -> dict:
         elements.append(_div(f"**{title}**\n{content}"))
         elements.append(_hr())
     elements.append(_note(
-        "示例：`/add https://example.com --name 官网 --interval 60 --keyword 招聘,金融`"
+        "通常只需要 `/add <url>`；设置了 `--selector` 时会自动启用自适应重定位。"
     ))
     return _card("📘 命令帮助", THEME["info"], elements)
 
@@ -172,17 +172,16 @@ def help_card() -> dict:
 def first_snapshot_card(task_id: int, task_name: str, url: str,
                         content_length: int, strategy: str) -> dict:
     return _card(
-        f"📸 首次快照　#{task_id}", THEME["first"],
+        f"📸 已开始监控　#{task_id}", THEME["first"],
         [
-            _div(f"任务 **{task_name}** 已建立基准快照，开始监控。"),
+            _div(f"**{task_name}** 已建立基准快照。"),
             _hr(),
             _fields([
-                ("正文长度", f"**{content_length:,}** 字", True),
-                ("抓取策略", f"`{strategy}`", True),
+                ("内容", f"**{content_length:,}** 字", True),
+                ("策略", f"`{strategy}`", True),
             ]),
             _div(f"[🔗 {url}]({url})"),
-            _hr(),
-            _note(f"📎 快照已附在文件中 · 时间 `{_now()}`"),
+            _note("后续只有确认变化时才会提醒。"),
         ],
         subtitle=task_name,
     )
@@ -198,36 +197,33 @@ def change_card(task_id: int, task_name: str, url: str,
                 has_diff_file: bool = True,
                 keyword_filtered: bool = False) -> dict:
     display = diff_summary or "（diff 摘要为空）"
-    if len(display) > 2800:
-        display = display[:2800] + "\n\n…（完整内容见附件）"
+    if len(display) > 1600:
+        display = display[:1600] + "\n\n…（完整内容见附件）"
 
     elements: list[dict] = [
-        _div(f"任务 **{task_name}** 检测到新变更"),
+        _div(
+            f"**{task_name}** 有新变化\n"
+            f"`+{added_count}` / `-{removed_count}` · 变化 `{change_ratio:.2%}`"
+        ),
     ]
 
     # 关键字命中提示
     if matched_keywords:
         kw_text = ", ".join(f"`{k}`" for k in matched_keywords)
-        suffix = "（已过滤仅展示相关行）" if keyword_filtered else ""
-        elements.append(_div(f"🎯 命中关键字：{kw_text}{suffix}"))
+        suffix = "，仅展示相关行" if keyword_filtered else ""
+        elements.append(_div(f"🎯 命中：{kw_text}{suffix}"))
 
-    elements.append(_hr())
-    elements.append(_fields([
-        ("新增", f"**+{added_count}** 行", True),
-        ("删除", f"**-{removed_count}** 行", True),
-        ("变化占比", f"**{change_ratio:.2%}**", True),
-        ("策略", f"`{strategy}`", True),
-    ]))
     elements.append(_hr())
     elements.append(_div(f"```diff\n{display}\n```"))
 
     note_parts = []
     if has_diff_file:
         note_parts.append("📎 完整 diff 见附件")
+    note_parts.append(f"策略 `{strategy}`")
     note_parts.append(f"[🔗 打开页面]({url})")
     elements.append(_note(" · ".join(note_parts)))
 
-    return _card(f"🔔 页面变化　#{task_id}", THEME["change"], elements,
+    return _card(f"🔔 页面有变化　#{task_id}", THEME["change"], elements,
                  subtitle=task_name)
 
 
@@ -254,11 +250,8 @@ def task_list_card(tasks: list[dict]) -> dict:
 
         elements.append(_div(
             f"{status} **#{t['id']} · {t['name']}**\n"
-            f"{t['url']}\n"
-            f"`{t['interval']}s` · "
-            f"检查 `{t.get('total_checks', 0)}` · "
-            f"变更 `{t.get('total_changes', 0)}` · "
-            f"最近 `{last}`"
+            f"[打开页面]({t['url']}) · `{t['interval']}s` · "
+            f"变更 `{t.get('total_changes', 0)}` · 最近 `{last}`"
             f"{kw_line}"
         ))
         elements.append(_action(_task_buttons(
@@ -267,7 +260,7 @@ def task_list_card(tasks: list[dict]) -> dict:
         )))
         elements.append(_hr())
 
-    elements.append(_note("`/add <url>` 添加新任务"))
+    elements.append(_note("添加任务通常只需 `/add <url>`"))
     return _card("📋 任务列表", THEME["info"], elements)
 
 
@@ -285,19 +278,24 @@ def task_detail_card(t: dict) -> dict:
     configured = t.get("strategy", "auto")
     strategy_text = f"`{actual}`" if actual else f"`{configured}`（未执行）"
 
+    advanced = []
+    if t.get("adaptive_selector"):
+        advanced.append(f"自适应 `{t.get('adaptive_threshold', 40)}`")
+    if t.get("wait_selector"):
+        advanced.append(f"等待 `{t['wait_selector']}`")
+    advanced_text = " · ".join(advanced) or "自动"
+
     elements: list[dict] = [
         _div(f"**{t['name']}**　{status}"),
         _div(f"[🔗 {t['url']}]({t['url']})"),
         _hr(),
         _fields([
             ("类型", t.get("type", "html"), True),
-            ("实际策略", strategy_text, True),
-            ("配置策略", f"`{configured}`", True),
-            ("浏览器指纹", t.get("impersonate", "chrome131"), True),
+            ("策略", strategy_text, True),
             ("检查间隔", f"{t['interval']} 秒", True),
-            ("累计检查", str(t.get("total_checks", 0)), True),
             ("累计变更", str(t.get("total_changes", 0)), True),
             ("连续失败", fail_text, True),
+            ("增强", advanced_text, True),
         ]),
     ]
 
@@ -305,14 +303,6 @@ def task_detail_card(t: dict) -> dict:
     extract_parts: list[str] = []
     if t.get("selector"):
         extract_parts.append(f"CSS 选择器：`{t['selector']}`")
-    if t.get("adaptive_selector"):
-        extract_parts.append(
-            f"自适应选择器：已启用（阈值 `{t.get('adaptive_threshold', 40)}`）"
-        )
-    if t.get("selector_identifier"):
-        extract_parts.append(f"选择器标识：`{t['selector_identifier']}`")
-    if t.get("wait_selector"):
-        extract_parts.append(f"渲染等待：`{t['wait_selector']}`")
     if t.get("json_path"):
         extract_parts.append(f"JSON Path：`{t['json_path']}`")
     if t.get("extract_next_data"):
@@ -429,7 +419,7 @@ def config_card(cfg: dict) -> dict:
             _hr(),
             _div(
                 f"**代理**：{cfg.get('proxy_info', '未启用')}\n"
-                f"**外部 API**：{cfg.get('external_apis', '未启用')}"
+                f"**增强模块**：{cfg.get('external_apis', '未启用')}"
             ),
         ],
     )

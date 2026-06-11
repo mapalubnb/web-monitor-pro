@@ -128,19 +128,17 @@ web-monitor-pro 采用**四级递进式抓取**，全自建无外部 API 依赖�
 ### 自适应选择器
 
 当目标页面局部改版导致原 CSS 选择器失效时，Scrapling 可以根据首次命中元素的结构特征重定位相似元素。
+只要任务配置了 `--selector`，服务会默认启用这项能力，无需额外参数。
 
 ```
 /add https://example.com/products \
-  --selector ".product-list" \
-  --adaptive-selector \
-  --selector-id product-list \
-  --adaptive-threshold 40
+  --selector ".product-list"
 ```
 
-如果已有任务需要启用：
+如需关闭：
 
 ```
-/reset <id> --adaptive-selector --selector-id main --adaptive-threshold 40
+/add https://example.com/products --selector ".product-list" --no-adaptive-selector
 ```
 
 ### 隐身抓取
@@ -149,7 +147,7 @@ web-monitor-pro 采用**四级递进式抓取**，全自建无外部 API 依赖�
 /add https://example.com --strategy scrapling_stealth --wait-selector "main"
 ```
 
-`--wait-selector` 会让浏览器等待指定元素出现后再提取，适合纯 CSR 页面。
+`--wait-selector` 会让浏览器等待指定元素出现后再提取，适合纯 CSR 页面。使用浏览器类策略并配置了 `--selector` 时，会自动复用该 selector 作为等待目标。
 
 ---
 

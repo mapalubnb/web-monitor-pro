@@ -206,6 +206,8 @@ class CommandDispatcher:
         parser.add_argument("--selector", default=None)
         parser.add_argument("--adaptive-selector", dest="adaptive_selector",
                             action="store_true")
+        parser.add_argument("--no-adaptive-selector", dest="disable_adaptive_selector",
+                            action="store_true")
         parser.add_argument("--selector-id", dest="selector_identifier", default=None)
         parser.add_argument("--adaptive-threshold", dest="adaptive_threshold",
                             type=int, default=40)
@@ -226,6 +228,10 @@ class CommandDispatcher:
         # 解析关键字：支持 --keyword a --keyword b,c --keyword "d e"
         # 英文/中文逗号、中文顿号都算分隔符
         keywords = _parse_keywords(ns.keyword)
+        adaptive_selector = _auto_adaptive_selector(
+            ns.selector, ns.adaptive_selector, ns.disable_adaptive_selector
+        )
+        wait_selector = _auto_wait_selector(ns.selector, ns.strategy, ns.wait_selector)
 
         with session_scope() as s:
             exists = s.execute(
@@ -239,10 +245,10 @@ class CommandDispatcher:
             t = Task(
                 name=name, url=url, type=ns.type, strategy=ns.strategy,
                 impersonate=ns.impersonate, selector=ns.selector,
-                adaptive_selector=ns.adaptive_selector,
-                selector_identifier=ns.selector_identifier,
+                adaptive_selector=adaptive_selector,
+                selector_identifier=ns.selector_identifier or ns.selector,
                 adaptive_threshold=max(1, min(ns.adaptive_threshold, 100)),
-                wait_selector=ns.wait_selector,
+                wait_selector=wait_selector,
                 json_path=ns.json_path, extract_next_data=ns.extract_next_data,
                 interval=ns.interval, keywords=keywords, enabled=True,
             )
@@ -258,13 +264,13 @@ class CommandDispatcher:
             f"\n🎯 关键字：{', '.join(f'`{k}`' for k in keywords)}"
             if keywords else ""
         )
-        adaptive_line = "\n🧭 自适应选择器：已启用" if ns.adaptive_selector else ""
+        adaptive_line = "\n🧭 已自动启用选择器自适应" if adaptive_selector else ""
         return CommandResponse(
             card=cards.success_card(
                 "任务已添加",
                 f"**#{task_id} · {name}**\n"
                 f"🔗 {url}\n"
-                f"⏱️ 间隔 {ns.interval}s · 🎯 策略 {ns.strategy}"
+                f"⏱️ 间隔 {ns.interval}s · 策略 `{ns.strategy}`"
                 f"{kw_line}{adaptive_line}\n\n"
                 f"首次抓取后会建立基准快照并推送卡片。",
             ),
@@ -658,18 +664,18 @@ class CommandDispatcher:
             recommendations.append(
                 f"高风控或纯 CSR 页面可尝试 `/reset {task_id} --strategy scrapling_stealth`"
             )
+        recommendations = recommendations[:4]
+        frameworks = "、".join(f["frameworks"]) or "未识别"
+        data_points = "、".join(x.replace("✅ ", "") for x in f["data_points"]) or "未找到"
         detail = (
-            f"**📊 诊断结果**\n\n"
-            f"🔖 任务：#{task_id} · {t.name}\n"
-            f"🌐 URL：{t.url}\n"
-            f"🎯 策略：`{result.strategy_used}`\n"
-            f"📏 HTML：{_humanize_size(f['html_size'])}\n"
-            f"👁️ 可见文本：{f['visible_text_length']} 字\n"
-            f"🏗️ 框架：{'、'.join(f['frameworks']) or '未识别'}\n\n"
-            f"**📦 数据嵌入点**\n"
-            f"{chr(10).join(f['data_points']) if f['data_points'] else '❌ 未找到'}\n\n"
-            f"**🧰 增强模块**\n{scrapling_note}\n\n"
-            f"**💡 建议**\n{chr(10).join(f'• {s}' for s in recommendations)}"
+            f"**#{task_id} · {t.name}**\n"
+            f"[打开页面]({t.url})\n\n"
+            f"策略 `{result.strategy_used}` · HTML `{_humanize_size(f['html_size'])}` · "
+            f"可见文本 `{f['visible_text_length']}` 字\n"
+            f"框架：{frameworks}\n"
+            f"数据：{data_points}\n"
+            f"{scrapling_note}\n\n"
+            f"**建议**\n{chr(10).join(f'• {s}' for s in recommendations)}"
         )
 
         # 附上 HTML 文件（写入 snapshots 目录，避免临时文件泄漏）
@@ -760,6 +766,10 @@ class CommandDispatcher:
                 changes.append(f"指纹→`{ns.impersonate}`")
             if ns.selector is not None:
                 t.selector = ns.selector
+                if not ns.disable_adaptive_selector:
+                    t.adaptive_selector = True
+                    if not t.selector_identifier:
+                        t.selector_identifier = ns.selector
                 changes.append(f"选择器→`{ns.selector}`")
             if ns.adaptive_selector:
                 t.adaptive_selector = True
@@ -856,6 +866,32 @@ def _make_parser(prog: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=f"/{prog}", add_help=False)
     p.error = lambda msg: (_ for _ in ()).throw(SystemExit(msg))  # type: ignore
     return p
+
+
+def _auto_adaptive_selector(
+    selector: str | None,
+    requested: bool = False,
+    disabled: bool = False,
+) -> bool:
+    """Default to resilient selector extraction without extra user config."""
+    if disabled:
+        return False
+    return bool(requested or selector)
+
+
+def _auto_wait_selector(
+    selector: str | None,
+    strategy: str,
+    explicit_wait_selector: str | None = None,
+) -> str | None:
+    """Reuse the extraction selector as render wait target for browser strategies."""
+    if explicit_wait_selector:
+        return explicit_wait_selector
+    if not selector:
+        return None
+    if strategy in ("playwright", "scrapling_dynamic", "scrapling_stealth", "scrapling_auto"):
+        return selector
+    return None
 
 
 def _url_to_name(url: str) -> str:

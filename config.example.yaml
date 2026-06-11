@@ -10,12 +10,9 @@ tasks: []
 # tasks:
 #   - name: "产品列表"
 #     url: "https://example.com/products"
-#     strategy: "scrapling_static"
 #     selector: ".product-list"
-#     adaptive_selector: true
-#     selector_identifier: "product-list"
-#     adaptive_threshold: 40
 #     interval: 300
+#     # 配置 selector 时会自动启用自适应重定位。
 
 # ============================================================
 # 全局风控配置

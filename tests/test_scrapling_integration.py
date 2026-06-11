@@ -1,5 +1,6 @@
 from src.config import load_config
 from src.db import Task
+from src.feishu.commands import _auto_adaptive_selector, _auto_wait_selector
 from src.fetcher.engine import SCRAPLING_STRATEGIES, SUPPORTED_STRATEGIES
 from src.fetcher.extractor import _by_selector
 
@@ -48,3 +49,16 @@ def test_adaptive_selector_falls_back_to_selectolax_when_unavailable():
     html = "<html><body><main><h1>Hello</h1><p>World</p></main></body></html>"
 
     assert _by_selector(html, "main", task) == "Hello\nWorld"
+
+
+def test_selector_defaults_to_adaptive_unless_disabled():
+    assert _auto_adaptive_selector(".content") is True
+    assert _auto_adaptive_selector(None, requested=True) is True
+    assert _auto_adaptive_selector(".content", disabled=True) is False
+
+
+def test_browser_strategies_reuse_selector_as_wait_target():
+    assert _auto_wait_selector("main", "scrapling_stealth") == "main"
+    assert _auto_wait_selector("main", "playwright") == "main"
+    assert _auto_wait_selector("main", "httpx") is None
+    assert _auto_wait_selector("main", "httpx", "#ready") == "#ready"

@@ -79,10 +79,15 @@ class App:
                     name=t.name, url=t.url, type=t.type,
                     strategy=t.strategy, impersonate=t.impersonate,
                     selector=t.selector,
-                    adaptive_selector=t.adaptive_selector,
-                    selector_identifier=t.selector_identifier,
+                    adaptive_selector=t.adaptive_selector or bool(t.selector),
+                    selector_identifier=t.selector_identifier or t.selector,
                     adaptive_threshold=t.adaptive_threshold,
-                    wait_selector=t.wait_selector,
+                    wait_selector=t.wait_selector or (
+                        t.selector if t.selector and t.strategy in (
+                            "playwright", "scrapling_dynamic",
+                            "scrapling_stealth", "scrapling_auto",
+                        ) else None
+                    ),
                     json_path=t.json_path,
                     extract_next_data=t.extract_next_data,
                     interval=t.interval,
