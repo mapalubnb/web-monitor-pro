@@ -218,3 +218,30 @@ Playwright 会启动 headless Chromium 渲染页面并提取完整 DOM。
 - ✅ Playwright stealth（隐藏无头浏览器特征）
 
 **进阶**：如需代理，在 `.env` 中配置 `HTTPS_PROXY=socks5://host:port` 即可。
+
+### 可选：Proxifly 免费代理池
+
+项目支持接入 [proxifly/free-proxy-list](https://github.com/proxifly/free-proxy-list)。
+Proxifly 的列表约每 5 分钟更新，提供 HTTP、HTTPS、SOCKS4、SOCKS5，并有 `.txt`、`.json`、`.csv` 格式。服务默认使用 txt 直链：
+
+```
+https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt
+```
+
+默认关闭，启用方式：
+
+```ini
+ENABLE_FREE_PROXY_POOL=true
+FREE_PROXY_SOURCE_URL=https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt
+FREE_PROXY_REFRESH_SECONDS=600
+FREE_PROXY_MAX_COUNT=200
+```
+
+优先级：
+
+1. 如果配置了 `HTTPS_PROXY` 或 `HTTP_PROXY`，始终优先使用显式代理。
+2. 未配置显式代理且 `ENABLE_FREE_PROXY_POOL=true` 时，curl_cffi、httpx、Scrapling 抓取会自动轮换免费代理。
+   其中 httpx 只使用 HTTP/HTTPS 代理；curl_cffi 和 Scrapling 会按自身支持情况使用 HTTP/HTTPS/SOCKS。
+3. Playwright 复用浏览器池，不动态切换免费代理；需要浏览器代理时建议配置稳定的 `HTTPS_PROXY`，或使用 `scrapling_stealth`。
+
+免费公共代理稳定性和安全性不可控，建议只用于测试或非敏感监控任务。

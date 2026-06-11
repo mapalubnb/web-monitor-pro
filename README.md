@@ -156,6 +156,7 @@ sudo journalctl -u web-monitor-pro -f
 - **浏览器请求头**：完整 `Sec-Fetch-*` / UA 轮换 / `Accept-Encoding` 自适应
 - **单域名限流**：默认 10s 间隔（±30% 抖动，避免固定周期）
 - **并发控制**：信号量限制最大并发抓取数（默认 5）
+- **可选免费代理池**：支持 Proxifly `free-proxy-list`，默认关闭，启用后自动拉取/缓存/轮换
 - **失败退避**：60s → 5min → 15min → 1h 阶梯退避
 - **熔断**：连续失败达到阈值（默认 20，可通过 `CIRCUIT_BREAKER_THRESHOLD` 配置）后自动禁用任务并告警
 - **推送冷却**：同任务 30s 内最多推一次

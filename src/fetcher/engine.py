@@ -13,6 +13,7 @@ from typing import Any
 from ..config import AppConfig
 from ..db import Task
 from ..logger import logger
+from ..proxy_pool import FreeProxyPool
 
 
 @dataclass
@@ -507,11 +508,22 @@ class FetchEngine:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
         self.timeout = cfg.request_timeout
-        proxy = cfg.https_proxy or cfg.http_proxy or None
-        self._proxies = ({"http": cfg.http_proxy or cfg.https_proxy,
-                          "https": cfg.https_proxy or cfg.http_proxy} if proxy else None)
         self._httpx_client: Any = None
+        self._httpx_clients: dict[str, Any] = {}
+        self._free_proxy_pool = FreeProxyPool(cfg)
         self._browser_pool = _BrowserPool(cfg)
+
+    def _select_proxy(self, allowed_schemes: set[str] | None = None) -> str | None:
+        """Return explicit proxy first, otherwise an optional free-pool proxy."""
+        if self.cfg.https_proxy or self.cfg.http_proxy:
+            return self.cfg.https_proxy or self.cfg.http_proxy
+        return self._free_proxy_pool.get_proxy(allowed_schemes=allowed_schemes)
+
+    @staticmethod
+    def _proxy_dict(proxy_url: str | None) -> dict | None:
+        if not proxy_url:
+            return None
+        return {"http": proxy_url, "https": proxy_url}
 
     def fetch(self, task: Task) -> FetchResult:
         """Main entry: route to strategy and return result."""
@@ -703,8 +715,10 @@ class FetchEngine:
         tag = f"curl_cffi/{impersonate}"
 
         try:
+            proxy_url = self._select_proxy()
             resp = cc.get(task.url, headers=headers, impersonate=impersonate,
-                          timeout=self.timeout, proxies=self._proxies, allow_redirects=True)
+                          timeout=self.timeout, proxies=self._proxy_dict(proxy_url),
+                          allow_redirects=True)
             return FetchResult(ok=200 <= resp.status_code < 300, url=task.url,
                                status_code=resp.status_code, content=resp.text,
                                content_type=resp.headers.get("content-type", ""),
@@ -714,7 +728,8 @@ class FetchEngine:
                                error=f"{type(e).__name__}: {e}")
 
     def _fetch_httpx(self, task: Task, headers: dict) -> FetchResult:
-        client = self._get_httpx_client()
+        proxy_url = self._select_proxy(allowed_schemes={"http", "https"})
+        client = self._get_httpx_client(proxy_url)
         if client is None:
             return FetchResult(ok=False, url=task.url, strategy_used="httpx",
                                error="httpx not installed")
@@ -728,17 +743,37 @@ class FetchEngine:
             return FetchResult(ok=False, url=task.url, strategy_used="httpx",
                                error=f"{type(e).__name__}: {e}")
 
-    def _get_httpx_client(self):
-        if self._httpx_client is None:
-            try:
-                import httpx
-            except ImportError:
-                return None
-            self._httpx_client = httpx.Client(
-                http2=True, timeout=self.timeout, follow_redirects=True,
-                proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
-                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
-        return self._httpx_client
+    def _get_httpx_client(self, proxy_url: str | None = None):
+        if proxy_url and not proxy_url.startswith(("http://", "https://")):
+            proxy_url = None
+        if proxy_url:
+            if proxy_url in self._httpx_clients:
+                return self._httpx_clients[proxy_url]
+        elif self._httpx_client is not None:
+            return self._httpx_client
+
+        try:
+            import httpx
+        except ImportError:
+            return None
+
+        client = httpx.Client(
+            http2=True, timeout=self.timeout, follow_redirects=True,
+            proxy=proxy_url or self.cfg.https_proxy or self.cfg.http_proxy or None,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
+
+        if proxy_url:
+            # Keep the cache bounded; free proxies churn quickly.
+            if len(self._httpx_clients) >= 20:
+                _, old = self._httpx_clients.popitem()
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            self._httpx_clients[proxy_url] = client
+        else:
+            self._httpx_client = client
+        return client
 
     def _fetch_playwright(self, task: Task, headers: dict) -> FetchResult:
         # Pass through the user-supplied UA only if it was explicitly set on
@@ -776,16 +811,18 @@ class FetchEngine:
         try:
             if strategy == "scrapling_static":
                 from scrapling.fetchers import Fetcher
+                proxy_url = self._select_proxy()
                 page = Fetcher.get(
                     task.url,
                     headers=headers,
                     impersonate=task.impersonate or "chrome131",
                     timeout=self.timeout,
-                    proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
+                    proxy=proxy_url,
                     selector_config=self._scrapling_selector_config(task),
                 )
             elif strategy == "scrapling_dynamic":
                 from scrapling.fetchers import DynamicFetcher
+                proxy_url = self._select_proxy()
                 page = DynamicFetcher.fetch(
                     task.url,
                     headless=True,
@@ -794,11 +831,12 @@ class FetchEngine:
                     timeout=self.cfg.playwright_timeout * 1000,
                     wait_selector=task.wait_selector or None,
                     extra_headers=headers,
-                    proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
+                    proxy=proxy_url,
                     selector_config=self._scrapling_selector_config(task),
                 )
             else:
                 from scrapling.fetchers import StealthyFetcher
+                proxy_url = self._select_proxy()
                 page = StealthyFetcher.fetch(
                     task.url,
                     headless=True,
@@ -809,7 +847,7 @@ class FetchEngine:
                     timeout=self.cfg.playwright_timeout * 1000,
                     wait_selector=task.wait_selector or None,
                     extra_headers=headers,
-                    proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
+                    proxy=proxy_url,
                     selector_config=self._scrapling_selector_config(task),
                 )
         except ImportError:
@@ -878,4 +916,10 @@ class FetchEngine:
             except Exception:
                 pass
             self._httpx_client = None
+        for client in self._httpx_clients.values():
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._httpx_clients.clear()
         self._browser_pool.close()

@@ -78,6 +78,12 @@ class AppConfig:
     enable_scrapling: bool = True
     http_proxy: str = ""
     https_proxy: str = ""
+    enable_free_proxy_pool: bool = False
+    free_proxy_source_url: str = (
+        "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt"
+    )
+    free_proxy_refresh_seconds: int = 600
+    free_proxy_max_count: int = 200
 
     # 连续失败多少次触发熔断（自动禁用任务并告警）
     circuit_breaker_threshold: int = 20
@@ -165,6 +171,16 @@ def load_config(
         enable_scrapling=os.getenv("ENABLE_SCRAPLING", "true").strip().lower() in ("true", "1", "yes"),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
+        enable_free_proxy_pool=os.getenv("ENABLE_FREE_PROXY_POOL", "false").strip().lower()
+        in ("true", "1", "yes"),
+        free_proxy_source_url=os.getenv(
+            "FREE_PROXY_SOURCE_URL",
+            "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
+        ),
+        free_proxy_refresh_seconds=_safe_int(
+            os.getenv("FREE_PROXY_REFRESH_SECONDS", "600"), 600,
+        ),
+        free_proxy_max_count=_safe_int(os.getenv("FREE_PROXY_MAX_COUNT", "200"), 200),
         circuit_breaker_threshold=_safe_int(
             os.getenv("CIRCUIT_BREAKER_THRESHOLD", "20"), 20,
         ),

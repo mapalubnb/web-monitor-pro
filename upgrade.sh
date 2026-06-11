@@ -123,6 +123,15 @@ if [[ -f "${ENV_FILE}" ]]; then
         echo 'ENABLE_SCRAPLING=true' >> "${ENV_FILE}"
         ADDED=1
     fi
+    if ! grep -q 'ENABLE_FREE_PROXY_POOL' "${ENV_FILE}" 2>/dev/null; then
+        {
+            echo 'ENABLE_FREE_PROXY_POOL=false'
+            echo 'FREE_PROXY_SOURCE_URL=https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt'
+            echo 'FREE_PROXY_REFRESH_SECONDS=600'
+            echo 'FREE_PROXY_MAX_COUNT=200'
+        } >> "${ENV_FILE}"
+        ADDED=1
+    fi
     if [[ ${ADDED} -eq 1 ]]; then
         ok "已添加新增配置项"
     else
@@ -164,4 +173,5 @@ echo -e "  本次升级内容:"
 echo -e "    - 自建抓取链路: curl_cffi → httpx → deep extract → Scrapling → Playwright"
 echo -e "    - Scrapling 自适应选择器与隐身抓取增强"
 echo -e "    - 简化飞书卡片输出，默认自动启用选择器自适应"
+echo -e "    - 可选 Proxifly 免费代理池（默认关闭）"
 echo ""

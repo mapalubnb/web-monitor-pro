@@ -42,6 +42,9 @@ cp .env.example .env
 cp config.example.yaml config.yaml
 vim .env                    # 填入飞书凭证
 
+# 可选：启用 Proxifly 免费代理池（默认关闭）
+# ENABLE_FREE_PROXY_POOL=true
+
 # 前台运行（调试用）
 python -m src.main
 

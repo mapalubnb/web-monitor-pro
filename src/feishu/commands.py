@@ -531,7 +531,7 @@ class CommandDispatcher:
             "push_cooldown_seconds": self.cfg.risk_control.push_cooldown_seconds,
             "alert_after_consecutive_failures":
                 self.cfg.risk_control.alert_after_consecutive_failures,
-            "proxy_info": (self.cfg.https_proxy or self.cfg.http_proxy or "未启用"),
+            "proxy_info": _proxy_summary(self.cfg),
             "external_apis": "、".join(apis) if apis else "未启用",
         }
         return CommandResponse(card=cards.config_card(summary))
@@ -925,6 +925,14 @@ def _scrapling_status_note() -> str:
         return f"Scrapling：已安装 `v{ver}`"
     except Exception:
         return "Scrapling：未安装（安装 `scrapling[fetchers]` 后可用）"
+
+
+def _proxy_summary(cfg: AppConfig) -> str:
+    if cfg.https_proxy or cfg.http_proxy:
+        return cfg.https_proxy or cfg.http_proxy
+    if cfg.enable_free_proxy_pool:
+        return f"Proxifly 免费代理池（最多 {cfg.free_proxy_max_count} 个）"
+    return "未启用"
 
 
 def _memory_mb() -> float:
