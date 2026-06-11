@@ -60,7 +60,7 @@ def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
     """从 Playwright 渲染后的 HTML 提取文本，跳过 SPA/RSC 解析。"""
     # 1) CSS 选择器（用户指定）
     if task.selector:
-        text = _by_selector(html, task.selector)
+        text = _by_selector(html, task.selector, task)
         if text and len(text) >= MIN_USEFUL_LENGTH:
             return _normalize(text)
 
@@ -87,7 +87,7 @@ def _extract_html(html: str, task: Task) -> str:
     """从原始 HTML 按优先级提取文本。"""
     # 1) CSS 选择器
     if task.selector:
-        text = _by_selector(html, task.selector)
+        text = _by_selector(html, task.selector, task)
         if text and len(text) >= MIN_USEFUL_LENGTH:
             return _normalize(text)
 
@@ -351,8 +351,13 @@ def _find_matching_brace(text: str, start: int) -> int | None:
     return None
 
 
-def _by_selector(html: str, selector: str) -> str:
+def _by_selector(html: str, selector: str, task: Task | None = None) -> str:
     """按 CSS 选择器提取文本。"""
+    if task is not None and getattr(task, "adaptive_selector", False):
+        text = _by_scrapling_selector(html, selector, task)
+        if text:
+            return text
+
     try:
         from selectolax.parser import HTMLParser
     except ImportError:
@@ -365,6 +370,59 @@ def _by_selector(html: str, selector: str) -> str:
         )
     except Exception as e:
         logger.warning("CSS 选择器 '{}' 解析失败: {}", selector, e)
+        return ""
+
+
+def _by_scrapling_selector(html: str, selector: str, task: Task) -> str:
+    """Use Scrapling adaptive selector when enabled for a task."""
+    try:
+        from scrapling import Selector
+        from ..config import DATA_DIR
+    except ImportError:
+        logger.warning("Scrapling 未安装，无法使用自适应选择器，回退 selectolax")
+        return ""
+
+    try:
+        page = Selector(
+            html,
+            url=task.url,
+            adaptive=True,
+            storage_args={
+                "storage_file": str(DATA_DIR / "scrapling_adaptive.db"),
+                "url": task.url,
+            },
+        )
+        identifier = task.selector_identifier or selector
+        threshold = max(1, min(int(task.adaptive_threshold or 40), 100))
+
+        nodes = page.css(selector, identifier=identifier, auto_save=True)
+        source = "direct"
+        if not nodes:
+            nodes = page.css(
+                selector,
+                identifier=identifier,
+                adaptive=True,
+                auto_save=True,
+                percentage=threshold,
+            )
+            source = "adaptive"
+        if not nodes:
+            return ""
+
+        lines: list[str] = []
+        for node in nodes:
+            try:
+                text = str(node.get_all_text(separator="\n", strip=True))
+            except Exception:
+                text = str(getattr(node, "text", "") or "")
+            if text.strip():
+                lines.append(text)
+        if source == "adaptive":
+            logger.info("#{} [{}] 自适应选择器重定位成功 selector={} threshold={}",
+                        task.id, task.name, selector, threshold)
+        return "\n\n".join(lines)
+    except Exception as e:
+        logger.warning("Scrapling 自适应选择器 '{}' 解析失败: {}", selector, e)
         return ""
 
 

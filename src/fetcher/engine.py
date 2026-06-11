@@ -36,6 +36,21 @@ SUPPORTED_IMPERSONATE = (
     "safari18_0", "safari17_0",
 )
 
+SCRAPLING_STRATEGIES = (
+    "scrapling_static",
+    "scrapling_dynamic",
+    "scrapling_stealth",
+    "scrapling_auto",
+)
+
+SUPPORTED_STRATEGIES = (
+    "auto",
+    "httpx",
+    "curl_cffi",
+    "playwright",
+    *SCRAPLING_STRATEGIES,
+)
+
 _UA_POOL = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -505,6 +520,8 @@ class FetchEngine:
 
         if strategy == "playwright":
             return self._fetch_playwright(task, headers)
+        if strategy in SCRAPLING_STRATEGIES:
+            return self._upgrade_if_empty(task, headers, self._fetch_scrapling(task, headers, strategy))
         if strategy in ("curl_cffi", "httpx"):
             fetcher = self._fetch_curl_cffi if strategy == "curl_cffi" else self._fetch_httpx
             return self._upgrade_if_empty(task, headers, fetcher(task, headers))
@@ -524,6 +541,9 @@ class FetchEngine:
         if last == "playwright":
             r = self._fetch_playwright(task, headers)
             return r if r.ok else None
+        if last in SCRAPLING_STRATEGIES or last.startswith("scrapling_"):
+            r = self._fetch_scrapling(task, headers, last.split("→")[0])
+            return r if r.ok and _is_content_usable(r, task) else None
 
         if last.endswith("\u2192deep"):
             base = last.split("\u2192")[0]
@@ -551,6 +571,8 @@ class FetchEngine:
             return self._fetch_httpx(task, headers)
         if name == "playwright":
             return self._fetch_playwright(task, headers)
+        if name in SCRAPLING_STRATEGIES or name.startswith("scrapling_"):
+            return self._fetch_scrapling(task, headers, name)
         return self._fetch_curl_cffi(task, headers)
 
     def _auto_chain(self, task: Task, headers: dict) -> FetchResult:
@@ -569,6 +591,15 @@ class FetchEngine:
         best_html = result if result.ok else result2
         if best_html.ok and best_html.content:
             deep = self._try_deep_extract(task, best_html)
+            if deep is not None:
+                return deep
+
+        scrapling_result = self._fetch_scrapling(task, headers, "scrapling_auto")
+        if scrapling_result.ok and _is_content_usable(scrapling_result, task):
+            logger.info("[{}] auto escalated to {}", task.name, scrapling_result.strategy_used)
+            return scrapling_result
+        if scrapling_result.ok and scrapling_result.content:
+            deep = self._try_deep_extract(task, scrapling_result)
             if deep is not None:
                 return deep
 
@@ -723,6 +754,121 @@ class FetchEngine:
         if explicit_ua:
             pw_headers["__override_user_agent__"] = explicit_ua
         return self._browser_pool.render(task.url, pw_headers, self.cfg.playwright_timeout)
+
+    def _fetch_scrapling(self, task: Task, headers: dict, strategy: str) -> FetchResult:
+        """Fetch with Scrapling's static/dynamic/stealth fetchers.
+
+        Scrapling is an optional enhancement layer.  Keep failures contained so
+        existing deployments can run even before installing the extra package.
+        """
+        if not self.cfg.enable_scrapling:
+            return FetchResult(ok=False, url=task.url, strategy_used=strategy,
+                               error="Scrapling disabled (ENABLE_SCRAPLING=false)")
+
+        strategy = strategy if strategy in SCRAPLING_STRATEGIES else "scrapling_static"
+        if strategy == "scrapling_auto":
+            first = self._fetch_scrapling(task, headers, "scrapling_static")
+            if first.ok and _is_content_usable(first, task):
+                return first
+            second = self._fetch_scrapling(task, headers, "scrapling_stealth")
+            return second if second.ok else first
+
+        try:
+            if strategy == "scrapling_static":
+                from scrapling.fetchers import Fetcher
+                page = Fetcher.get(
+                    task.url,
+                    headers=headers,
+                    impersonate=task.impersonate or "chrome131",
+                    timeout=self.timeout,
+                    proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
+                    selector_config=self._scrapling_selector_config(task),
+                )
+            elif strategy == "scrapling_dynamic":
+                from scrapling.fetchers import DynamicFetcher
+                page = DynamicFetcher.fetch(
+                    task.url,
+                    headless=True,
+                    network_idle=True,
+                    disable_resources=True,
+                    timeout=self.cfg.playwright_timeout * 1000,
+                    wait_selector=task.wait_selector or None,
+                    extra_headers=headers,
+                    proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
+                    selector_config=self._scrapling_selector_config(task),
+                )
+            else:
+                from scrapling.fetchers import StealthyFetcher
+                page = StealthyFetcher.fetch(
+                    task.url,
+                    headless=True,
+                    network_idle=True,
+                    disable_resources=True,
+                    solve_cloudflare=True,
+                    block_webrtc=True,
+                    timeout=self.cfg.playwright_timeout * 1000,
+                    wait_selector=task.wait_selector or None,
+                    extra_headers=headers,
+                    proxy=self.cfg.https_proxy or self.cfg.http_proxy or None,
+                    selector_config=self._scrapling_selector_config(task),
+                )
+        except ImportError:
+            return FetchResult(ok=False, url=task.url, strategy_used=strategy,
+                               error="scrapling not installed")
+        except Exception as e:
+            return FetchResult(ok=False, url=task.url, strategy_used=strategy,
+                               error=f"{type(e).__name__}: {e}")
+
+        status = getattr(page, "status", None) or getattr(page, "status_code", None)
+        headers_out = getattr(page, "headers", {}) or {}
+        content_type = ""
+        if isinstance(headers_out, dict):
+            content_type = headers_out.get("content-type", "") or headers_out.get("Content-Type", "")
+        content = self._scrapling_body_to_text(page)
+        inner_text = self._scrapling_inner_text(page)
+        ok = status is None or 200 <= int(status) < 300
+        return FetchResult(
+            ok=ok,
+            url=task.url,
+            status_code=int(status) if status is not None else None,
+            content=content,
+            content_type=content_type,
+            strategy_used=strategy,
+            inner_text=inner_text,
+        )
+
+    @staticmethod
+    def _scrapling_body_to_text(page: Any) -> str:
+        body = getattr(page, "body", b"")
+        encoding = getattr(page, "encoding", None) or "utf-8"
+        if isinstance(body, bytes):
+            text = body.decode(encoding, errors="replace")
+        else:
+            text = str(body or "")
+        if text.strip():
+            return text
+        try:
+            return str(page)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _scrapling_inner_text(page: Any) -> str:
+        try:
+            return str(page.get_all_text(separator="\n", strip=True))
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _scrapling_selector_config(task: Task) -> dict:
+        from ..config import DATA_DIR
+        return {
+            "adaptive": bool(getattr(task, "adaptive_selector", False)),
+            "storage_args": {
+                "storage_file": str(DATA_DIR / "scrapling_adaptive.db"),
+                "url": task.url,
+            },
+        }
 
     def close(self) -> None:
         """Shutdown connections and browser."""

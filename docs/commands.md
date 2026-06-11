@@ -16,9 +16,13 @@
 | `--name "名字"` | 任务名称 | URL 的域名+路径 |
 | `--interval 60` | 检查间隔（秒） | `DEFAULT_CHECK_INTERVAL` |
 | `--type html\|json` | 内容类型 | `html` |
-| `--strategy auto\|httpx\|curl_cffi\|playwright` | 抓取策略 | `auto` |
+| `--strategy auto\|httpx\|curl_cffi\|playwright\|scrapling_static\|scrapling_dynamic\|scrapling_stealth\|scrapling_auto` | 抓取策略 | `auto` |
 | `--impersonate chrome131\|chrome124\|firefox133\|safari18_0` | curl_cffi 模拟的浏览器 | `chrome131` |
 | `--selector "article"` | CSS 选择器（仅 html） | 自动抽正文 |
+| `--adaptive-selector` | 对 CSS 选择器启用 Scrapling 自适应重定位 | 关闭 |
+| `--selector-id main` | 自适应选择器存储标识 | 选择器本身 |
+| `--adaptive-threshold 40` | 自适应重定位最低相似度 | `40` |
+| `--wait-selector "main"` | 浏览器策略等待指定元素出现 | 空 |
 | `--json-path "data[*].name"` | JSON 字段路径（仅 json） | 整个 JSON |
 | `--extract-next-data` | 提取 Next.js `__NEXT_DATA__` | 关闭 |
 | `--keyword "招聘" --keyword "实习"` | 关键字过滤（命中才推送，可多个） | 空 |
@@ -35,6 +39,10 @@
 
 ```
 /add https://pfund.tech/ --strategy playwright --name PFund
+```
+
+```
+/add https://example.com/products --strategy scrapling_stealth --selector ".list" --adaptive-selector --selector-id products
 ```
 
 ```

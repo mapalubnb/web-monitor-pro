@@ -51,6 +51,10 @@ class TaskConfig:
     strategy: str = "auto"
     impersonate: str = "chrome131"
     selector: str | None = None
+    adaptive_selector: bool = False
+    selector_identifier: str | None = None
+    adaptive_threshold: int = 40
+    wait_selector: str | None = None
     json_path: str | None = None
     extract_next_data: bool = False
     interval: int = 60
@@ -71,6 +75,7 @@ class AppConfig:
     enable_playwright: bool = True
     playwright_timeout: int = 30
     playwright_max_pages: int = 20
+    enable_scrapling: bool = True
     http_proxy: str = ""
     https_proxy: str = ""
 
@@ -157,6 +162,7 @@ def load_config(
         enable_playwright=os.getenv("ENABLE_PLAYWRIGHT", "true").strip().lower() in ("true", "1", "yes"),
         playwright_timeout=_safe_int(os.getenv("PLAYWRIGHT_TIMEOUT", "30"), 30),
         playwright_max_pages=_safe_int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20"), 20),
+        enable_scrapling=os.getenv("ENABLE_SCRAPLING", "true").strip().lower() in ("true", "1", "yes"),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),
         circuit_breaker_threshold=_safe_int(

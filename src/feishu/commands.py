@@ -192,7 +192,7 @@ class CommandDispatcher:
     # /add
     # ============================================================
     def _cmd_add(self, args: list[str]) -> CommandResponse:
-        from ..fetcher.engine import SUPPORTED_IMPERSONATE
+        from ..fetcher.engine import SUPPORTED_IMPERSONATE, SUPPORTED_STRATEGIES
         parser = _make_parser("add")
         parser.add_argument("url")
         parser.add_argument("--name", default="")
@@ -200,10 +200,16 @@ class CommandDispatcher:
                             default=self.cfg.default_check_interval)
         parser.add_argument("--type", default="html", choices=["html", "json"])
         parser.add_argument("--strategy", default="auto",
-                            choices=["auto", "httpx", "curl_cffi", "playwright"])
+                            choices=SUPPORTED_STRATEGIES)
         parser.add_argument("--impersonate", default="chrome131",
                             choices=SUPPORTED_IMPERSONATE)
         parser.add_argument("--selector", default=None)
+        parser.add_argument("--adaptive-selector", dest="adaptive_selector",
+                            action="store_true")
+        parser.add_argument("--selector-id", dest="selector_identifier", default=None)
+        parser.add_argument("--adaptive-threshold", dest="adaptive_threshold",
+                            type=int, default=40)
+        parser.add_argument("--wait-selector", dest="wait_selector", default=None)
         parser.add_argument("--json-path", dest="json_path", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
                             action="store_true")
@@ -233,6 +239,10 @@ class CommandDispatcher:
             t = Task(
                 name=name, url=url, type=ns.type, strategy=ns.strategy,
                 impersonate=ns.impersonate, selector=ns.selector,
+                adaptive_selector=ns.adaptive_selector,
+                selector_identifier=ns.selector_identifier,
+                adaptive_threshold=max(1, min(ns.adaptive_threshold, 100)),
+                wait_selector=ns.wait_selector,
                 json_path=ns.json_path, extract_next_data=ns.extract_next_data,
                 interval=ns.interval, keywords=keywords, enabled=True,
             )
@@ -248,13 +258,14 @@ class CommandDispatcher:
             f"\n🎯 关键字：{', '.join(f'`{k}`' for k in keywords)}"
             if keywords else ""
         )
+        adaptive_line = "\n🧭 自适应选择器：已启用" if ns.adaptive_selector else ""
         return CommandResponse(
             card=cards.success_card(
                 "任务已添加",
                 f"**#{task_id} · {name}**\n"
                 f"🔗 {url}\n"
                 f"⏱️ 间隔 {ns.interval}s · 🎯 策略 {ns.strategy}"
-                f"{kw_line}\n\n"
+                f"{kw_line}{adaptive_line}\n\n"
                 f"首次抓取后会建立基准快照并推送卡片。",
             ),
             trigger_check_task_id=task_id,
@@ -502,6 +513,8 @@ class CommandDispatcher:
         apis = []
         if self.cfg.enable_playwright:
             apis.append("Playwright 渲染")
+        if self.cfg.enable_scrapling:
+            apis.append("Scrapling 抓取/自适应选择器")
         summary = {
             "default_check_interval": self.cfg.default_check_interval,
             "max_concurrent_fetch": self.cfg.max_concurrent_fetch,
@@ -632,6 +645,19 @@ class CommandDispatcher:
             )
 
         f = diagnose_html(result.content or "")
+        scrapling_note = _scrapling_status_note()
+        recommendations = list(f["suggestions"])
+        if t.selector and not getattr(t, "adaptive_selector", False):
+            recommendations.append(
+                f"选择器任务可尝试 `/reset {task_id} --adaptive-selector "
+                f"--selector-id main --adaptive-threshold 40`，降低页面小改版导致的空提取"
+            )
+        if self.cfg.enable_scrapling and result.strategy_used not in (
+            "scrapling_static", "scrapling_dynamic", "scrapling_stealth"
+        ):
+            recommendations.append(
+                f"高风控或纯 CSR 页面可尝试 `/reset {task_id} --strategy scrapling_stealth`"
+            )
         detail = (
             f"**📊 诊断结果**\n\n"
             f"🔖 任务：#{task_id} · {t.name}\n"
@@ -642,7 +668,8 @@ class CommandDispatcher:
             f"🏗️ 框架：{'、'.join(f['frameworks']) or '未识别'}\n\n"
             f"**📦 数据嵌入点**\n"
             f"{chr(10).join(f['data_points']) if f['data_points'] else '❌ 未找到'}\n\n"
-            f"**💡 建议**\n{chr(10).join(f'• {s}' for s in f['suggestions'])}"
+            f"**🧰 增强模块**\n{scrapling_note}\n\n"
+            f"**💡 建议**\n{chr(10).join(f'• {s}' for s in recommendations)}"
         )
 
         # 附上 HTML 文件（写入 snapshots 目录，避免临时文件泄漏）
@@ -694,14 +721,22 @@ class CommandDispatcher:
     # /reset
     # ============================================================
     def _cmd_reset(self, args: list[str]) -> CommandResponse:
-        from ..fetcher.engine import SUPPORTED_IMPERSONATE
+        from ..fetcher.engine import SUPPORTED_IMPERSONATE, SUPPORTED_STRATEGIES
         parser = _make_parser("reset")
         parser.add_argument("task_id", type=int)
         parser.add_argument("--strategy", default=None,
-                            choices=["auto", "httpx", "curl_cffi", "playwright"])
+                            choices=SUPPORTED_STRATEGIES)
         parser.add_argument("--impersonate", default=None,
                             choices=(None, *SUPPORTED_IMPERSONATE))
         parser.add_argument("--selector", default=None)
+        parser.add_argument("--adaptive-selector", dest="adaptive_selector",
+                            action="store_true", default=None)
+        parser.add_argument("--no-adaptive-selector", dest="disable_adaptive_selector",
+                            action="store_true", default=False)
+        parser.add_argument("--selector-id", dest="selector_identifier", default=None)
+        parser.add_argument("--adaptive-threshold", dest="adaptive_threshold",
+                            type=int, default=None)
+        parser.add_argument("--wait-selector", dest="wait_selector", default=None)
         parser.add_argument("--extract-next-data", dest="extract_next_data",
                             action="store_true", default=None)
         try:
@@ -726,6 +761,21 @@ class CommandDispatcher:
             if ns.selector is not None:
                 t.selector = ns.selector
                 changes.append(f"选择器→`{ns.selector}`")
+            if ns.adaptive_selector:
+                t.adaptive_selector = True
+                changes.append("启用自适应选择器")
+            if ns.disable_adaptive_selector:
+                t.adaptive_selector = False
+                changes.append("关闭自适应选择器")
+            if ns.selector_identifier is not None:
+                t.selector_identifier = ns.selector_identifier
+                changes.append(f"选择器标识→`{ns.selector_identifier}`")
+            if ns.adaptive_threshold is not None:
+                t.adaptive_threshold = max(1, min(ns.adaptive_threshold, 100))
+                changes.append(f"自适应阈值→`{t.adaptive_threshold}`")
+            if ns.wait_selector is not None:
+                t.wait_selector = ns.wait_selector
+                changes.append(f"等待选择器→`{ns.wait_selector}`")
             if ns.extract_next_data:
                 t.extract_next_data = True
                 changes.append("启用 SPA 提取")
@@ -832,6 +882,15 @@ def _humanize_size(n: float) -> str:
     return f"{n:.1f} TB"
 
 
+def _scrapling_status_note() -> str:
+    try:
+        import scrapling
+        ver = getattr(scrapling, "__version__", "unknown")
+        return f"Scrapling：已安装 `v{ver}`"
+    except Exception:
+        return "Scrapling：未安装（安装 `scrapling[fetchers]` 后可用）"
+
+
 def _memory_mb() -> float:
     try:
         with open("/proc/self/status") as f:
@@ -853,6 +912,10 @@ def _task_to_dict(t: Task) -> dict[str, Any]:
         "last_strategy_used": getattr(t, "last_strategy_used", None) or "",
         "impersonate": t.impersonate,
         "selector": t.selector or "",
+        "adaptive_selector": getattr(t, "adaptive_selector", False),
+        "selector_identifier": getattr(t, "selector_identifier", None) or "",
+        "adaptive_threshold": getattr(t, "adaptive_threshold", 40) or 40,
+        "wait_selector": getattr(t, "wait_selector", None) or "",
         "json_path": t.json_path or "",
         "extract_next_data": t.extract_next_data,
         "interval": t.interval,

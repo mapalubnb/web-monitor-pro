@@ -32,6 +32,8 @@ loguru>=0.7.2
 # ============ 浏览器渲染（纯 CSR 站点兜底）============
 playwright>=1.40.0        # 按需启动 Chromium，不常驻
 playwright-stealth>=1.0.6 # 隐藏无头浏览器特征
+scrapling[fetchers]>=0.4.9 # 自适应选择器 + 静态/动态/隐身抓取增强
 
 # ============ 其他 ============
 tenacity>=8.2.3           # 重试
+pytest>=8.2.0             # 测试

@@ -27,6 +27,12 @@ web-monitor-pro 采用**四级递进式抓取**，全自建无外部 API 依赖�
              │ 无有效内容
              ↓
 ┌────────────────────────────────┐
+│ 策略 3.5: Scrapling 增强         │  ← 自适应解析 / 隐身抓取
+│  static → stealth 自动尝试        │
+└────────────┬───────────────────┘
+             │ 仍无有效内容
+             ↓
+┌────────────────────────────────┐
 │ 策略 4: Playwright              │  ← 终极兜底
 │  headless Chromium 渲染          │
 │  stealth 隐藏无头特征            │
@@ -103,6 +109,47 @@ web-monitor-pro 采用**四级递进式抓取**，全自建无外部 API 依赖�
 ```
 /add https://example.com --strategy curl_cffi --impersonate chrome131
 ```
+
+---
+
+## Scrapling 增强策略
+
+从 v0.4.0 起，服务可选集成 Scrapling，提供更稳的解析器、自适应选择器和隐身浏览器抓取。
+
+### 策略值
+
+| 值 | 用途 |
+| --- | --- |
+| `scrapling_static` | 基于 Scrapling Fetcher 的静态抓取，适合 HTML/弱风控页面 |
+| `scrapling_dynamic` | 基于 Chromium 动态渲染，适合 JS 加载页面 |
+| `scrapling_stealth` | 隐身 Chromium，适合 Cloudflare/高风控页面 |
+| `scrapling_auto` | 先 static，失败后 stealth |
+
+### 自适应选择器
+
+当目标页面局部改版导致原 CSS 选择器失效时，Scrapling 可以根据首次命中元素的结构特征重定位相似元素。
+
+```
+/add https://example.com/products \
+  --selector ".product-list" \
+  --adaptive-selector \
+  --selector-id product-list \
+  --adaptive-threshold 40
+```
+
+如果已有任务需要启用：
+
+```
+/reset <id> --adaptive-selector --selector-id main --adaptive-threshold 40
+```
+
+### 隐身抓取
+
+```
+/add https://example.com --strategy scrapling_stealth --wait-selector "main"
+```
+
+`--wait-selector` 会让浏览器等待指定元素出现后再提取，适合纯 CSR 页面。
 
 ---
 

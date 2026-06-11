@@ -47,6 +47,10 @@ class Task(Base):
     impersonate: Mapped[str] = mapped_column(String(32), default="chrome131")
 
     selector: Mapped[str | None] = mapped_column(Text, nullable=True)
+    adaptive_selector: Mapped[bool] = mapped_column(Boolean, default=False)
+    selector_identifier: Mapped[str | None] = mapped_column(Text, nullable=True)
+    adaptive_threshold: Mapped[int] = mapped_column(Integer, default=40)
+    wait_selector: Mapped[str | None] = mapped_column(Text, nullable=True)
     json_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     extract_next_data: Mapped[bool] = mapped_column(Boolean, default=False)
 

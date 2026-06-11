@@ -143,6 +143,8 @@ def help_card() -> dict:
         ("精细配置",
          "`/keyword <id> add <词1>[, 词2]` — 添加关键字\n"
          "`/keyword <id> remove / list / clear`\n"
+         "`--strategy scrapling_stealth` — 使用 Scrapling 隐身浏览器\n"
+         "`--adaptive-selector --selector <css>` — 启用自适应选择器\n"
          "`/sniff <url>` — 抓包助手\n"
          "`/debug <id>` — 诊断页面"),
         ("服务管理",
@@ -303,6 +305,14 @@ def task_detail_card(t: dict) -> dict:
     extract_parts: list[str] = []
     if t.get("selector"):
         extract_parts.append(f"CSS 选择器：`{t['selector']}`")
+    if t.get("adaptive_selector"):
+        extract_parts.append(
+            f"自适应选择器：已启用（阈值 `{t.get('adaptive_threshold', 40)}`）"
+        )
+    if t.get("selector_identifier"):
+        extract_parts.append(f"选择器标识：`{t['selector_identifier']}`")
+    if t.get("wait_selector"):
+        extract_parts.append(f"渲染等待：`{t['wait_selector']}`")
     if t.get("json_path"):
         extract_parts.append(f"JSON Path：`{t['json_path']}`")
     if t.get("extract_next_data"):

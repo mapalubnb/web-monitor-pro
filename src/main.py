@@ -78,7 +78,12 @@ class App:
                 s.add(Task(
                     name=t.name, url=t.url, type=t.type,
                     strategy=t.strategy, impersonate=t.impersonate,
-                    selector=t.selector, json_path=t.json_path,
+                    selector=t.selector,
+                    adaptive_selector=t.adaptive_selector,
+                    selector_identifier=t.selector_identifier,
+                    adaptive_threshold=t.adaptive_threshold,
+                    wait_selector=t.wait_selector,
+                    json_path=t.json_path,
                     extract_next_data=t.extract_next_data,
                     interval=t.interval,
                     keywords=t.keywords or [],

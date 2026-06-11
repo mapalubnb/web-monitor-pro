@@ -6,6 +6,16 @@
 
 # 种子任务（留空即可；也可在此预置开机自动加载）
 tasks: []
+# 示例：
+# tasks:
+#   - name: "产品列表"
+#     url: "https://example.com/products"
+#     strategy: "scrapling_static"
+#     selector: ".product-list"
+#     adaptive_selector: true
+#     selector_identifier: "product-list"
+#     adaptive_threshold: 40
+#     interval: 300
 
 # ============================================================
 # 全局风控配置
