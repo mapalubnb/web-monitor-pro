@@ -247,11 +247,13 @@ def task_list_card(tasks: list[dict]) -> dict:
         last = t.get("last_checked_at") or "从未"
         keywords = t.get("keywords") or []
         kw_line = f"\n🎯 {', '.join(f'`{k}`' for k in keywords)}" if keywords else ""
+        proxy = t.get("proxy_info") or "未启用"
 
         elements.append(_div(
             f"{status} **#{t['id']} · {t['name']}**\n"
             f"[打开页面]({t['url']}) · `{t['interval']}s` · "
             f"变更 `{t.get('total_changes', 0)}` · 最近 `{last}`"
+            f"\n🌐 代理：{proxy}"
             f"{kw_line}"
         ))
         elements.append(_action(_task_buttons(
@@ -296,6 +298,7 @@ def task_detail_card(t: dict) -> dict:
             ("累计变更", str(t.get("total_changes", 0)), True),
             ("连续失败", fail_text, True),
             ("增强", advanced_text, True),
+            ("代理", t.get("proxy_info") or "未启用", True),
         ]),
     ]
 

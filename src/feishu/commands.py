@@ -265,13 +265,14 @@ class CommandDispatcher:
             if keywords else ""
         )
         adaptive_line = "\n🧭 已自动启用选择器自适应" if adaptive_selector else ""
+        proxy_line = f"\n🌐 代理：{_proxy_summary(self.cfg)}"
         return CommandResponse(
             card=cards.success_card(
                 "任务已添加",
                 f"**#{task_id} · {name}**\n"
                 f"🔗 {url}\n"
                 f"⏱️ 间隔 {ns.interval}s · 策略 `{ns.strategy}`"
-                f"{kw_line}{adaptive_line}\n\n"
+                f"{proxy_line}{kw_line}{adaptive_line}\n\n"
                 f"首次抓取后会建立基准快照并推送卡片。",
             ),
             trigger_check_task_id=task_id,
@@ -283,7 +284,7 @@ class CommandDispatcher:
     def _cmd_list(self, args: list[str]) -> CommandResponse:
         with session_scope() as s:
             rows = s.execute(select(Task).order_by(Task.id)).scalars().all()
-            tasks = [_task_to_dict(t) for t in rows]
+            tasks = [self._task_card_data(t) for t in rows]
         return CommandResponse(card=cards.task_list_card(tasks))
 
     # ============================================================
@@ -810,7 +811,12 @@ class CommandDispatcher:
             t = s.get(Task, task_id)
             if t is None:
                 return CommandResponse.err(f"未找到任务 #{task_id}")
-            return CommandResponse(card=cards.task_detail_card(_task_to_dict(t)))
+            return CommandResponse(card=cards.task_detail_card(self._task_card_data(t)))
+
+    def _task_card_data(self, t: Task) -> dict[str, Any]:
+        data = _task_to_dict(t)
+        data["proxy_info"] = _proxy_summary(self.cfg)
+        return data
 
 
 # ============================================================
