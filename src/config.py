@@ -75,6 +75,7 @@ class AppConfig:
     enable_playwright: bool = True
     playwright_timeout: int = 30
     playwright_max_pages: int = 20
+    playwright_idle_seconds: int = 300
     enable_scrapling: bool = True
     http_proxy: str = ""
     https_proxy: str = ""
@@ -168,6 +169,7 @@ def load_config(
         enable_playwright=os.getenv("ENABLE_PLAYWRIGHT", "true").strip().lower() in ("true", "1", "yes"),
         playwright_timeout=_safe_int(os.getenv("PLAYWRIGHT_TIMEOUT", "30"), 30),
         playwright_max_pages=_safe_int(os.getenv("PLAYWRIGHT_MAX_PAGES", "20"), 20),
+        playwright_idle_seconds=_safe_int(os.getenv("PLAYWRIGHT_IDLE_SECONDS", "300"), 300),
         enable_scrapling=os.getenv("ENABLE_SCRAPLING", "true").strip().lower() in ("true", "1", "yes"),
         http_proxy=os.getenv("HTTP_PROXY", ""),
         https_proxy=os.getenv("HTTPS_PROXY", ""),

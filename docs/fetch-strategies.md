@@ -36,7 +36,7 @@ web-monitor-pro 采用**自动递进式抓取**，全自建无外部 API 依赖�
 │ 策略 4: Playwright              │  ← 终极兜底
 │  headless Chromium 渲染          │
 │  stealth 隐藏无头特征            │
-│  按需启动，用完释放               │
+│  页面用完关闭，空闲自动释放        │
 └────────────────────────────────┘
 ```
 
@@ -200,6 +200,8 @@ Playwright 会启动 headless Chromium 渲染页面并提取完整 DOM。
 - **按需启动**：只在需要时才启动浏览器，大多数任务不触发
 - **Stealth 隐藏**：使用 `playwright-stealth` 隐藏无头浏览器特征
 - **资源屏蔽**：自动屏蔽图片/CSS/字体/媒体加载，节省内存
+- **页面隔离**：每次渲染后关闭 page 和 browser context，避免页面级资源泄漏
+- **空闲回收**：Chromium 空闲 `PLAYWRIGHT_IDLE_SECONDS` 秒后自动关闭释放内存
 - **定期回收**：每处理 N 页或运行 30 分钟后自动回收浏览器实例，防内存泄漏
 
 ### 使用方法
@@ -212,7 +214,7 @@ Playwright 会启动 headless Chromium 渲染页面并提取完整 DOM。
 
 - 空闲时（未启动浏览器）：0 额外开销
 - 渲染时峰值：~700MB（含 Chromium 子进程）
-- 渲染完毕：内存自动释放
+- 渲染完毕：页面和上下文立即释放；Chromium 进程空闲 300 秒后自动关闭（可用 `PLAYWRIGHT_IDLE_SECONDS` 调整）
 
 ---
 

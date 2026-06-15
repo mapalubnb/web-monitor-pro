@@ -124,6 +124,10 @@ if [[ -f "${ENV_FILE}" ]]; then
         echo 'PLAYWRIGHT_MAX_PAGES=20' >> "${ENV_FILE}"
         ADDED=1
     fi
+    if ! grep -q 'PLAYWRIGHT_IDLE_SECONDS' "${ENV_FILE}" 2>/dev/null; then
+        echo 'PLAYWRIGHT_IDLE_SECONDS=300' >> "${ENV_FILE}"
+        ADDED=1
+    fi
     if ! grep -q 'ENABLE_SCRAPLING' "${ENV_FILE}" 2>/dev/null; then
         echo 'ENABLE_SCRAPLING=true' >> "${ENV_FILE}"
         ADDED=1

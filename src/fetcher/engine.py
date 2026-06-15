@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from html import unescape
 from typing import Any
@@ -340,6 +341,9 @@ class _BrowserPool:
         self._browser: Any = None
         self._page_count = 0
         self._created_at = 0.0
+        self._last_used_at = 0.0
+        self._force_recycle = False
+        self._idle_timer: threading.Timer | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._exec_lock = threading.Lock()
 
@@ -358,7 +362,8 @@ class _BrowserPool:
         """Must be called from the executor thread."""
         if self._browser is None:
             return False
-        return ((time.time() - self._created_at) > self.MAX_AGE
+        return (self._force_recycle
+                or (time.time() - self._created_at) > self.MAX_AGE
                 or self._page_count >= self._cfg.playwright_max_pages)
 
     def _proxy_config(self) -> dict | None:
@@ -393,6 +398,7 @@ class _BrowserPool:
             self._browser = self._pw.chromium.launch(**launch_kwargs)
             self._page_count = 0
             self._created_at = time.time()
+            self._force_recycle = False
             proxy_note = f" via proxy {proxy_cfg['server']}" if proxy_cfg else ""
             logger.info("Playwright Chromium started (thread={}){}",
                         threading.get_ident(), proxy_note)
@@ -414,6 +420,10 @@ class _BrowserPool:
             # Allow generous headroom above the configured timeout to cover
             # browser launch + retry without blocking forever.
             return future.result(timeout=timeout * 2 + 30)
+        except FutureTimeoutError:
+            self._force_recycle = True
+            return FetchResult(ok=False, url=url, strategy_used="playwright",
+                               error="executor timeout; browser will be recycled")
         except Exception as e:
             return FetchResult(ok=False, url=url, strategy_used="playwright",
                                error=f"executor error: {type(e).__name__}: {e}")
@@ -437,7 +447,45 @@ class _BrowserPool:
         if not result.ok and "Timeout" in (result.error or ""):
             logger.info("[{}] stealth mode timed out, retrying in bare mode", url)
             result = self._render_bare(url, headers, timeout, browser)
+        self._last_used_at = time.time()
+        self._schedule_idle_close()
         return result
+
+    def _schedule_idle_close(self) -> None:
+        """Close Chromium after an idle window to release memory."""
+        idle_seconds = max(getattr(self._cfg, "playwright_idle_seconds", 300), 0)
+        if idle_seconds <= 0 or self._browser is None:
+            return
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+        expected_last_used = self._last_used_at
+        self._idle_timer = threading.Timer(
+            idle_seconds,
+            self._submit_idle_close,
+            args=(expected_last_used,),
+        )
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
+
+    def _submit_idle_close(self, expected_last_used: float) -> None:
+        executor = self._executor
+        if executor is None:
+            return
+        try:
+            executor.submit(self._close_if_idle, expected_last_used)
+        except RuntimeError:
+            pass
+
+    def _close_if_idle(self, expected_last_used: float) -> None:
+        idle_seconds = max(getattr(self._cfg, "playwright_idle_seconds", 300), 0)
+        if self._browser is None or idle_seconds <= 0:
+            return
+        if self._last_used_at != expected_last_used:
+            return
+        if (time.time() - self._last_used_at) < idle_seconds:
+            return
+        logger.info("Playwright Chromium idle for {}s, closing", idle_seconds)
+        self._close_internal()
 
     def _render_once(self, url: str, headers: dict, timeout: int,
                      browser: Any, *, block_resources: bool) -> FetchResult:
@@ -572,9 +620,13 @@ class _BrowserPool:
                 pass
             self._pw = None
         self._page_count = 0
+        self._force_recycle = False
 
     def close(self) -> None:
         """Public shutdown (e.g. on application exit)."""
+        if self._idle_timer is not None:
+            self._idle_timer.cancel()
+            self._idle_timer = None
         # If executor was never created but browser was somehow started
         # (shouldn't happen, but defensive), clean up directly.
         if self._executor is None:
