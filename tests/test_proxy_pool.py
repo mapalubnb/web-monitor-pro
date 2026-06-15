@@ -49,6 +49,17 @@ def test_free_proxy_pool_cools_down_failed_proxy(monkeypatch):
     assert pool.get_proxy(allowed_schemes={"http", "https"}) == "http://good-proxy:8080"
 
 
+def test_free_proxy_pool_pauses_after_consecutive_failures(monkeypatch):
+    pool = FreeProxyPool(AppConfig(enable_free_proxy_pool=True))
+    monkeypatch.setattr(pool, "_refresh_if_needed", lambda: None)
+    pool._proxies = ["http://good-proxy:8080"]
+
+    for i in range(5):
+        pool.report_result(f"http://bad-proxy-{i}:8080", success=False)
+
+    assert pool.get_proxy(allowed_schemes={"http", "https"}) is None
+
+
 def test_fetch_engine_prefers_explicit_proxy_over_free_pool(monkeypatch):
     cfg = AppConfig(
         https_proxy="http://stable-proxy:8080",
@@ -98,3 +109,24 @@ def test_httpx_free_proxy_failure_retries_direct(monkeypatch):
     assert result.ok is True
     assert result.proxy_url == ""
     assert "http://bad-proxy:8080" in engine._free_proxy_pool._cooldown_until
+
+
+def test_failed_proxy_httpx_client_is_closed():
+    engine = FetchEngine(AppConfig(enable_free_proxy_pool=True))
+
+    class Client:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    client = Client()
+    engine._httpx_clients["http://bad-proxy:8080"] = client
+
+    try:
+        engine._report_proxy_url("http://bad-proxy:8080", success=False)
+    finally:
+        engine.close()
+
+    assert client.closed is True
+    assert "http://bad-proxy:8080" not in engine._httpx_clients

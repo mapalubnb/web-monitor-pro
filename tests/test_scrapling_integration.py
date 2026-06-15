@@ -1,7 +1,7 @@
-from src.config import load_config
+from src.config import AppConfig, load_config
 from src.db import Task
 from src.feishu.commands import _auto_adaptive_selector, _auto_wait_selector
-from src.fetcher.engine import SCRAPLING_STRATEGIES, SUPPORTED_STRATEGIES
+from src.fetcher.engine import SCRAPLING_STRATEGIES, SUPPORTED_STRATEGIES, FetchEngine, FetchResult
 from src.fetcher.extractor import _by_selector
 
 
@@ -62,3 +62,56 @@ def test_browser_strategies_reuse_selector_as_wait_target():
     assert _auto_wait_selector("main", "playwright") == "main"
     assert _auto_wait_selector("main", "httpx") is None
     assert _auto_wait_selector("main", "httpx", "#ready") == "#ready"
+
+
+def test_auto_chain_uses_light_scrapling_before_playwright(monkeypatch):
+    engine = FetchEngine(AppConfig(enable_free_proxy_pool=False))
+    task = Task(
+        id=1,
+        name="spa",
+        url="https://example.com/app",
+        type="html",
+        strategy="auto",
+    )
+    shell = "<html><body><div id=\"__next\"></div></body></html>"
+    real_html = "<html><body><main>" + ("rendered content " * 30) + "</main></body></html>"
+    calls = []
+
+    monkeypatch.setattr(
+        engine,
+        "_fetch_curl_cffi",
+        lambda *_: FetchResult(ok=True, url=task.url, content=shell, strategy_used="curl_cffi"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_fetch_httpx",
+        lambda *_: FetchResult(ok=True, url=task.url, content=shell, strategy_used="httpx"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_fetch_scrapling",
+        lambda _task, _headers, strategy: (
+            calls.append(strategy)
+            or FetchResult(ok=True, url=task.url, content=shell, strategy_used=strategy)
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_fetch_playwright",
+        lambda *_: FetchResult(
+            ok=True,
+            url=task.url,
+            content=real_html,
+            inner_text="rendered content " * 30,
+            strategy_used="playwright",
+        ),
+    )
+
+    try:
+        result = engine.fetch(task)
+    finally:
+        engine.close()
+
+    assert result.ok is True
+    assert result.strategy_used == "playwright"
+    assert calls == ["scrapling_static"]

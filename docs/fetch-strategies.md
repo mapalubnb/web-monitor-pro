@@ -27,8 +27,8 @@ web-monitor-pro 采用**自动递进式抓取**，全自建无外部 API 依赖�
              │ 无有效内容
              ↓
 ┌────────────────────────────────┐
-│ 策略 3.5: Scrapling 增强         │  ← 自适应解析 / 隐身抓取
-│  static → stealth 自动尝试        │
+│ 策略 3.5: Scrapling 轻量增强      │  ← 自适应解析 / 静态抓取
+│  auto 默认 static；挑战页再 stealth │
 └────────────┬───────────────────┘
              │ 仍无有效内容
              ↓
@@ -131,6 +131,10 @@ web-monitor-pro 采用**自动递进式抓取**，全自建无外部 API 依赖�
 “JavaScript is disabled / verify that you're not a robot” 这类挑战页，或
 “not authorized / access denied” 这类权限页，服务会直接判定为抓取失败，不会把
 挑战页文字建立成基准快照。
+
+普通域名的 `auto` 模式只会先使用轻量 `scrapling_static`，不会无条件启动
+`scrapling_stealth` 浏览器；只有识别到挑战页时才升级 stealth，从而避免同一轮检查
+连续启动 Scrapling 浏览器和 Playwright。
 
 这样可以避免 Binance 等页面出现“明明抓到的是机器人验证页，却显示监控成功”的误判。
 失败卡片会给出判断提示，建议排查稳定代理、降低频率，或改监控公开 API/JSON 数据源。
@@ -257,7 +261,7 @@ FREE_PROXY_MAX_COUNT=200
    其中 httpx 只使用 HTTP/HTTPS 代理；curl_cffi 和 Scrapling 会按自身支持情况使用 HTTP/HTTPS/SOCKS。
 3. Playwright 复用浏览器池，不动态切换免费代理；需要浏览器代理时建议配置稳定的 `HTTPS_PROXY`，或使用 `scrapling_stealth`。
 
-抓取链会对免费代理做轻量健康记录：成功后清除失败状态；失败或返回不可用内容后临时冷却该代理，避免同一个坏代理被连续选中。
+抓取链会对免费代理做轻量健康记录：成功后清除失败状态；失败或返回不可用内容后临时冷却该代理，避免同一个坏代理被连续选中。连续多个免费代理失败时，会临时暂停免费代理池并直接走直连，避免在坏代理列表里反复消耗 CPU/连接资源。
 如果免费代理连接失败，curl_cffi、httpx、Scrapling 和 GitBook markdown alternate 会自动直连重试一次；显式配置的 `HTTPS_PROXY` / `HTTP_PROXY` 不会被绕过。
 
 免费公共代理稳定性和安全性不可控；监控敏感内容时建议关闭代理池，或配置稳定的 `HTTPS_PROXY` / `HTTP_PROXY`。

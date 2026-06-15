@@ -324,7 +324,7 @@ class _BrowserPool:
     """
 
     MAX_AGE = 1800
-    _BLOCK_TYPES = {"image", "font", "media"}
+    _BLOCK_TYPES = {"image", "font", "media", "stylesheet"}
     # External domains whose resources often hang in restricted networks
     # (e.g. mainland China) and are non-essential for content extraction.
     _BLOCK_DOMAINS = (
@@ -613,14 +613,23 @@ class FetchEngine:
         return {"http": proxy_url, "https": proxy_url}
 
     def _report_proxy_result(self, result: FetchResult, *, success: bool) -> None:
-        if self.cfg.https_proxy or self.cfg.http_proxy:
-            return
-        self._free_proxy_pool.report_result(result.proxy_url, success=success)
+        self._report_proxy_url(result.proxy_url, success=success)
 
     def _report_proxy_url(self, proxy_url: str | None, *, success: bool) -> None:
         if self.cfg.https_proxy or self.cfg.http_proxy:
             return
         self._free_proxy_pool.report_result(proxy_url, success=success)
+        if proxy_url and not success:
+            self._drop_httpx_client(proxy_url)
+
+    def _drop_httpx_client(self, proxy_url: str) -> None:
+        client = self._httpx_clients.pop(proxy_url, None)
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            pass
 
     def _is_free_proxy(self, proxy_url: str | None) -> bool:
         return bool(proxy_url) and not (self.cfg.https_proxy or self.cfg.http_proxy)
@@ -693,7 +702,7 @@ class FetchEngine:
         return self._fetch_curl_cffi(task, headers)
 
     def _auto_chain(self, task: Task, headers: dict) -> FetchResult:
-        """Full auto chain: curl_cffi -> httpx -> deep extract -> Playwright."""
+        """Auto chain: HTTP fetchers -> light extraction -> browser fallback."""
         result = self._fetch_curl_cffi(task, headers)
         if result.ok and _is_content_usable(result, task):
             self._report_proxy_result(result, success=True)
@@ -721,7 +730,7 @@ class FetchEngine:
                 self._report_proxy_result(best_html, success=True)
                 return deep
 
-        scrapling_result = self._fetch_scrapling(task, headers, "scrapling_auto")
+        scrapling_result = self._fetch_scrapling(task, headers, "scrapling_static")
         if scrapling_result.ok and _is_content_usable(scrapling_result, task):
             logger.info("[{}] auto escalated to {}", task.name, scrapling_result.strategy_used)
             self._report_proxy_result(scrapling_result, success=True)
@@ -737,6 +746,10 @@ class FetchEngine:
             if deep is not None:
                 self._report_proxy_result(scrapling_result, success=True)
                 return deep
+            stealth = self._try_scrapling_stealth_upgrade(task, headers, scrapling_result)
+            if stealth is not None:
+                self._report_proxy_result(stealth, success=True)
+                return stealth
 
         pw = self._fetch_playwright(task, headers)
         if pw.ok and _is_content_usable(pw, task):

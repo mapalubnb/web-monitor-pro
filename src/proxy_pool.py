@@ -14,6 +14,8 @@ from .config import DATA_DIR, AppConfig
 from .logger import logger
 
 _SUPPORTED_SCHEMES = {"http", "https", "socks4", "socks5"}
+_FAILURE_STREAK_LIMIT = 5
+_GLOBAL_COOLDOWN_SECONDS = 600
 
 
 def parse_proxy_lines(text: str, *, max_count: int = 200) -> list[str]:
@@ -52,16 +54,20 @@ class FreeProxyPool:
         self._last_refresh = 0.0
         self._failures: dict[str, int] = defaultdict(int)
         self._cooldown_until: dict[str, float] = {}
+        self._failure_streak = 0
+        self._global_cooldown_until = 0.0
 
     def get_proxy(self, allowed_schemes: set[str] | None = None) -> str | None:
         """Return the next proxy URL, or None when disabled/unavailable."""
         if not self.enabled:
             return None
         with self._lock:
+            now = time.time()
+            if self._global_cooldown_until > now:
+                return None
             self._refresh_if_needed()
             if not self._proxies:
                 return None
-            now = time.time()
             for _ in range(len(self._proxies)):
                 proxy = self._proxies[self._idx % len(self._proxies)]
                 self._idx = (self._idx + 1) % len(self._proxies)
@@ -78,10 +84,12 @@ class FreeProxyPool:
             return
         with self._lock:
             if success:
+                self._failure_streak = 0
                 self._failures.pop(proxy, None)
                 self._cooldown_until.pop(proxy, None)
                 return
 
+            self._failure_streak += 1
             failures = self._failures.get(proxy, 0) + 1
             self._failures[proxy] = failures
             # Free proxies churn quickly. Cool bad ones down instead of deleting
@@ -89,6 +97,13 @@ class FreeProxyPool:
             cooldown = min(300, 30 * failures)
             self._cooldown_until[proxy] = time.time() + cooldown
             logger.debug("free proxy cooled down for {}s: {}", cooldown, proxy)
+            if self._failure_streak >= _FAILURE_STREAK_LIMIT:
+                self._global_cooldown_until = time.time() + _GLOBAL_COOLDOWN_SECONDS
+                self._failure_streak = 0
+                logger.warning(
+                    "free proxy pool paused for {}s after consecutive failures",
+                    _GLOBAL_COOLDOWN_SECONDS,
+                )
 
     def _refresh_if_needed(self) -> None:
         now = time.time()

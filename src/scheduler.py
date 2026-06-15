@@ -27,7 +27,7 @@ class MonitorScheduler:
         self._run_fn = run_fn
         self._sched = BackgroundScheduler(
             executors={"default": {"type": "threadpool",
-                                   "max_workers": max(cfg.max_concurrent_fetch * 2, 4)}},
+                                   "max_workers": max(cfg.max_concurrent_fetch, 2)}},
             job_defaults={"coalesce": True, "max_instances": 1,
                           "misfire_grace_time": 60},
             timezone="UTC",
