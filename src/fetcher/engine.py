@@ -176,6 +176,22 @@ _COOKIE_ACTION_MARKERS = (
     "接受全部",
 )
 
+_NOTICE_INTERSTITIAL_MARKERS = (
+    "you are leaving the",
+    "you are now leaving",
+    "leaving the galaxy website",
+    "leaving this website",
+    "being directed to an external third-party website",
+    "external third-party website",
+    "third-party websites are not under the control",
+    "not responsible for the accuracy or completeness",
+    "security and privacy policies on third-party websites",
+    "if you do not wish to continue",
+    "click cancel",
+    "external link disclaimer",
+    "will be directed to a third-party website",
+)
+
 _ERROR_PAGE_MARKERS = (
     "application error: a client-side exception has occurred",
     "this page isn't working",
@@ -332,6 +348,30 @@ def _is_cookie_notice_text(text: str) -> bool:
     return len(lower) <= 5000 and cookie_count >= 3 and (cookie_count / words) >= 0.015
 
 
+def _is_notice_interstitial_text(text: str) -> bool:
+    """Detect modal-only legal/external-link notices extracted as page content."""
+    if not text:
+        return False
+    lower = " ".join(text.lower().split())
+    if len(lower) > 5000:
+        return False
+    hits = sum(1 for marker in _NOTICE_INTERSTITIAL_MARKERS if marker in lower)
+    return hits >= 2
+
+
+def extracted_content_failure_reason(text: str) -> str:
+    """Return a failure reason when extracted text is only a blocker/notice."""
+    if _is_access_denied_text(text):
+        return "access denied / unauthorized page detected"
+    if _is_challenge_text(text):
+        return "bot challenge / JavaScript verification page detected"
+    if _is_cookie_notice_text(text):
+        return "cookie consent page detected"
+    if _is_notice_interstitial_text(text):
+        return "external link notice page detected"
+    return ""
+
+
 def _find_markdown_alternate(html: str, base_url: str) -> str | None:
     """Find a page-declared Markdown alternate URL, used by GitBook-style docs."""
     if not html:
@@ -364,6 +404,8 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
         return False
     if _is_cookie_notice_text(result.inner_text):
         return False
+    if _is_notice_interstitial_text(result.inner_text):
+        return False
     if _looks_like_binary_garbage(text):
         return False
     if task.type == "json":
@@ -381,6 +423,8 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     if _is_access_denied_text(visible):
         return False
     if _is_cookie_notice_text(visible):
+        return False
+    if _is_notice_interstitial_text(visible):
         return False
     if _is_error_page(visible):
         return False
@@ -1004,19 +1048,15 @@ class FetchEngine:
             if _is_challenge_text(html_result.content):
                 logger.info("[{}] deep extract skipped bot-challenge page", task.name)
                 return None
-            if _is_cookie_notice_text(html_result.inner_text or _quick_visible_text(html_result.content)):
-                logger.info("[{}] deep extract skipped cookie notice page", task.name)
+            if extracted_content_failure_reason(
+                html_result.inner_text or _quick_visible_text(html_result.content)
+            ):
+                logger.info("[{}] deep extract skipped unusable notice page", task.name)
                 return None
             text = try_deep_extract(html_result.content)
             if text and len(text) >= 120:
-                if _is_access_denied_text(text):
-                    logger.info("[{}] deep extract rejected access-denied page", task.name)
-                    return None
-                if _is_challenge_text(text):
-                    logger.info("[{}] deep extract rejected bot-challenge page", task.name)
-                    return None
-                if _is_cookie_notice_text(text):
-                    logger.info("[{}] deep extract rejected cookie notice page", task.name)
+                if extracted_content_failure_reason(text):
+                    logger.info("[{}] deep extract rejected unusable notice page", task.name)
                     return None
                 strategy = f"{html_result.strategy_used}\u2192deep"
                 logger.info("[{}] deep extract ok ({} chars, strategy={})",
@@ -1049,9 +1089,7 @@ class FetchEngine:
             if len(text.strip()) < 30:
                 self._report_proxy_url(used_proxy_url, success=False)
                 return None
-            if (_is_access_denied_text(text)
-                    or _is_cookie_notice_text(text)
-                    or _is_markdown_not_found(text)):
+            if _is_markdown_not_found(text) or extracted_content_failure_reason(text):
                 self._report_proxy_url(used_proxy_url, success=False)
                 return None
             strategy = f"{html_result.strategy_used}→markdown"
@@ -1105,15 +1143,11 @@ class FetchEngine:
                 return None
             if _is_challenge_text(html_result.content):
                 return None
-            if _is_cookie_notice_text(html_result.inner_text):
+            if extracted_content_failure_reason(html_result.inner_text):
                 return None
             text = extract_meta_fallback(html_result.content)
             if text and len(text) >= 30:
-                if _is_access_denied_text(text):
-                    return None
-                if _is_challenge_text(text):
-                    return None
-                if _is_cookie_notice_text(text):
+                if extracted_content_failure_reason(text):
                     return None
                 strategy = f"{html_result.strategy_used}→meta"
                 logger.info("[{}] meta-tag fallback ok ({} chars)", task.name, len(text))
@@ -1180,12 +1214,9 @@ class FetchEngine:
     @staticmethod
     def _unusable_reason(result: FetchResult) -> str:
         content = result.inner_text or result.content or ""
-        if _is_access_denied_text(content):
-            return "access denied / unauthorized page detected"
-        if _is_challenge_text(content):
-            return "bot challenge / JavaScript verification page detected"
-        if _is_cookie_notice_text(content):
-            return "cookie consent page detected"
+        reason = extracted_content_failure_reason(content)
+        if reason:
+            return reason
         if _looks_like_binary_garbage(result.content or ""):
             return "binary garbage response"
         return f"content unusable (len={len(result.content or '')})"

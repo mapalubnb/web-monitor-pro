@@ -492,6 +492,12 @@ def _failure_hint(error: str) -> str:
             "系统会用浏览器策略自动尝试点击同意；可发送 `/strategy <id> stealth`"
             "（实际策略 `scrapling_stealth`）后重试。"
         )
+    if "external link notice" in text:
+        return (
+            "疑似外链跳转或合规提示弹窗，已拒绝作为有效快照。"
+            "可发送 `/debug <id>` 查看诊断附件；如页面依赖浏览器渲染，"
+            "再尝试 `/strategy <id> browser` 或 `/strategy <id> stealth`。"
+        )
     if "access denied" in text or "unauthorized" in text:
         return "疑似权限受限页面，已拒绝作为有效快照。请确认页面是否公开可访问。"
     if "content unusable" in text:

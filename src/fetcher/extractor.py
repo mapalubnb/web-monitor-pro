@@ -9,7 +9,7 @@ from typing import Any
 
 from ..db import Task
 from ..logger import logger
-from .engine import FetchResult
+from .engine import FetchResult, extracted_content_failure_reason
 
 # 归一化时移除的噪音（时间戳 / csrf / nonce / 长 hash）
 # 注意：过于激进的 hex 匹配会误杀用户真正关心的哈希（如链上交易 hash），
@@ -32,6 +32,16 @@ _WS_RE = re.compile(r"[ \t]+")
 _BLANK_RE = re.compile(r"\n{3,}")
 
 MIN_USEFUL_LENGTH = 120
+
+
+def _candidate_text(text: str | None, min_length: int = MIN_USEFUL_LENGTH) -> str:
+    """Normalize and reject blocker/notice-only extraction candidates."""
+    normalized = _normalize(text or "")
+    if len(normalized) < min_length:
+        return ""
+    if extracted_content_failure_reason(normalized):
+        return ""
+    return normalized
 
 
 def extract(task: Task, result: FetchResult) -> str:
@@ -63,36 +73,36 @@ def _extract_rendered_html(html: str, task: Task, inner_text: str = "") -> str:
     """从 Playwright 渲染后的 HTML 提取文本，跳过 SPA/RSC 解析。"""
     # 1) CSS 选择器（用户指定）
     if task.selector:
-        text = _by_selector(html, task.selector, task)
-        if text and len(text) >= MIN_USEFUL_LENGTH:
-            return _normalize(text)
+        text = _candidate_text(_by_selector(html, task.selector, task))
+        if text:
+            return text
 
     # 2) Playwright 直接提供的 body.innerText
-    if inner_text and len(inner_text) >= MIN_USEFUL_LENGTH:
-        return _normalize(inner_text)
+    text = _candidate_text(inner_text)
+    if text:
+        return text
 
     # 3) 整页可见文本（从 HTML 重新解析）
-    text = _html_to_text(html)
-    if text and len(text) >= MIN_USEFUL_LENGTH:
-        return _normalize(text)
+    text = _candidate_text(_html_to_text(html))
+    if text:
+        return text
 
     # 4) trafilatura 正文提取
-    text = _main_content(html)
-    if text and len(text) >= MIN_USEFUL_LENGTH:
-        return _normalize(text)
+    text = _candidate_text(_main_content(html))
+    if text:
+        return text
 
     # 5) meta 兜底
-    meta = _extract_meta(html)
-    return _normalize(meta) if meta else ""
+    return _candidate_text(_extract_meta(html), min_length=30)
 
 
 def _extract_html(html: str, task: Task) -> str:
     """从原始 HTML 按优先级提取文本。"""
     # 1) CSS 选择器
     if task.selector:
-        text = _by_selector(html, task.selector, task)
-        if text and len(text) >= MIN_USEFUL_LENGTH:
-            return _normalize(text)
+        text = _candidate_text(_by_selector(html, task.selector, task))
+        if text:
+            return text
 
     # 2) SPA 嵌入数据
     if task.extract_next_data or _looks_like_spa_shell(html):
@@ -102,21 +112,31 @@ def _extract_html(html: str, task: Task) -> str:
 
     # 3) RSC Flight 数据（Next.js App Router SSR）
     rsc = _extract_rsc_flight(html)
-    if rsc and len(rsc) >= MIN_USEFUL_LENGTH:
-        return _normalize(rsc)
+    text = _candidate_text(rsc)
+    if text:
+        return text
 
     # 4) trafilatura 正文
-    text = _main_content(html)
-    if text and len(text) >= MIN_USEFUL_LENGTH:
-        return _normalize(text)
+    main_text = _normalize(_main_content(html))
+    if main_text and len(main_text) >= MIN_USEFUL_LENGTH:
+        if not extracted_content_failure_reason(main_text):
+            return main_text
+        text = _candidate_text(_html_to_text(html))
+        if text:
+            return text
 
     # 5) meta 元数据
     meta = _extract_meta(html)
-    if meta and len(meta) >= MIN_USEFUL_LENGTH:
-        return _normalize(meta)
+    text = _candidate_text(meta)
+    if text:
+        return text
 
     # 6) 兜底：整页纯文本
-    return _normalize(_html_to_text(html)) or _normalize(meta)
+    return (
+        _candidate_text(_html_to_text(html), min_length=30)
+        or _candidate_text(meta, min_length=30)
+        or main_text
+    )
 
 
 def _looks_like_spa_shell(html: str) -> bool:

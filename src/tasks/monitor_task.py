@@ -11,7 +11,10 @@ from ..db import ChangeHistory, Task, now_utc, session_scope
 from ..differ import compute_diff, filter_by_keywords
 from ..feishu import FeishuClient, cards
 from ..feishu.client import ensure_upload_size
-from ..fetcher import FetchEngine, FetchResult, content_hash, extract
+from ..fetcher import (
+    FetchEngine, FetchResult, content_hash, extract,
+    extracted_content_failure_reason,
+)
 from ..logger import logger
 from ..risk_control import RiskController
 
@@ -90,6 +93,12 @@ class MonitorRunner:
             logger.warning("#{} [{}] empty extraction (strategy={} len={})",
                            task.id, task.name, result.strategy_used, len(result.content or ""))
             self._handle_failure(task, "empty extraction (try /debug or /strategy browser)")
+            return
+        unusable_reason = extracted_content_failure_reason(extracted)
+        if unusable_reason:
+            logger.warning("#{} [{}] unusable extraction: {}",
+                           task.id, task.name, unusable_reason)
+            self._handle_failure(task, unusable_reason)
             return
 
         # Compare
