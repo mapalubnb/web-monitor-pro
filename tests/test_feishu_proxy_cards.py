@@ -3,7 +3,7 @@ import json
 from src.feishu import cards
 
 
-def test_task_list_card_shows_proxy_info():
+def test_task_list_card_keeps_summary_compact():
     card = cards.task_list_card([{
         "id": 1,
         "name": "示例任务",
@@ -17,7 +17,10 @@ def test_task_list_card_shows_proxy_info():
         "proxy_info": "Proxifly 免费代理池（最多 200 个）",
     }])
 
-    assert "代理：Proxifly 免费代理池" in json.dumps(card, ensure_ascii=False)
+    text = json.dumps(card, ensure_ascii=False)
+    assert "策略 `auto`" in text
+    assert "📜 历史" in text
+    assert "代理：Proxifly 免费代理池" not in text
 
 
 def test_task_detail_card_shows_proxy_info():

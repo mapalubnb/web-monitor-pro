@@ -1,96 +1,71 @@
-# 命令完整说明
+# 飞书命令
 
-在飞书群里 **@机器人 /命令** 或 私聊机器人 发送 `/命令` 即可触发。
-所有命令都会以卡片形式返回结果。
+在飞书群里 `@机器人 /命令`，或私聊机器人发送 `/命令` 即可触发。命令会返回卡片，任务列表卡片里提供历史、快照、检查、暂停、删除等按钮。
 
----
+## 常用命令
 
-## 任务管理
-
-### `/add <url> [选项]`
-
-新增一个监控任务。
-
-| 选项 | 说明 | 默认 |
+| 命令 | 用途 | 示例 |
 | --- | --- | --- |
-| `--name "名字"` | 任务名称 | URL 的域名+路径 |
-| `--interval 60` | 检查间隔（秒） | `DEFAULT_CHECK_INTERVAL` |
-| `--type html\|json` | 内容类型 | `html` |
-| `--strategy auto\|httpx\|curl_cffi\|playwright\|scrapling_static\|scrapling_dynamic\|scrapling_stealth\|scrapling_auto` | 抓取策略 | `auto` |
-| `--impersonate chrome131\|chrome124\|firefox133\|safari18_0` | curl_cffi 模拟的浏览器 | `chrome131` |
-| `--selector "article"` | CSS 选择器（仅 html） | 自动抽正文 |
-| `--adaptive-selector` | 对 CSS 选择器启用 Scrapling 自适应重定位 | 配置 selector 时自动开启 |
-| `--no-adaptive-selector` | 关闭 selector 自适应重定位 | 关闭 |
-| `--selector-id main` | 自适应选择器存储标识 | 选择器本身 |
-| `--adaptive-threshold 40` | 自适应重定位最低相似度 | `40` |
-| `--wait-selector "main"` | 浏览器策略等待指定元素出现 | 动态策略下自动复用 selector |
-| `--json-path "data[*].name"` | JSON 字段路径（仅 json） | 整个 JSON |
-| `--extract-next-data` | 提取 Next.js `__NEXT_DATA__` | 关闭 |
-| `--keyword "招聘" --keyword "实习"` | 关键字过滤（命中才推送，可多个） | 空 |
+| `/help` | 查看命令手册 | `/help` |
+| `/add <url>` | 新增监控任务 | `/add https://example.com/news` |
+| `/list` | 查看任务和按钮操作 | `/list` |
+| `/check <id>` | 立即检查一次 | `/check 3` |
+| `/pause <id>` | 暂停任务 | `/pause 3` |
+| `/resume <id>` | 恢复任务 | `/resume 3` |
+| `/remove <id>` | 删除任务 | `/remove 3` |
+| `/debug <id>` | 抓取诊断和修复建议 | `/debug 3` |
+| `/log [--tail N]` | 查看日志并附完整日志文件 | `/log --tail 200` |
+| `/status` | 服务状态和配置摘要 | `/status` |
+| `/mute <时长>` | 临时免打扰 | `/mute 30m` |
+| `/unmute` | 关闭免打扰 | `/unmute` |
 
-**示例：**
+## 新增任务
 
-```
-/add https://github.com/trending --name GitHub趋势 --interval 300 --selector "article.Box-row"
-```
+最简单只需要 URL：
 
-```
+```text
 /add https://example.com/news
 ```
 
-```
-/add https://example.com/news --selector "main"
-```
+常用选项：
 
-```
-/add https://four.meme/en/create-token --extract-next-data
-```
+| 选项 | 用途 | 示例 |
+| --- | --- | --- |
+| `--name` | 设置任务名称 | `--name GitHub趋势` |
+| `--interval` | 设置检查间隔，单位秒 | `--interval 300` |
+| `--selector` | 只监控指定 CSS 区域 | `--selector "main"` |
+| `--type json` | 监控 JSON/API | `--type json` |
+| `--json-path` | 只监控 JSON 指定字段 | `--json-path "data[*].name"` |
+| `--keyword` | 只推送命中关键字的变化 | `--keyword 招聘` |
 
-```
+示例：
+
+```text
+/add https://github.com/trending --name GitHub趋势 --interval 300 --selector "article.Box-row"
 /add https://api.example.com/v1/items --type json --json-path "data[*].name,data[*].price"
 ```
 
-高级兜底：
+## 调整任务
 
+### 检查间隔
+
+```text
+/interval 3 300
 ```
-/strategy <id> stealth
+
+### 关键字
+
+```text
+/keyword 3 add 招聘
+/keyword 3 add 招聘,实习,Python
+/keyword 3 remove 招聘
+/keyword 3 list
+/keyword 3 clear
 ```
 
----
+### 抓取策略
 
-### `/list`
-
-列出所有监控任务（带操作按钮：立即检查 / 历史 / 暂停 / 删除）
-
----
-
-### `/pause <id>` / `/resume <id>` / `/remove <id>`
-
-暂停 / 恢复 / 删除指定任务。
-
----
-
-### `/check <id>`
-
-立即触发一次检查，不等定时器。
-
----
-
-### `/history <id>`
-
-查看该任务最近 10 次变更记录。
-
----
-
-### `/snapshot <id>`
-
-下载该任务当前基准快照。
-
----
-
-### `/strategy <id> <策略>`
-
-给任务切换抓取策略，并清空旧基准快照。切换后会立即触发一次抓取，用新策略重新建立基准。
+`/strategy` 会清空旧基准，并立即用新策略重新抓取一次。
 
 | 策略 | 实际策略值 | 适用场景 |
 | --- | --- | --- |
@@ -107,97 +82,33 @@
 /strategy 3 stealth
 /strategy 3 browser
 /strategy 3 auto
+/strategy 3 scrapling
 ```
 
----
+## 按钮操作
 
-### `/reset <id> [选项]`
+`/list` 返回的任务卡片包含按钮：
 
-清空基准快照，下次检查会重新建立首次快照。可同时调整高级参数：
-
-| 选项 | 说明 |
+| 按钮 | 用途 |
 | --- | --- |
-| `--strategy scrapling_stealth` | 切换抓取策略（新手建议优先用 `/strategy <id> stealth`） |
-| `--impersonate chrome131` | 切换 curl_cffi 浏览器指纹 |
-| `--selector "main"` | 更新 CSS 选择器，并默认启用自适应 |
-| `--no-adaptive-selector` | 关闭 selector 自适应 |
-| `--wait-selector "main"` | 浏览器策略等待指定元素 |
-| `--extract-next-data` | 启用 SPA 嵌入数据提取 |
+| 打开 | 打开目标页面 |
+| 检查 | 立即检查一次 |
+| 详情 | 查看任务配置和状态 |
+| 快照 | 下载当前基准快照 |
+| 历史 | 查看最近 10 条变更 |
+| 暂停 / 恢复 | 切换任务状态 |
+| 删除 | 删除任务 |
 
----
+## 旧命令迁移
 
-### `/keyword <id> add <关键字>` / `/keyword <id> remove <关键字>`
+以下文本命令已收敛，不再作为常用入口：
 
-为任务添加或移除关键字。设置关键字后，**只有 diff 命中关键字才会推送**。
-
-```
-/keyword 3 add 招聘
-/keyword 3 add iPhone
-```
-
----
-
-## 服务管理
-
-### `/status`
-
-查看服务健康状态：运行时长、任务数、今日推送数、今日检查数、错误数、内存占用等。
-
----
-
-### `/config`
-
-查看全局配置概览（不含敏感凭证）。
-
----
-
-### `/log [--tail N]`
-
-查看当日日志末尾 N 行，**同时附上完整日志文件作为下载附件**。
-
-```
-/log              # 默认末尾 100 行
-/log --tail 500   # 末尾 500 行
-```
-
----
-
-### `/mute <时长>` / `/unmute`
-
-临时免打扰 / 取消免打扰。期间检测到的变更不会推送，但仍会正常检查并记录。
-
-```
-/mute 30m    # 免打扰 30 分钟
-/mute 2h     # 免打扰 2 小时
-/mute 1d     # 免打扰 1 天
-```
-
----
-
-### `/sniff <url>`
-
-**抓包助手**：当目标是动态加载（SPA）的网站时，直接请求它的内部 API 比渲染页面更稳定。
-此命令会返回一份操作指南，教你用 Chrome F12 找到 API。
-
-```
-/sniff https://four.meme/en/create-token
-```
-
----
-
-### `/debug <id>`
-
-立即抓取一次并诊断页面：识别框架、嵌入数据、当前策略和修复建议，同时附上 HTML 文件。
-
----
-
-### `/help`
-
-显示所有命令（卡片形式）。
-
----
-
-## 卡片按钮
-
-所有返回的卡片中的按钮（⚡ 立即检查 / ⏸️ 暂停 / ▶️ 恢复 / 🗑️ 删除 / 📜 历史等）
-**功能等价于对应的命令**，点击即可触发。
+| 旧命令 | 新入口 |
+| --- | --- |
+| `/history <id>` | `/list` 卡片里的「历史」按钮 |
+| `/snapshot <id>` | `/list` 卡片里的「快照」按钮 |
+| `/config` | `/status` |
+| `/sniff <url>` | `/debug <id>` |
+| `/reset <id> ...` | `/strategy <id> <策略>` 或重新 `/add` |
+| `/delete <id>` | `/remove <id>` |
+| `/logs` | `/log` |

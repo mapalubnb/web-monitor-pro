@@ -109,25 +109,22 @@ sudo journalctl -u web-monitor-pro -f
 | 命令 | 说明 |
 |------|------|
 | `/help` | 查看命令手册 |
-| `/add <url> [options]` | 新增监控（常用：`--name` `--interval` `--type json` `--selector` `--json-path` `--keyword`；高级：`--strategy` `--impersonate` 等） |
+| `/add <url> [常用选项]` | 新增监控（常用：`--name` `--interval` `--type json` `--selector` `--json-path` `--keyword`） |
 | `/list` | 列出所有任务（带管理按钮） |
 | `/check <id>` | 立即触发检查 |
 | `/pause <id>` / `/resume <id>` | 暂停 / 恢复 |
 | `/remove <id>` | 删除任务 |
-| `/history <id>` | 变更历史（最近 10 条） |
-| `/snapshot <id>` | 下载当前基准快照 |
 | `/keyword <id> add/remove/list/clear <kw>` | 关键字过滤管理（支持逗号/顿号批量） |
 | `/interval <id> <seconds>` | 修改检查间隔（≥10 秒） |
 | `/debug <id>` | 诊断（识别框架、嵌入数据、给出建议，附 HTML 下载） |
-| `/sniff <url>` | 抓包辅助（引导找 API） |
-| `/strategy <id> <策略>` | 切换抓取策略：`auto`、`stealth`、`browser`、`fast`、`http` |
-| `/reset <id> [options]` | 重置基准快照（可同时调整抓取参数） |
+| `/strategy <id> <策略>` | 切换抓取策略：`auto`、`stealth`、`browser`、`fast`、`http`、`scrapling` |
 | `/mute <30m/2h/1d>` / `/unmute` | 免打扰 |
 | `/log [--tail N]` | 查看日志（附完整日志下载） |
-| `/status` | 服务健康状态 |
-| `/config` | 全局配置概览 |
+| `/status` | 服务健康状态和配置摘要 |
 
 完整说明：[docs/commands.md](docs/commands.md)
+
+变更历史和快照下载在 `/list` 返回的任务卡片按钮中操作。
 
 常用策略示例：
 
@@ -137,6 +134,7 @@ sudo journalctl -u web-monitor-pro -f
 /strategy 3 browser   # 普通浏览器，实际策略 playwright
 /strategy 3 fast      # 快速模式，实际策略 curl_cffi
 /strategy 3 http      # 普通 HTTP，实际策略 httpx
+/strategy 3 scrapling # 增强静态抓取，实际策略 scrapling_static
 ```
 
 ---

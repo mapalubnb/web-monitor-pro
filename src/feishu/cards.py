@@ -95,6 +95,7 @@ def _task_buttons(task_id: int, enabled: bool, url: str | None = None,
     btns.append(_btn("📄 详情", "task_detail", task_id))
     if has_snapshot:
         btns.append(_btn("📥 快照", "snapshot", task_id))
+    btns.append(_btn("📜 历史", "history", task_id))
     if enabled:
         btns.append(_btn("⏸ 暂停", "pause", task_id))
     else:
@@ -131,33 +132,29 @@ def startup_card(task_count: int, default_interval: int,
 # ============================================================
 def help_card() -> dict:
     sections = [
-        ("常用命令",
-         "`/add <url>` — 新增监控，自动选择抓取方式\n"
-         "`/add <url> --selector \"main\"` — 只监控页面指定区域\n"
-         "`/add <api_url> --type json --json-path data.items` — 监控 API 字段\n"
-         "`/list` — 列出所有任务\n"
+        ("任务",
+         "`/add <url>` — 新增监控\n"
+         "`/list` — 查看任务和按钮操作\n"
          "`/check <id>` — 立即检查\n"
-         "`/pause <id>` · `/resume <id>` · `/remove <id>`\n"
-         "`/history <id>` — 变更历史\n"
-         "`/snapshot <id>` — 下载快照\n"
-         "`/interval <id> <秒>` — 修改间隔"),
-        ("切换抓取策略",
-         "`/strategy <id> auto` — 自动选择，默认推荐\n"
-         "`/strategy <id> stealth` — 隐身浏览器，实际策略 `scrapling_stealth`\n"
-         "`/strategy <id> browser` — 普通浏览器，实际策略 `playwright`\n"
-         "`/strategy <id> fast` — 快速模式，实际策略 `curl_cffi`\n"
-         "`/strategy <id> http` — 普通 HTTP，实际策略 `httpx`"),
-        ("精细配置",
-         "`/keyword <id> add <词1>[, 词2]` — 添加关键字\n"
-         "`/keyword <id> remove / list / clear`\n"
-         "`/sniff <url>` — 抓包助手\n"
-         "`/debug <id>` — 自动诊断并给出修复建议\n"
-         "`/reset <id> [选项]` — 高级重置，可调整选择器/指纹等参数"),
+         "`/pause <id>` / `/resume <id>` — 暂停或恢复\n"
+         "`/remove <id>` — 删除任务"),
+        ("调整",
+         "`/interval <id> <秒>` — 修改检查间隔\n"
+         "`/keyword <id> add <词>` — 添加关键字\n"
+         "`/keyword <id> remove <词>` — 移除关键字\n"
+         "`/keyword <id> list` / `clear` — 查看或清空关键字"),
+        ("抓取策略",
+         "`/strategy <id> auto` — 自动选择，实际 `auto`\n"
+         "`/strategy <id> stealth` — 隐身浏览器，实际 `scrapling_stealth`\n"
+         "`/strategy <id> browser` — 普通浏览器，实际 `playwright`\n"
+         "`/strategy <id> fast` — 快速模式，实际 `curl_cffi`\n"
+         "`/strategy <id> http` — 普通 HTTP，实际 `httpx`\n"
+         "`/strategy <id> scrapling` — 增强静态，实际 `scrapling_static`"),
         ("服务管理",
-         "`/status` — 健康状态\n"
-         "`/config` — 全局配置\n"
+         "`/debug <id>` — 抓取诊断和修复建议\n"
          "`/log [--tail N]` — 查看日志\n"
-         "`/mute 30m` · `/unmute` — 免打扰"),
+         "`/status` — 服务状态和配置摘要\n"
+         "`/mute 30m` / `/unmute` — 免打扰"),
     ]
     elements: list[dict] = [
         _div("**命令手册**　　@机器人 或私聊发送命令均可"),
@@ -167,7 +164,7 @@ def help_card() -> dict:
         elements.append(_div(f"**{title}**\n{content}"))
         elements.append(_hr())
     elements.append(_note(
-        "通常只需要 `/add <url>`。抓取失败时先试 `/debug <id>`，再试 `/strategy <id> stealth`。"
+        "历史和快照请在 `/list` 卡片中点击按钮查看。抓取失败先用 `/debug <id>`。"
     ))
     return _card("📘 命令帮助", THEME["info"], elements)
 
@@ -253,13 +250,13 @@ def task_list_card(tasks: list[dict]) -> dict:
         last = t.get("last_checked_at") or "从未"
         keywords = t.get("keywords") or []
         kw_line = f"\n🎯 {', '.join(f'`{k}`' for k in keywords)}" if keywords else ""
-        proxy = t.get("proxy_info") or "未启用"
+        strategy = t.get("last_strategy_used") or t.get("strategy", "auto")
 
         elements.append(_div(
             f"{status} **#{t['id']} · {t['name']}**\n"
-            f"[打开页面]({t['url']}) · `{t['interval']}s` · "
+            f"[打开页面]({t['url']})\n"
+            f"间隔 `{t['interval']}s` · 策略 `{strategy}` · "
             f"变更 `{t.get('total_changes', 0)}` · 最近 `{last}`"
-            f"\n🌐 代理：{proxy}"
             f"{kw_line}"
         ))
         elements.append(_action(_task_buttons(
@@ -268,7 +265,7 @@ def task_list_card(tasks: list[dict]) -> dict:
         )))
         elements.append(_hr())
 
-    elements.append(_note("添加任务通常只需 `/add <url>`"))
+    elements.append(_note("常用操作直接点按钮；更多调整用 `/strategy`、`/interval`、`/keyword`。"))
     return _card("📋 任务列表", THEME["info"], elements)
 
 
@@ -276,7 +273,7 @@ def task_list_card(tasks: list[dict]) -> dict:
 # 6. 任务详情（无管理按钮，纯信息展示）
 # ============================================================
 def task_detail_card(t: dict) -> dict:
-    status = "🟢 运行中" if t["enabled"] else "⏸ 已暂停"
+    status = "运行中" if t["enabled"] else "已暂停"
     keywords = ", ".join(f"`{k}`" for k in (t.get("keywords") or [])) or "未配置"
     fails = t.get("consecutive_failures", 0)
     fail_text = f"**{fails}** 次" if fails else "无"
@@ -294,8 +291,7 @@ def task_detail_card(t: dict) -> dict:
     advanced_text = " · ".join(advanced) or "自动"
 
     elements: list[dict] = [
-        _div(f"**{t['name']}**　{status}"),
-        _div(f"[🔗 {t['url']}]({t['url']})"),
+        _div(f"**{t['name']}**\n状态：{status}\n[打开页面]({t['url']})"),
         _hr(),
         _fields([
             ("类型", t.get("type", "html"), True),
@@ -303,7 +299,6 @@ def task_detail_card(t: dict) -> dict:
             ("检查间隔", f"{t['interval']} 秒", True),
             ("累计变更", str(t.get("total_changes", 0)), True),
             ("连续失败", fail_text, True),
-            ("增强", advanced_text, True),
             ("代理", t.get("proxy_info") or "未启用", True),
         ]),
     ]
@@ -321,14 +316,14 @@ def task_detail_card(t: dict) -> dict:
         elements.append(_div("**提取配置**\n" + "\n".join(extract_parts)))
 
     elements.append(_hr())
-    elements.append(_div(f"**关键字**：{keywords}"))
+    elements.append(_div(f"**增强配置**：{advanced_text}\n**关键字**：{keywords}"))
     elements.append(_fields([
         ("上次检查", t.get("last_checked_at") or "从未", True),
         ("上次变更", t.get("last_changed_at") or "从未", True),
     ]))
     elements.append(_hr())
     elements.append(
-        _note("`/check` 立即检查 · `/history` 变更历史 · `/snapshot` 下载快照"))
+        _note("常用：`/check` 立即检查 · `/strategy` 切换策略 · `/interval` 修改间隔"))
 
     return _card(f"📄 任务详情　#{t['id']}", THEME["info"], elements,
                  subtitle=t["name"])
@@ -369,6 +364,7 @@ def status_card(data: dict) -> dict:
     return _card(
         "📊 服务状态", THEME["success"],
         [
+            _div("**运行概览**"),
             _fields([
                 ("运行时长", data.get("uptime", "-"), True),
                 ("任务", f"{data.get('active_tasks', 0)} 活跃 / "
@@ -379,6 +375,22 @@ def status_card(data: dict) -> dict:
                 ("免打扰", data.get("mute_status", "否"), True),
             ]),
             _hr(),
+            _div("**抓取配置**"),
+            _fields([
+                ("默认间隔", f"{data.get('default_check_interval', '-')} 秒", True),
+                ("最大并发", str(data.get("max_concurrent_fetch", "-")), True),
+                ("域名限流", f"{data.get('domain_min_interval', '-')} 秒", True),
+                ("请求超时", f"{data.get('request_timeout', '-')} 秒", True),
+                ("噪音阈值", f"{data.get('min_change_ratio', 0):.2%}", True),
+                ("推送冷却", f"{data.get('push_cooldown_seconds', '-')} 秒", True),
+            ]),
+            _hr(),
+            _div(
+                f"**代理**：{data.get('proxy_info', '未启用')}\n"
+                f"**增强模块**：{data.get('external_apis', '未启用')}"
+            ),
+            _hr(),
+            _div("**运行环境**"),
             _fields([
                 ("主机", data.get("hostname", "-"), True),
                 ("Python", data.get("python_version", "-"), True),
@@ -409,46 +421,20 @@ def log_card(tail_text: str, log_size: str = "", date: str = "") -> dict:
 
 
 # ============================================================
-# 10. 配置查看
-# ============================================================
-def config_card(cfg: dict) -> dict:
-    return _card(
-        "⚙️ 全局配置", THEME["info"],
-        [
-            _fields([
-                ("默认间隔", f"{cfg.get('default_check_interval', '-')}s", True),
-                ("最大并发", str(cfg.get("max_concurrent_fetch", "-")), True),
-                ("域名限流", f"{cfg.get('domain_min_interval', '-')}s", True),
-                ("请求超时", f"{cfg.get('request_timeout', '-')}s", True),
-                ("抖动比例", f"{cfg.get('jitter_ratio', 0):.1%}", True),
-                ("噪音阈值", f"{cfg.get('min_change_ratio', 0):.2%}", True),
-                ("推送冷却", f"{cfg.get('push_cooldown_seconds', '-')}s", True),
-                ("失败告警", f"连续 {cfg.get('alert_after_consecutive_failures', '-')} 次", True),
-            ]),
-            _hr(),
-            _div(
-                f"**代理**：{cfg.get('proxy_info', '未启用')}\n"
-                f"**增强模块**：{cfg.get('external_apis', '未启用')}"
-            ),
-        ],
-    )
-
-
-# ============================================================
 # 11. 错误 / 成功 / 失败告警
 # ============================================================
 def error_card(title: str, reason: str, suggestion: str = "") -> dict:
     content = f"**{title}**\n\n{reason}"
     if suggestion:
         content += f"\n\n💡 {suggestion}"
-    return _card("❌ 操作失败", THEME["error"], [_div(content)])
+    return _card("❌ 处理失败", THEME["error"], [_div(content)])
 
 
 def success_card(title: str, detail: str = "") -> dict:
     content = f"**{title}**"
     if detail:
         content += f"\n\n{detail}"
-    return _card("✅ 操作成功", THEME["success"], [_div(content)])
+    return _card("✅ 处理完成", THEME["success"], [_div(content)])
 
 
 def fetch_failure_card(task_id: int, task_name: str, url: str,
@@ -497,13 +483,13 @@ def _failure_hint(error: str) -> str:
     if "javascript verification" in text or "bot challenge" in text:
         return (
             "疑似机器人验证 / JS 挑战页，已拒绝作为有效快照。"
-            "可尝试稳定代理、降低频率，或发送 `/strategy <ID> stealth`"
+            "可尝试稳定代理、降低频率，或发送 `/strategy <id> stealth`"
             "（实际策略 `scrapling_stealth`）。"
         )
     if "cookie consent" in text or "cookie notice" in text:
         return (
             "疑似 Cookie 同意页，已拒绝作为有效快照。"
-            "系统会用浏览器策略自动尝试点击同意；可发送 `/strategy <ID> stealth`"
+            "系统会用浏览器策略自动尝试点击同意；可发送 `/strategy <id> stealth`"
             "（实际策略 `scrapling_stealth`）后重试。"
         )
     if "access denied" in text or "unauthorized" in text:
@@ -513,40 +499,9 @@ def _failure_hint(error: str) -> str:
     return ""
 
 
-# ============================================================
-# 12. 抓包助手
-# ============================================================
-def sniff_helper_card(url: str) -> dict:
-    return _card(
-        "🔍 抓包助手", THEME["info"],
-        [
-            _div(f"对于 SPA 网站，**请求内部 API 比渲染页面更快更稳定**。\n\n"
-                 f"目标：`{url}`"),
-            _hr(),
-            _div(
-                "**操作步骤**\n\n"
-                "1. Chrome 打开目标网址\n"
-                "2. `F12` → **Network** → 筛选 **Fetch/XHR**\n"
-                "3. 刷新页面，观察请求列表\n"
-                "4. 右键请求 → Copy → **Copy URL**"
-            ),
-            _hr(),
-            _div(
-                "**识别 API 的特征**\n"
-                "- Content-Type: `application/json`\n"
-                "- URL 含 `/api/`、`/v1/`、`/graphql`\n"
-                "- Preview 能看到关心的数据字段"
-            ),
-            _hr(),
-            _note("`/add <api_url> --type json --json-path data[*].name`"),
-        ],
-    )
-
-
 __all__ = [
     "startup_card", "help_card", "first_snapshot_card", "change_card",
     "task_list_card", "task_detail_card", "history_card",
-    "status_card", "log_card", "config_card",
+    "status_card", "log_card",
     "error_card", "success_card", "fetch_failure_card",
-    "sniff_helper_card",
 ]

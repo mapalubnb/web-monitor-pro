@@ -89,7 +89,7 @@ class MonitorRunner:
         if not extracted.strip():
             logger.warning("#{} [{}] empty extraction (strategy={} len={})",
                            task.id, task.name, result.strategy_used, len(result.content or ""))
-            self._handle_failure(task, "empty extraction (try /debug or /reset --strategy playwright)")
+            self._handle_failure(task, "empty extraction (try /debug or /strategy browser)")
             return
 
         # Compare

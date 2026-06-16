@@ -636,13 +636,12 @@ def diagnose_html(html: str) -> dict[str, Any]:
         suggestions.append("页面内嵌结构化数据，当前提取策略应能拿到")
     elif "CSR Bailout" in "".join(frameworks) or "纯客户端 SPA" in "".join(frameworks):
         suggestions.append(
-            "纯客户端 SPA（数据由 JS 动态加载）。建议 `/sniff <url>` 找内部 API "
-            "用 `--type json` 监控，或 `--strategy playwright` 让浏览器渲染"
+            "纯客户端 SPA（数据由 JS 动态加载）。建议用 `/debug <id>` 查看诊断附件，"
+            "或发送 `/strategy <id> browser` 让浏览器渲染。"
         )
     elif "Cloudflare 保护" in frameworks and visible_len < 400:
         suggestions.append(
-            "疑似 Cloudflare 挑战，建议 `--impersonate chrome124/firefox133` 换指纹，"
-            "或 `--strategy playwright` 用浏览器渲染"
+            "疑似 Cloudflare 挑战，建议发送 `/strategy <id> stealth` 使用隐身浏览器策略。"
         )
     else:
         suggestions.append(f"抓取正常，可见文本 {visible_len} 字")

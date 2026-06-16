@@ -47,7 +47,7 @@ class CommandResponse:
 
     @classmethod
     def err(cls, reason: str, suggestion: str = "") -> CommandResponse:
-        return cls(card=cards.error_card("操作失败", reason, suggestion))
+        return cls(card=cards.error_card("处理失败", reason, suggestion))
 
     @classmethod
     def ok(cls, title: str, detail: str = "") -> CommandResponse:
@@ -73,23 +73,27 @@ class CommandDispatcher:
             "pause": lambda a: self._set_enabled(_first_int(a), False),
             "resume": lambda a: self._set_enabled(_first_int(a), True),
             "remove": self._cmd_remove,
-            "delete": self._cmd_remove,
             "check": self._cmd_check,
-            "history": self._cmd_history,
-            "snapshot": self._cmd_snapshot,
             "keyword": self._cmd_keyword,
-            "config": self._cmd_config,
             "log": self._cmd_log,
-            "logs": self._cmd_log,
             "status": self._cmd_status,
             "mute": self._cmd_mute,
             "unmute": lambda _: (self.risk.unmute(),
-                                 CommandResponse.ok("🔔 已关闭免打扰"))[1],
-            "sniff": self._cmd_sniff,
+                                 CommandResponse.ok(
+                                     "免打扰已关闭",
+                                     "状态：已恢复推送",
+                                 ))[1],
             "debug": self._cmd_debug,
             "interval": self._cmd_interval,
             "strategy": self._cmd_strategy,
-            "reset": self._cmd_reset,
+            # 已收敛的旧命令：保留迁移提示，避免老消息直接变成未知命令。
+            "delete": lambda a: self._cmd_removed("delete", "/remove <ID>"),
+            "logs": lambda a: self._cmd_removed("logs", "/log [--tail N]"),
+            "config": lambda a: self._cmd_removed("config", "/status"),
+            "sniff": lambda a: self._cmd_removed("sniff", "/debug <ID>"),
+            "reset": lambda a: self._cmd_removed("reset", "/strategy <ID> <策略>"),
+            "history": lambda a: self._cmd_removed("history", "点击 `/list` 卡片里的「历史」按钮"),
+            "snapshot": lambda a: self._cmd_removed("snapshot", "点击 `/list` 卡片里的「快照」按钮"),
         }
 
         self._action_handlers: dict[str, Callable[[dict], CommandResponse]] = {
@@ -158,7 +162,7 @@ class CommandDispatcher:
             return handler(value)
         except Exception as e:
             logger.exception("按钮异常：{}", e)
-            return CommandResponse.err(f"操作失败：{e}")
+            return CommandResponse.err(f"按钮处理失败：{e}")
 
     def _is_authorized(self, user_id: str) -> bool:
         admins = self.cfg.feishu.admin_open_ids
@@ -188,6 +192,12 @@ class CommandDispatcher:
     # ============================================================
     def _cmd_help(self, args: list[str]) -> CommandResponse:
         return CommandResponse(card=cards.help_card())
+
+    def _cmd_removed(self, old_command: str, replacement: str) -> CommandResponse:
+        return CommandResponse.err(
+            f"`/{old_command}` 已合并，不再作为常用文本命令。",
+            f"请改用：{replacement}",
+        )
 
     # ============================================================
     # /add
@@ -240,8 +250,8 @@ class CommandDispatcher:
             ).scalar_one_or_none()
             if exists:
                 return CommandResponse.err(
-                    f"URL 已存在：任务 #{exists.id} [{exists.name}]",
-                    f"用 `/reset {exists.id}` 重置，或 `/remove {exists.id}` 后重建",
+                    f"URL 已存在：任务 #{exists.id} · {exists.name}",
+                    f"可用 `/check {exists.id}` 立即检查，或 `/remove {exists.id}` 后重新添加。",
                 )
             t = Task(
                 name=name, url=url, type=ns.type, strategy=ns.strategy,
@@ -271,10 +281,11 @@ class CommandDispatcher:
             card=cards.success_card(
                 "任务已添加",
                 f"**#{task_id} · {name}**\n"
-                f"🔗 {url}\n"
-                f"⏱️ 间隔 {ns.interval}s · 策略 `{ns.strategy}`"
+                f"URL：{url}\n"
+                f"间隔：{ns.interval} 秒\n"
+                f"策略：`{ns.strategy}`"
                 f"{proxy_line}{kw_line}{adaptive_line}\n\n"
-                f"首次抓取后会建立基准快照并推送卡片。",
+                f"下一步：系统会立即抓取一次，成功后建立基准快照。",
             ),
             trigger_check_task_id=task_id,
         )
@@ -302,7 +313,10 @@ class CommandDispatcher:
             name = t.name
         verb = "▶️ 已恢复" if enabled else "⏸️ 已暂停"
         logger.info("{} 任务 #{} [{}]", verb, task_id, name)
-        resp = CommandResponse.ok(f"{verb} #{task_id} · {name}")
+        resp = CommandResponse.ok(
+            "任务状态已更新",
+            f"任务：#{task_id} · {name}\n状态：{'运行中' if enabled else '已暂停'}",
+        )
         resp.sync_scheduler_task_ids = [task_id]
         return resp
 
@@ -320,7 +334,10 @@ class CommandDispatcher:
             name = t.name
             s.delete(t)
         logger.info("🗑️  已删除任务 #{} [{}]", task_id, name)
-        resp = CommandResponse.ok(f"🗑️ 已删除任务 #{task_id} · {name}")
+        resp = CommandResponse.ok(
+            "任务已删除",
+            f"任务：#{task_id} · {name}\n下一步：如需恢复，请重新 `/add <url>`。",
+        )
         resp.sync_scheduler_task_ids = [task_id]
         return resp
 
@@ -334,8 +351,8 @@ class CommandDispatcher:
             return err
         return CommandResponse(
             card=cards.success_card(
-                "⚡ 已触发立即检查",
-                f"任务 #{task_id} · {t.name}\n抓取结果稍后推送（如有变化）。",
+                "已触发检查",
+                f"任务：#{task_id} · {t.name}\n下一步：如有新变化，系统会在确认后推送。",
             ),
             trigger_check_task_id=task_id,
         )
@@ -391,11 +408,11 @@ class CommandDispatcher:
         )
         return CommandResponse(
             card=cards.success_card(
-                "📥 快照已发送",
-                f"**#{task_id} · {t.name}**\n"
-                f"🔗 {t.url}\n"
-                f"🕐 抓取时间：`{last_checked}`\n"
-                f"📝 文件大小：`{_humanize_size(content_len)}`",
+                "快照已发送",
+                f"任务：#{task_id} · {t.name}\n"
+                f"URL：{t.url}\n"
+                f"抓取时间：`{last_checked}`\n"
+                f"文件大小：`{_humanize_size(content_len)}`",
             ),
             file_path=snap_path,
             file_display_name=f"[{t.name}] 最新快照.txt",
@@ -437,8 +454,9 @@ class CommandDispatcher:
                     if current else "（未配置关键字）"
                 )
                 return CommandResponse(card=cards.success_card(
-                    f"🎯 任务 #{task_id} · {name} 的关键字",
-                    text + f"\n\n共 {len(current)} 个。",
+                    "关键字列表",
+                    f"任务：#{task_id} · {name}\n"
+                    f"数量：{len(current)} 个\n\n{text}",
                 ))
 
             if op == "clear":
@@ -448,8 +466,8 @@ class CommandDispatcher:
                 logger.info("🎯 任务 #{} [{}] 清空了 {} 个关键字",
                             task_id, name, len(current))
                 return CommandResponse.ok(
-                    "🧹 已清空关键字",
-                    f"任务 #{task_id} · {name}\n清除了 {len(current)} 个关键字",
+                    "关键字已清空",
+                    f"任务：#{task_id} · {name}\n数量：清除 {len(current)} 个",
                 )
 
             if op not in ("add", "remove"):
@@ -480,15 +498,15 @@ class CommandDispatcher:
                     )
                 t.keywords = current
                 detail = (
-                    f"任务 #{task_id} · {name}\n"
-                    f"➕ 新增：{', '.join(f'`{k}`' for k in added)}"
+                    f"任务：#{task_id} · {name}\n"
+                    f"新增：{', '.join(f'`{k}`' for k in added)}"
                 )
                 if skipped:
-                    detail += f"\n⏭️ 已存在跳过：{', '.join(f'`{k}`' for k in skipped)}"
-                detail += f"\n\n当前共 {len(current)} 个关键字。"
+                    detail += f"\n跳过：{', '.join(f'`{k}`' for k in skipped)} 已存在"
+                detail += f"\n数量：当前 {len(current)} 个"
                 logger.info("🎯 任务 #{} [{}] ➕ 关键字 {}",
                             task_id, name, added)
-                return CommandResponse.ok("🎯 已更新关键字", detail)
+                return CommandResponse.ok("关键字已更新", detail)
 
             # op == "remove"
             removed, missing = [], []
@@ -504,39 +522,15 @@ class CommandDispatcher:
                 )
             t.keywords = current
             detail = (
-                f"任务 #{task_id} · {name}\n"
-                f"➖ 移除：{', '.join(f'`{k}`' for k in removed)}"
+                f"任务：#{task_id} · {name}\n"
+                f"移除：{', '.join(f'`{k}`' for k in removed)}"
             )
             if missing:
-                detail += f"\n⏭️ 未找到跳过：{', '.join(f'`{k}`' for k in missing)}"
-            detail += f"\n\n当前共 {len(current)} 个关键字。"
+                detail += f"\n跳过：{', '.join(f'`{k}`' for k in missing)} 未找到"
+            detail += f"\n数量：当前 {len(current)} 个"
             logger.info("🎯 任务 #{} [{}] ➖ 关键字 {}",
                         task_id, name, removed)
-            return CommandResponse.ok("🎯 已更新关键字", detail)
-
-    # ============================================================
-    # /config
-    # ============================================================
-    def _cmd_config(self, args: list[str]) -> CommandResponse:
-        apis = []
-        if self.cfg.enable_playwright:
-            apis.append("Playwright 渲染")
-        if self.cfg.enable_scrapling:
-            apis.append("Scrapling 抓取/自适应选择器")
-        summary = {
-            "default_check_interval": self.cfg.default_check_interval,
-            "max_concurrent_fetch": self.cfg.max_concurrent_fetch,
-            "domain_min_interval": self.cfg.risk_control.domain_min_interval,
-            "request_timeout": self.cfg.request_timeout,
-            "jitter_ratio": self.cfg.risk_control.jitter_ratio,
-            "min_change_ratio": self.cfg.risk_control.min_change_ratio,
-            "push_cooldown_seconds": self.cfg.risk_control.push_cooldown_seconds,
-            "alert_after_consecutive_failures":
-                self.cfg.risk_control.alert_after_consecutive_failures,
-            "proxy_info": _proxy_summary(self.cfg),
-            "external_apis": "、".join(apis) if apis else "未启用",
-        }
-        return CommandResponse(card=cards.config_card(summary))
+            return CommandResponse.ok("关键字已更新", detail)
 
     # ============================================================
     # /log
@@ -598,6 +592,14 @@ class CommandDispatcher:
             "python_version": platform.python_version(),
             "version": __version__,
             "memory": f"{_memory_mb():.1f} MB" if _memory_mb() else "-",
+            "default_check_interval": self.cfg.default_check_interval,
+            "max_concurrent_fetch": self.cfg.max_concurrent_fetch,
+            "domain_min_interval": self.cfg.risk_control.domain_min_interval,
+            "request_timeout": self.cfg.request_timeout,
+            "min_change_ratio": self.cfg.risk_control.min_change_ratio,
+            "push_cooldown_seconds": self.cfg.risk_control.push_cooldown_seconds,
+            "proxy_info": _proxy_summary(self.cfg),
+            "external_apis": _enabled_modules(self.cfg),
         }))
 
     # ============================================================
@@ -611,17 +613,9 @@ class CommandDispatcher:
         except ValueError as e:
             return CommandResponse.err(str(e))
         return CommandResponse.ok(
-            "🔇 已开启免打扰",
-            f"到期：**{until:%Y-%m-%d %H:%M:%S}**\n`/unmute` 可提前恢复",
+            "免打扰已开启",
+            f"到期：**{until:%Y-%m-%d %H:%M:%S}**\n下一步：发送 `/unmute` 可提前恢复。",
         )
-
-    # ============================================================
-    # /sniff
-    # ============================================================
-    def _cmd_sniff(self, args: list[str]) -> CommandResponse:
-        if not args:
-            return CommandResponse.err("用法：`/sniff <URL>`")
-        return CommandResponse(card=cards.sniff_helper_card(args[0].strip()))
 
     # ============================================================
     # /debug
@@ -657,8 +651,7 @@ class CommandDispatcher:
         recommendations = list(f["suggestions"])
         if t.selector and not getattr(t, "adaptive_selector", False):
             recommendations.append(
-                f"选择器任务可尝试 `/reset {task_id} --adaptive-selector "
-                f"--selector-id main --adaptive-threshold 40`，降低页面小改版导致的空提取"
+                "当前选择器未启用自适应，建议重新添加任务时保留 `--selector`，系统会默认开启自适应。"
             )
         if self.cfg.enable_scrapling and result.strategy_used not in (
             "scrapling_static", "scrapling_dynamic", "scrapling_stealth"
@@ -670,13 +663,14 @@ class CommandDispatcher:
         frameworks = "、".join(f["frameworks"]) or "未识别"
         data_points = "、".join(x.replace("✅ ", "") for x in f["data_points"]) or "未找到"
         detail = (
-            f"**#{task_id} · {t.name}**\n"
-            f"[打开页面]({t.url})\n\n"
-            f"策略 `{result.strategy_used}` · HTML `{_humanize_size(f['html_size'])}` · "
-            f"可见文本 `{f['visible_text_length']}` 字\n"
+            f"任务：#{task_id} · {t.name}\n"
+            f"URL：{t.url}\n"
+            f"策略：`{result.strategy_used}`\n"
+            f"HTML：`{_humanize_size(f['html_size'])}`\n"
+            f"可见文本：{f['visible_text_length']} 字\n"
             f"框架：{frameworks}\n"
             f"数据：{data_points}\n"
-            f"{scrapling_note}\n\n"
+            f"增强：{scrapling_note}\n\n"
             f"**建议**\n{chr(10).join(f'• {s}' for s in recommendations)}"
         )
 
@@ -691,7 +685,7 @@ class CommandDispatcher:
             html_path = None
 
         return CommandResponse(
-            card=cards.success_card("🔍 抓取诊断报告", detail),
+            card=cards.success_card("抓取诊断报告", detail),
             file_path=html_path,
             file_display_name=f"task_{task_id}_debug.html" if html_path else "",
         )
@@ -719,8 +713,8 @@ class CommandDispatcher:
 
         logger.info("⏱️ 任务 #{} [{}] 间隔 → {}s", task_id, name, seconds)
         resp = CommandResponse.ok(
-            "⏱️ 已更新间隔",
-            f"任务 #{task_id} · {name}\n新间隔：**{seconds} 秒**",
+            "检查间隔已更新",
+            f"任务：#{task_id} · {name}\n间隔：**{seconds} 秒**",
         )
         resp.sync_scheduler_task_ids = [task_id]
         return resp
@@ -767,91 +761,13 @@ class CommandDispatcher:
 
         logger.info("🧭 任务 #{} [{}] 切换策略为 {}", task_id, name, strategy)
         detail = (
-            f"任务 #{task_id} · {name}\n"
-            f"已清空旧基准，下次抓取会用新策略重新建立。\n"
-            f"📝 " + "、".join(changes)
+            f"任务：#{task_id} · {name}\n"
+            f"调整：" + "、".join(changes) + "\n"
+            f"下一步：系统会立即抓取一次，并用新策略重新建立基准。"
         )
         return CommandResponse(
-            card=cards.success_card("🧭 已切换策略", detail),
+            card=cards.success_card("抓取策略已更新", detail),
             trigger_check_task_id=task_id,
-        )
-
-    # ============================================================
-    # /reset
-    # ============================================================
-    def _cmd_reset(self, args: list[str]) -> CommandResponse:
-        from ..fetcher.engine import SUPPORTED_IMPERSONATE, SUPPORTED_STRATEGIES
-        parser = _make_parser("reset")
-        parser.add_argument("task_id", type=int)
-        parser.add_argument("--strategy", default=None,
-                            choices=SUPPORTED_STRATEGIES)
-        parser.add_argument("--impersonate", default=None,
-                            choices=(None, *SUPPORTED_IMPERSONATE))
-        parser.add_argument("--selector", default=None)
-        parser.add_argument("--adaptive-selector", dest="adaptive_selector",
-                            action="store_true", default=None)
-        parser.add_argument("--no-adaptive-selector", dest="disable_adaptive_selector",
-                            action="store_true", default=False)
-        parser.add_argument("--selector-id", dest="selector_identifier", default=None)
-        parser.add_argument("--adaptive-threshold", dest="adaptive_threshold",
-                            type=int, default=None)
-        parser.add_argument("--wait-selector", dest="wait_selector", default=None)
-        parser.add_argument("--extract-next-data", dest="extract_next_data",
-                            action="store_true", default=None)
-        try:
-            ns = parser.parse_args(args)
-        except SystemExit:
-            return CommandResponse.err("用法：`/reset <ID> [--strategy playwright]`")
-
-        changes: list[str] = []
-        with session_scope() as s:
-            t = s.get(Task, ns.task_id)
-            if t is None:
-                return CommandResponse.err(f"未找到任务 #{ns.task_id}")
-            t.last_content_hash = None
-            t.last_snapshot_path = None
-            t.consecutive_failures = 0
-            if ns.strategy:
-                t.strategy = ns.strategy
-                changes.append(f"策略→`{ns.strategy}`")
-            if ns.impersonate:
-                t.impersonate = ns.impersonate
-                changes.append(f"指纹→`{ns.impersonate}`")
-            if ns.selector is not None:
-                t.selector = ns.selector
-                if not ns.disable_adaptive_selector:
-                    t.adaptive_selector = True
-                    if not t.selector_identifier:
-                        t.selector_identifier = ns.selector
-                changes.append(f"选择器→`{ns.selector}`")
-            if ns.adaptive_selector:
-                t.adaptive_selector = True
-                changes.append("启用自适应选择器")
-            if ns.disable_adaptive_selector:
-                t.adaptive_selector = False
-                changes.append("关闭自适应选择器")
-            if ns.selector_identifier is not None:
-                t.selector_identifier = ns.selector_identifier
-                changes.append(f"选择器标识→`{ns.selector_identifier}`")
-            if ns.adaptive_threshold is not None:
-                t.adaptive_threshold = max(1, min(ns.adaptive_threshold, 100))
-                changes.append(f"自适应阈值→`{t.adaptive_threshold}`")
-            if ns.wait_selector is not None:
-                t.wait_selector = ns.wait_selector
-                changes.append(f"等待选择器→`{ns.wait_selector}`")
-            if ns.extract_next_data:
-                t.extract_next_data = True
-                changes.append("启用 SPA 提取")
-            name = t.name
-
-        logger.info("🔄 任务 #{} [{}] 已重置，{}",
-                    ns.task_id, name, "; ".join(changes) or "策略不变")
-        detail = f"任务 #{ns.task_id} · {name}\n基准已清空，下次抓取作为新首次建立。"
-        if changes:
-            detail += "\n📝 同时调整：" + "、".join(changes)
-        return CommandResponse(
-            card=cards.success_card("🔄 已重置", detail),
-            trigger_check_task_id=ns.task_id,
         )
 
     # ============================================================
@@ -1037,6 +953,15 @@ def _proxy_summary(cfg: AppConfig) -> str:
     if cfg.enable_free_proxy_pool:
         return f"Proxifly 免费代理池（最多 {cfg.free_proxy_max_count} 个）"
     return "未启用"
+
+
+def _enabled_modules(cfg: AppConfig) -> str:
+    modules = []
+    if cfg.enable_playwright:
+        modules.append("Playwright")
+    if cfg.enable_scrapling:
+        modules.append("Scrapling")
+    return "、".join(modules) if modules else "未启用"
 
 
 def _memory_mb() -> float:
