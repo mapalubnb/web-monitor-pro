@@ -102,6 +102,35 @@ sudo systemctl start web-monitor-pro
 sudo journalctl -u web-monitor-pro -f
 ```
 
+### 服务器更新
+
+已通过 `install.sh` 部署的服务器，直接在项目目录运行升级脚本：
+
+```bash
+cd /path/to/web-monitor-pro
+sudo bash upgrade.sh
+sudo systemctl status web-monitor-pro
+```
+
+`upgrade.sh` 会自动执行 `git pull origin main`、更新 Python 依赖、刷新浏览器组件并重启服务。
+
+查看更新后的日志：
+
+```bash
+sudo journalctl -u web-monitor-pro -f
+```
+
+如果需要手动更新：
+
+```bash
+cd /path/to/web-monitor-pro
+sudo systemctl stop web-monitor-pro
+git pull origin main
+venv/bin/pip install -r requirements.txt
+sudo systemctl restart web-monitor-pro
+sudo systemctl status web-monitor-pro
+```
+
 ---
 
 ## 飞书命令
