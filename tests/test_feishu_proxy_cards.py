@@ -54,6 +54,22 @@ def test_fetch_failure_card_shows_bot_challenge_hint():
     assert "scrapling_stealth" in text
 
 
+def test_fetch_failure_card_shows_cookie_notice_hint():
+    card = cards.fetch_failure_card(
+        2,
+        "cookie",
+        "https://example.com",
+        1,
+        "cookie consent page detected",
+        first_attempt=True,
+    )
+    text = json.dumps(card, ensure_ascii=False)
+
+    assert "Cookie 同意页" in text
+    assert "/strategy 2 stealth" in text
+    assert "scrapling_stealth" in text
+
+
 def test_fetch_failure_card_shows_free_proxy_hint():
     card = cards.fetch_failure_card(
         9,

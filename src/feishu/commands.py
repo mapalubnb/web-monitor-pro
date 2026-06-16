@@ -88,6 +88,7 @@ class CommandDispatcher:
             "sniff": self._cmd_sniff,
             "debug": self._cmd_debug,
             "interval": self._cmd_interval,
+            "strategy": self._cmd_strategy,
             "reset": self._cmd_reset,
         }
 
@@ -663,7 +664,7 @@ class CommandDispatcher:
             "scrapling_static", "scrapling_dynamic", "scrapling_stealth"
         ):
             recommendations.append(
-                f"高风控或纯 CSR 页面可尝试 `/reset {task_id} --strategy scrapling_stealth`"
+                f"高风控或纯 CSR 页面可尝试 `/strategy {task_id} stealth`"
             )
         recommendations = recommendations[:4]
         frameworks = "、".join(f["frameworks"]) or "未识别"
@@ -723,6 +724,57 @@ class CommandDispatcher:
         )
         resp.sync_scheduler_task_ids = [task_id]
         return resp
+
+    # ============================================================
+    # /strategy
+    # ============================================================
+    def _cmd_strategy(self, args: list[str]) -> CommandResponse:
+        if len(args) < 2:
+            return CommandResponse.err(
+                "用法：`/strategy <ID> <策略>`",
+                "可选策略：`auto` 自动、`stealth` 隐身浏览器、`browser` 浏览器、"
+                "`fast` 快速、`http` 普通、`scrapling` 增强静态",
+            )
+        task_id = _first_int(args)
+        if task_id is None:
+            return CommandResponse.err("任务 ID 必须为整数")
+
+        raw_strategy = args[1].strip().lower()
+        strategy = _normalize_strategy(raw_strategy)
+        if strategy is None:
+            return CommandResponse.err(
+                f"未知策略：`{raw_strategy}`",
+                "可直接复制：`auto`、`stealth`、`browser`、`fast`、`http`、`scrapling`",
+            )
+
+        changes: list[str] = []
+        with session_scope() as s:
+            t = s.get(Task, task_id)
+            if t is None:
+                return CommandResponse.err(f"未找到任务 #{task_id}")
+            name = t.name
+            t.strategy = strategy
+            t.last_content_hash = None
+            t.last_snapshot_path = None
+            t.last_strategy_used = None
+            t.consecutive_failures = 0
+            changes.append(f"策略→`{strategy}`（{_strategy_label(strategy)}）")
+            if strategy in ("playwright", "scrapling_dynamic", "scrapling_stealth", "scrapling_auto"):
+                wait_selector = _auto_wait_selector(t.selector, strategy, t.wait_selector)
+                if wait_selector and wait_selector != t.wait_selector:
+                    t.wait_selector = wait_selector
+                    changes.append(f"等待选择器→`{wait_selector}`")
+
+        logger.info("🧭 任务 #{} [{}] 切换策略为 {}", task_id, name, strategy)
+        detail = (
+            f"任务 #{task_id} · {name}\n"
+            f"已清空旧基准，下次抓取会用新策略重新建立。\n"
+            f"📝 " + "、".join(changes)
+        )
+        return CommandResponse(
+            card=cards.success_card("🧭 已切换策略", detail),
+            trigger_check_task_id=task_id,
+        )
 
     # ============================================================
     # /reset
@@ -898,6 +950,52 @@ def _auto_wait_selector(
     if strategy in ("playwright", "scrapling_dynamic", "scrapling_stealth", "scrapling_auto"):
         return selector
     return None
+
+
+_STRATEGY_ALIASES = {
+    "auto": "auto",
+    "自动": "auto",
+    "stealth": "scrapling_stealth",
+    "隐身": "scrapling_stealth",
+    "隐身浏览器": "scrapling_stealth",
+    "browser": "playwright",
+    "浏览器": "playwright",
+    "playwright": "playwright",
+    "fast": "curl_cffi",
+    "快速": "curl_cffi",
+    "curl": "curl_cffi",
+    "curl_cffi": "curl_cffi",
+    "http": "httpx",
+    "httpx": "httpx",
+    "普通": "httpx",
+    "scrapling": "scrapling_static",
+    "增强静态": "scrapling_static",
+    "scrapling_static": "scrapling_static",
+    "dynamic": "scrapling_dynamic",
+    "动态": "scrapling_dynamic",
+    "scrapling_dynamic": "scrapling_dynamic",
+    "scrapling_stealth": "scrapling_stealth",
+    "scrapling_auto": "scrapling_auto",
+}
+
+_STRATEGY_LABELS = {
+    "auto": "自动选择，默认推荐",
+    "scrapling_stealth": "隐身浏览器，适合风控/Cookie/纯动态页面",
+    "playwright": "普通浏览器，适合 JS 渲染页面",
+    "curl_cffi": "快速模式，适合 Cloudflare/TLS 指纹页面",
+    "httpx": "普通 HTTP，适合静态页面",
+    "scrapling_static": "增强静态，适合 HTML 页面和选择器自适应",
+    "scrapling_dynamic": "增强动态，适合需要 JS 的页面",
+    "scrapling_auto": "Scrapling 自动选择",
+}
+
+
+def _normalize_strategy(value: str) -> str | None:
+    return _STRATEGY_ALIASES.get((value or "").strip().lower())
+
+
+def _strategy_label(value: str) -> str:
+    return _STRATEGY_LABELS.get(value, value)
 
 
 def _url_to_name(url: str) -> str:

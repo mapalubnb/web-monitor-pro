@@ -53,7 +53,7 @@
 高级兜底：
 
 ```
-/reset <id> --strategy scrapling_stealth
+/strategy <id> stealth
 ```
 
 ---
@@ -88,13 +88,36 @@
 
 ---
 
+### `/strategy <id> <策略>`
+
+给任务切换抓取策略，并清空旧基准快照。切换后会立即触发一次抓取，用新策略重新建立基准。
+
+| 策略 | 实际策略值 | 适用场景 |
+| --- | --- | --- |
+| `auto` | `auto` | 自动选择，默认推荐 |
+| `stealth` | `scrapling_stealth` | 风控、Cookie 同意页、纯动态页面 |
+| `browser` | `playwright` | 普通浏览器渲染，适合 JS 页面 |
+| `fast` | `curl_cffi` | 快速抓取，适合 Cloudflare/TLS 指纹页面 |
+| `http` | `httpx` | 普通静态页面 |
+| `scrapling` | `scrapling_static` | 增强静态抓取，适合 HTML/选择器自适应 |
+
+示例：
+
+```text
+/strategy 3 stealth
+/strategy 3 browser
+/strategy 3 auto
+```
+
+---
+
 ### `/reset <id> [选项]`
 
 清空基准快照，下次检查会重新建立首次快照。可同时调整高级参数：
 
 | 选项 | 说明 |
 | --- | --- |
-| `--strategy scrapling_stealth` | 切换抓取策略 |
+| `--strategy scrapling_stealth` | 切换抓取策略（新手建议优先用 `/strategy <id> stealth`） |
 | `--impersonate chrome131` | 切换 curl_cffi 浏览器指纹 |
 | `--selector "main"` | 更新 CSS 选择器，并默认启用自适应 |
 | `--no-adaptive-selector` | 关闭 selector 自适应 |

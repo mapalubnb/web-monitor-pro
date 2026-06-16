@@ -126,6 +126,56 @@ _CHALLENGE_MARKERS = (
     "anti-bot",
 )
 
+_COOKIE_NOTICE_MARKERS = (
+    "we use cookies",
+    "this website uses cookies",
+    "this site uses cookies",
+    "uses cookies to",
+    "cookie consent",
+    "cookie notice",
+    "cookie banner",
+    "cookie settings",
+    "cookie preferences",
+    "manage cookies",
+    "accept all cookies",
+    "reject all cookies",
+    "allow all cookies",
+    "cookie policy",
+    "privacy preferences",
+    "consent preferences",
+    "your privacy choices",
+    "we value your privacy",
+    "our partners use cookies",
+    "我们使用 cookie",
+    "我们使用cookies",
+    "使用 cookie",
+    "使用cookies",
+    "cookie 设置",
+    "cookie 偏好",
+    "接受所有 cookie",
+    "接受全部 cookie",
+    "隐私偏好",
+)
+
+_COOKIE_ACTION_MARKERS = (
+    "accept all",
+    "accept cookies",
+    "reject all",
+    "manage preferences",
+    "save preferences",
+    "cookie settings",
+    "allow all",
+    "i agree",
+    "got it",
+    "同意",
+    "接受",
+    "拒绝",
+    "管理偏好",
+    "保存偏好",
+    "全部接受",
+    "接受全部",
+)
+
 _ERROR_PAGE_MARKERS = (
     "application error: a client-side exception has occurred",
     "this page isn't working",
@@ -180,6 +230,23 @@ _MARKDOWN_ALTERNATE_RE = re.compile(
 _JS_BODY_LEN = "() => (document.body && document.body.innerText || '').trim().length"
 _JS_BODY_READY = "() => (document.body && document.body.innerText || '').trim().length >= 200"
 _JS_INNER_TEXT = "() => (document.body && document.body.innerText || '').trim()"
+_COOKIE_CLICK_SCRIPT = r"""
+() => {
+  const re = /(accept all|accept cookies|allow all|agree|i agree|got it|continue|reject all|同意|接受|全部接受|接受全部|我同意|继续|拒绝)/i;
+  const nodes = Array.from(document.querySelectorAll(
+    'button, [role="button"], input[type="button"], input[type="submit"], a'
+  ));
+  for (const el of nodes) {
+    const text = ((el.innerText || el.value || el.getAttribute('aria-label') || '') + '').trim();
+    if (!text || text.length > 80 || !re.test(text)) continue;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) continue;
+    el.click();
+    return text;
+  }
+  return '';
+}
+"""
 
 _HIGH_RISK_DOMAINS = (
     "binance.com",
@@ -234,6 +301,37 @@ def _is_challenge_text(text: str) -> bool:
     return any(m in lower for m in _CHALLENGE_MARKERS)
 
 
+def _has_cookie_notice_marker(text: str) -> bool:
+    """Detect that a page likely contains a cookie banner or cookie wall."""
+    if not text:
+        return False
+    lower = " ".join(text.lower().split())
+    if "cookie" not in lower and "cookies" not in lower:
+        return False
+    return (
+        any(m in lower for m in _COOKIE_NOTICE_MARKERS)
+        or any(m in lower for m in _COOKIE_ACTION_MARKERS)
+    )
+
+
+def _is_cookie_notice_text(text: str) -> bool:
+    """Detect cookie-only consent pages that should never become baselines."""
+    if not text:
+        return False
+    lower = " ".join(text.lower().split())
+    if not _has_cookie_notice_marker(lower):
+        return False
+
+    # Cookie banners embedded in a real article can be long; only reject pages
+    # where the visible text is mostly the consent UI itself.
+    cookie_count = lower.count("cookie") + lower.count("cookies")
+    action_count = sum(1 for m in _COOKIE_ACTION_MARKERS if m in lower)
+    if len(lower) <= 2500 and (cookie_count >= 2 or action_count >= 1):
+        return True
+    words = max(len(lower.split()), 1)
+    return len(lower) <= 5000 and cookie_count >= 3 and (cookie_count / words) >= 0.015
+
+
 def _find_markdown_alternate(html: str, base_url: str) -> str | None:
     """Find a page-declared Markdown alternate URL, used by GitBook-style docs."""
     if not html:
@@ -264,6 +362,8 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
     text = result.content
     if _is_access_denied_text(text) or _is_access_denied_text(result.inner_text):
         return False
+    if _is_cookie_notice_text(result.inner_text):
+        return False
     if _looks_like_binary_garbage(text):
         return False
     if task.type == "json":
@@ -279,6 +379,8 @@ def _is_content_usable(result: FetchResult, task: Task) -> bool:
 
     visible = _quick_visible_text(text)
     if _is_access_denied_text(visible):
+        return False
+    if _is_cookie_notice_text(visible):
         return False
     if _is_error_page(visible):
         return False
@@ -574,6 +676,10 @@ class _BrowserPool:
             except Exception:
                 pass
 
+            clicked_cookie = self._accept_cookie_notice(page)
+            if clicked_cookie:
+                logger.info("[{}] accepted cookie notice via '{}'", url, clicked_cookie)
+
             # Poll for body content
             for _ in range(5):
                 if page.evaluate(_JS_BODY_LEN) >= 200:
@@ -604,6 +710,34 @@ class _BrowserPool:
                         obj.close()
                     except Exception:
                         pass
+
+    @staticmethod
+    def _accept_cookie_notice(page: Any) -> str:
+        """Best-effort click for cookie banners before extracting text."""
+        try:
+            body_text = page.evaluate(_JS_INNER_TEXT)
+        except Exception:
+            body_text = ""
+        if not body_text or not _has_cookie_notice_marker(body_text):
+            return ""
+
+        clicked = ""
+        try:
+            clicked = str(page.evaluate(_COOKIE_CLICK_SCRIPT) or "")
+        except Exception:
+            clicked = ""
+        if not clicked:
+            return ""
+
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
+        return clicked
 
     def _close_internal(self) -> None:
         """Shutdown browser — must run on the executor thread."""
@@ -870,6 +1004,9 @@ class FetchEngine:
             if _is_challenge_text(html_result.content):
                 logger.info("[{}] deep extract skipped bot-challenge page", task.name)
                 return None
+            if _is_cookie_notice_text(html_result.inner_text or _quick_visible_text(html_result.content)):
+                logger.info("[{}] deep extract skipped cookie notice page", task.name)
+                return None
             text = try_deep_extract(html_result.content)
             if text and len(text) >= 120:
                 if _is_access_denied_text(text):
@@ -877,6 +1014,9 @@ class FetchEngine:
                     return None
                 if _is_challenge_text(text):
                     logger.info("[{}] deep extract rejected bot-challenge page", task.name)
+                    return None
+                if _is_cookie_notice_text(text):
+                    logger.info("[{}] deep extract rejected cookie notice page", task.name)
                     return None
                 strategy = f"{html_result.strategy_used}\u2192deep"
                 logger.info("[{}] deep extract ok ({} chars, strategy={})",
@@ -909,7 +1049,9 @@ class FetchEngine:
             if len(text.strip()) < 30:
                 self._report_proxy_url(used_proxy_url, success=False)
                 return None
-            if _is_access_denied_text(text) or _is_markdown_not_found(text):
+            if (_is_access_denied_text(text)
+                    or _is_cookie_notice_text(text)
+                    or _is_markdown_not_found(text)):
                 self._report_proxy_url(used_proxy_url, success=False)
                 return None
             strategy = f"{html_result.strategy_used}→markdown"
@@ -963,11 +1105,15 @@ class FetchEngine:
                 return None
             if _is_challenge_text(html_result.content):
                 return None
+            if _is_cookie_notice_text(html_result.inner_text):
+                return None
             text = extract_meta_fallback(html_result.content)
             if text and len(text) >= 30:
                 if _is_access_denied_text(text):
                     return None
                 if _is_challenge_text(text):
+                    return None
+                if _is_cookie_notice_text(text):
                     return None
                 strategy = f"{html_result.strategy_used}→meta"
                 logger.info("[{}] meta-tag fallback ok ({} chars)", task.name, len(text))
@@ -1038,6 +1184,8 @@ class FetchEngine:
             return "access denied / unauthorized page detected"
         if _is_challenge_text(content):
             return "bot challenge / JavaScript verification page detected"
+        if _is_cookie_notice_text(content):
+            return "cookie consent page detected"
         if _looks_like_binary_garbage(result.content or ""):
             return "binary garbage response"
         return f"content unusable (len={len(result.content or '')})"

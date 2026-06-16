@@ -131,13 +131,16 @@ web-monitor-pro 采用**自动递进式抓取**，全自建无外部 API 依赖�
 “JavaScript is disabled / verify that you're not a robot” 这类挑战页，或
 “not authorized / access denied” 这类权限页，服务会直接判定为抓取失败，不会把
 挑战页文字建立成基准快照。
+如果页面只返回 Cookie 同意 / 隐私偏好内容，也会被判定为无效内容；浏览器类策略会
+自动尝试点击“接受 / 同意”按钮后再提取正文。
 
 普通域名的 `auto` 模式只会先使用轻量 `scrapling_static`，不会无条件启动
 `scrapling_stealth` 浏览器；只有识别到挑战页时才升级 stealth，从而避免同一轮检查
 连续启动 Scrapling 浏览器和 Playwright。
 
 这样可以避免 Binance 等页面出现“明明抓到的是机器人验证页，却显示监控成功”的误判。
-失败卡片会给出判断提示，建议排查稳定代理、降低频率，或改监控公开 API/JSON 数据源。
+失败卡片会给出判断提示，建议排查稳定代理、降低频率，或先发送
+`/strategy <id> stealth` 切换到隐身浏览器策略。
 
 ### 自适应选择器
 

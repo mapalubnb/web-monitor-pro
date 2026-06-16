@@ -131,22 +131,28 @@ def startup_card(task_count: int, default_interval: int,
 # ============================================================
 def help_card() -> dict:
     sections = [
-        ("任务管理",
+        ("常用命令",
          "`/add <url>` — 新增监控，自动选择抓取方式\n"
          "`/add <url> --selector \"main\"` — 只监控页面指定区域\n"
          "`/add <api_url> --type json --json-path data.items` — 监控 API 字段\n"
          "`/list` — 列出所有任务\n"
-         "`/pause <id>` · `/resume <id>` · `/remove <id>`\n"
          "`/check <id>` — 立即检查\n"
+         "`/pause <id>` · `/resume <id>` · `/remove <id>`\n"
          "`/history <id>` — 变更历史\n"
          "`/snapshot <id>` — 下载快照\n"
          "`/interval <id> <秒>` — 修改间隔"),
+        ("切换抓取策略",
+         "`/strategy <id> auto` — 自动选择，默认推荐\n"
+         "`/strategy <id> stealth` — 隐身浏览器，实际策略 `scrapling_stealth`\n"
+         "`/strategy <id> browser` — 普通浏览器，实际策略 `playwright`\n"
+         "`/strategy <id> fast` — 快速模式，实际策略 `curl_cffi`\n"
+         "`/strategy <id> http` — 普通 HTTP，实际策略 `httpx`"),
         ("精细配置",
          "`/keyword <id> add <词1>[, 词2]` — 添加关键字\n"
          "`/keyword <id> remove / list / clear`\n"
          "`/sniff <url>` — 抓包助手\n"
          "`/debug <id>` — 自动诊断并给出修复建议\n"
-         "`/reset <id> [选项]` — 重置基准或高级调参"),
+         "`/reset <id> [选项]` — 高级重置，可调整选择器/指纹等参数"),
         ("服务管理",
          "`/status` — 健康状态\n"
          "`/config` — 全局配置\n"
@@ -161,7 +167,7 @@ def help_card() -> dict:
         elements.append(_div(f"**{title}**\n{content}"))
         elements.append(_hr())
     elements.append(_note(
-        "通常只需要 `/add <url>`；设置了 `--selector` 时会自动启用自适应重定位。"
+        "通常只需要 `/add <url>`。抓取失败时先试 `/debug <id>`，再试 `/strategy <id> stealth`。"
     ))
     return _card("📘 命令帮助", THEME["info"], elements)
 
@@ -466,7 +472,7 @@ def fetch_failure_card(task_id: int, task_name: str, url: str,
     elements.extend([
         _hr(),
         _note(f"`/debug {task_id}` 诊断 · "
-              f"`/reset {task_id} --strategy scrapling_stealth` 切换策略"),
+              f"`/strategy {task_id} stealth` 切换为隐身浏览器（`scrapling_stealth`）"),
     ])
     return _card(
         f"{title}　#{task_id}", THEME["warning"],
@@ -491,7 +497,14 @@ def _failure_hint(error: str) -> str:
     if "javascript verification" in text or "bot challenge" in text:
         return (
             "疑似机器人验证 / JS 挑战页，已拒绝作为有效快照。"
-            "可尝试稳定代理、降低频率，或使用 `scrapling_stealth`。"
+            "可尝试稳定代理、降低频率，或发送 `/strategy <ID> stealth`"
+            "（实际策略 `scrapling_stealth`）。"
+        )
+    if "cookie consent" in text or "cookie notice" in text:
+        return (
+            "疑似 Cookie 同意页，已拒绝作为有效快照。"
+            "系统会用浏览器策略自动尝试点击同意；可发送 `/strategy <ID> stealth`"
+            "（实际策略 `scrapling_stealth`）后重试。"
         )
     if "access denied" in text or "unauthorized" in text:
         return "疑似权限受限页面，已拒绝作为有效快照。请确认页面是否公开可访问。"

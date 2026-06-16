@@ -120,6 +120,7 @@ sudo journalctl -u web-monitor-pro -f
 | `/interval <id> <seconds>` | 修改检查间隔（≥10 秒） |
 | `/debug <id>` | 诊断（识别框架、嵌入数据、给出建议，附 HTML 下载） |
 | `/sniff <url>` | 抓包辅助（引导找 API） |
+| `/strategy <id> <策略>` | 切换抓取策略：`auto`、`stealth`、`browser`、`fast`、`http` |
 | `/reset <id> [options]` | 重置基准快照（可同时调整抓取参数） |
 | `/mute <30m/2h/1d>` / `/unmute` | 免打扰 |
 | `/log [--tail N]` | 查看日志（附完整日志下载） |
@@ -127,6 +128,16 @@ sudo journalctl -u web-monitor-pro -f
 | `/config` | 全局配置概览 |
 
 完整说明：[docs/commands.md](docs/commands.md)
+
+常用策略示例：
+
+```text
+/strategy 3 auto      # 自动选择，默认推荐
+/strategy 3 stealth   # 隐身浏览器，实际策略 scrapling_stealth
+/strategy 3 browser   # 普通浏览器，实际策略 playwright
+/strategy 3 fast      # 快速模式，实际策略 curl_cffi
+/strategy 3 http      # 普通 HTTP，实际策略 httpx
+```
 
 ---
 
